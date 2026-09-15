@@ -27,6 +27,7 @@ import { Manager } from './projects/manager.ts'
 import { Store as ProjectsStore } from './projects/store.ts'
 import { Scanner, defaultConfig, discoverWorkBuddyModels } from './discover/index.ts'
 import { usageStatsSource } from './adminapi/stats.ts'
+import { providerValidate } from './model/index.ts'
 
 // 路径语义对齐 Go：配置/数据/凭据一律相对进程 cwd（运行目录即工作目录）；
 // 仅 web/dist 锚定包/仓库自身（Go 时代它嵌在二进制里，TS 侧从安装位置现读）。
@@ -335,8 +336,6 @@ async function runZCode(args: string[]): Promise<void> {
   }
   fatal(new Error('未知子命令 zcode ' + (sub ?? '') + '（支持: zcode login | zcode sidecar install|setup|start|stop|status|login|ensure）'))
 }
-
-import { providerValidate } from './model/index.ts'
 
 const argv = process.argv.slice(2)
 const cmd = argv[0] ?? 'serve'

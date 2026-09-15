@@ -97,7 +97,7 @@ export interface AccountUsage {
 
 export class Store {
   // 用量落盘与聚合：insertLog 按 DSH 口径（input + creation + output）求 total；
-  // summarize/breakdown 读时重算总量（不读存量列，历史脏行不污染口径）。
+  // summarize/breakdown/accountBreakdown 读时重算总量（不读存量列，历史脏行不污染口径）。
   private db: InstanceType<typeof DatabaseSync>
 
   private constructor(db: InstanceType<typeof DatabaseSync>) { this.db = db }
@@ -362,8 +362,7 @@ export class Store {
       ELSE NULL END AS avgTps,
       AVG(CASE WHEN first_token_ms > 0 THEN first_token_ms END) AS avgTtftMs
       FROM usage_logs WHERE ts >= @since${Store.range(until)}${acct}
-      GROUP BY provider_id, source_id, model_id
-      ORDER BY 8 DESC`)
+      GROUP BY provider_id, source_id, model_id`)
       .all(p) as unknown as ModelPoint[]
 
     // 每行补总量与命中率（与 totals 同源、同为 DSH 口径）

@@ -34,7 +34,7 @@ export interface GatewayConfig {  host: string
 // kind 支持 http/https（socks5 需专用 agent，暂不支持；Clash 类混合端口用 http:// 即可）。
 export interface Egress {
   id: string
-  kind: 'http'
+  kind: 'http' | 'https'
   addr: string
 }
 
@@ -184,7 +184,8 @@ function strictMap(raw: Record<string, unknown>, spec: Record<string, [string, F
 }
 
 // YAML 值 → TS 值的宽松转换：string 接受 number/boolean（转字符串）；
-// number 走 Number(v)（非法得 NaN，由 validate 兜底报错）；boolean 走 Boolean(v)。
+// number 走 Number(v)（非法得 NaN：port 靠范围校验/默认值兜底，其余字段 NaN 会透传，必要时补校验）；
+// boolean 走 Boolean(v)。
 function convert(v: unknown, fs: FieldSpec, path: string): unknown {
   if (fs.kind === 'map') {
     if (v === null || typeof v !== 'object' || Array.isArray(v)) {
