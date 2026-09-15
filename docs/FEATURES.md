@@ -66,13 +66,14 @@
 
 账号池（`pool/account.ts`）：
 
-- 同源轮询（`pick:36-44`）；Provider 白名单（`accountIds`）按名单轮询（`pickFrom:49-60`）；无可用抛 `ErrNoAccount`（`:11-14`），调度据此换源/报错，不静默等待。
+- 同源加权轮询（`pick`）：按 `Account.weight`（缺省/非法按 1）分配流量；无可用抛 `ErrNoAccount`，调度据此换源/报错，不静默等待。
 - `markResult:69-93`：成功且有惩罚时清零落盘；失败 `fails++`，kind=quota → `exhausted`（**不设到期时间，只认人工“重置”或一次成功的测试**，`pool/account.ts:84-87`），其余 → `cooldown` + 到期时间。
 - `hasFor:30-32` 区分“该源无账号 → 走 Provider 级凭据”与“有账号但全冷却 → 跳过该源”。
 - 冷却到期自动复位（`eligible:128-140`）；`exhausted` 永不自动恢复（`model/index.ts:200-203`）。
 - 惩罚落盘：`fails / cooldownUntil` 写回 `admin.db`，重启不失忆；`exhausted` 必须把 status 一起写进去，恢复时再抹回 available（`cli.ts:104-118` 回写规则注释）。
 - 健康度（纯派生，不落盘，`model/index.ts:205-218`）：绿=健康、琥珀=冷却中或连败 ≥ 3 次（`FAILS_WARN_AT=3`）、红=disabled / exhausted。
-- **指定账号头** `x-polycode-account`（`proxy.ts:190-192,268-321 servePinned`）：钉死指定账号，不轮询、不换号；账号不存在→404、source 不匹配→400、冷却中→429、不在 Provider 白名单→400。
+- **指定账号头** `x-polycode-account`（`proxy.ts servePinned`）：钉死指定账号，不轮询、不换号；账号不存在→404、source 不匹配→400、冷却中→429。
+- **权重**：账号 `weight`（正整数，默认 1，`PATCH /admin/api/accounts/:id {weight}`）；关（disabled）/失效（exhausted/cooldown）的账号不在 eligible 里，分母是可用者的权重和——自动重算，不用手动调。
 
 ### 协议自动识别
 
@@ -84,7 +85,7 @@
 
 - **配置文件**：`config/apps.yaml`（本机正式配置，git 忽略）；模板 `config/apps.example.yaml`（171 行，v0.4 口径）。`POLYCODE_CONFIG` 可覆盖路径（`cli.ts:72`）；文件不存在 → 全默认零配置启动（`config/index.ts:50-54`）。
 - **gateway 真实字段**（`config/index.ts:18-31`）：`host`（缺省 `127.0.0.1`）、`port`（缺省 3000）、`admin_key`、`gateway_key`（空=不校验）、`default_model`、`risk_max`（low/medium/high，缺省 high=不过滤）、`precheck_context`、`first_byte_timeout_ms`、`stream_idle_timeout_ms`。启动参数 `--port` 可覆盖端口（`cli.ts:73-80`）。
-- **Provider 真实字段**（`config/index.ts:105-126`）：`id`（只允许小写字母/数字/连字符，永久不可改，`model/index.ts:150-152`）、`source_id`、`display_name`、`access_kind`（official/session-reuse/simulated-login/reverse）、`risk` + `risk_note`（medium/high 必填，`model/index.ts:157-159`）、`stability`、`api`（空=自动探测）、`base_url`（anthropic-messages 停域名根由网关拼 `/v1/messages`，openai 两种停 `/v1`，`upstream.ts:392-405` 有去重 `/v1` 逻辑）、`credential`、`headers`、`dynamic_headers`（绝对路径命令，不走 shell，缺省超时 8000ms）、`enabled`、`priority`、`stream_only`、`tags`、`models`、`probe_model`、`egress`、`account_ids`（绑定账号白名单）。
+- **Provider 真实字段**（`config/index.ts`）：`id`（只允许小写字母/数字/连字符，永久不可改，`model/index.ts:150-152`）、`source_id`、`display_name`、`access_kind`（official/session-reuse/simulated-login/reverse）、`risk` + `risk_note`（medium/high 必填，`model/index.ts:157-159`）、`stability`、`api`（空=自动探测）、`base_url`（anthropic-messages 停域名根由网关拼 `/v1/messages`，openai 两种停 `/v1`，`upstream.ts:392-405` 有去重 `/v1` 逻辑）、`credential`、`headers`、`dynamic_headers`（绝对路径命令，不走 shell，缺省超时 8000ms）、`enabled`、`priority`、`stream_only`、`tags`、`models`、`probe_model`、`egress`。
 - **严格模式**：未知字段直接抛错拒绝启动（`config/index.ts:173-184 strictMap`，含 jwt/token 等明文凭据字段亦拒，注释 `:1-2`）；跨实体校验 source 引用 / egress 引用 / 重复 id / 端口范围（`:281-315`）。示例文件本身有测试保证可解析。
 - **凭据不落明文**：只存引用 `api_key_env`（环境变量，改值需重启）或 `api_key_file`（`config/credentials/` 下文件，**改内容即热轮换**，每次请求现读，`model/index.ts:34-47`）；无凭据返回 `['', true]` 即公开端点。管理面写凭据文件限定在 `config/credentials/` 下（`adminapi/discover_api.ts:40-42`）。
 - **存储语义**：YAML 只在**空库时播种一次**（`seedProvidersIfEmpty / seedAccountsIfEmpty`，`adminapi/store.ts:196-204`），之后 `admin.db` 是唯一真相源，界面增删改重启不丢，YAML 后续改动不再生效；但配置文件里的 Provider / egress 定义在库里缺失时会被补回（删了重启回来，`cli.ts:90-92,124-129`），内置 Provider 不可删（`builtinIDs:cli.ts:171`，删除返回 403）。
@@ -120,9 +121,9 @@
 管理面 REST（`/admin/api/*`，`adminapi/api.ts:createAdminApi`，错误形状 `{error:{type,message}}`，未接线依赖对应端点 501）：
 
 - egresses：`GET /admin/api/egresses`，`PUT /admin/api/egresses/:id`（body `{kind:http|https, addr}`），`DELETE`（`api.ts:146-170`）。
-- providers：`GET` 列表，`POST` 新建（`parse.ts:53-97` 收敛解析 + `providerValidate`，accountIds 须存在且同 sourceId，冲突 409），`PATCH /:id`（白名单 `enabled/priority/streamOnly/displayName/riskNote/credential/models/probeModel/egress/accountIds`，models 只增不减，`api.ts:43-47,199-305`），`DELETE /:id`（builtin 禁删 403，成功 204）。
+- providers：`GET` 列表，`POST` 新建（`parse.ts` 收敛解析 + `providerValidate`，冲突 409），`PATCH /:id`（白名单 `enabled/priority/streamOnly/displayName/riskNote/credential/models/probeModel/egress`，models 只增不减），`DELETE /:id`（builtin 禁删 403，成功 204）。
+- accounts：`GET /admin/api/accounts`（DB + 池内冷却/连败合并，过期冷却复位），`POST` 新建（id/sourceId 必填，新建只许 available/disabled），`PATCH /:id`（白名单 status/displayName/credential/weight），`DELETE /:id`，`POST /:id/recheck`（零上游成本，只清惩罚），`POST /:id/test`（真实请求，可传 `{model}`，成功清冷却归零）。
 - 模型：`POST /providers/:id/test`（最小真实请求），`POST /providers/:id/scan`（探到协议写回），`PUT /providers/:id/models/:model/{protocol,egress,note,enabled}`（note 限 200 字，空串删字段），`DELETE /providers/:id/models/:model`（PATCH 删不掉故独立端点），`GET /providers/:id/models`（lister 报错转 502）。
-- accounts：`GET /admin/api/accounts`（DB + 池内冷却/连败合并，过期冷却复位），`POST` 新建（id/sourceId 必填，新建只许 available/disabled），`PATCH /:id`（白名单 status/displayName/credential），`DELETE /:id`，`POST /:id/recheck`（零上游成本，只清惩罚），`POST /:id/test`（真实请求，可传 `{model}`，成功清冷却归零）。
 - stats：`GET /admin/api/stats`（全量），`GET /admin/api/breakdown?days|since|until&account_id`（默认 365 天），`GET /admin/api/usage/accounts`（账号维度）。
 - discover（`discover_api.ts`）：`GET /admin/api/discover`（未接线返回空列表），`POST /discover/adopt {key,id?}`（须 ready 否则 400，幂等），`POST /discover/import-account`（必填 key/tokenPath/accountId/credentialFile，服务端 0600 落盘，token 不经前端），`POST /discover/quick-import {key}`（全量导入存活登录态）。
 - sidecar / projects 以 Hono 子应用注入（`api.ts:646-653`），未注入对应端点 501。

@@ -71,9 +71,6 @@ export function parseProvider(raw: unknown): Provider {
   if (typeof o.riskNote === 'string') p.riskNote = o.riskNote
   if (typeof o.probeModel === 'string') p.probeModel = o.probeModel
   if (o.streamOnly === true) p.streamOnly = true
-  if (Array.isArray(o.accountIds)) {
-    p.accountIds = (o.accountIds as unknown[]).filter((x): x is string => typeof x === 'string')
-  }
   const tags = strArr(o.tags)
   if (tags) p.tags = tags
   if (isObj(o.headers)) {
@@ -110,6 +107,9 @@ export function parseAccount(raw: unknown): Account {
     fails: num(o.fails),
   }
   if (typeof o.displayName === 'string') a.displayName = o.displayName
+  if (typeof o.weight === 'number' && Number.isFinite(o.weight) && o.weight > 0) {
+    a.weight = Math.floor(o.weight)
+  }
   const cooldownUntil = parseDate(o.cooldownUntil)
   if (cooldownUntil) a.cooldownUntil = cooldownUntil
   const lastUsed = parseDate(o.lastUsed)

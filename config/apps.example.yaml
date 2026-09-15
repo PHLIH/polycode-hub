@@ -44,7 +44,7 @@ providers:
       api_key_env: "COMPANY_GW_KEY"      # 密钥放环境变量，配置不落明文
     enabled: true
     priority: 1
-    # account_ids: ["zcode-1"]  # 可选：绑定账号白名单；缺省 = 该源全部账号轮询
+    # 同源多账号按 weight 加权轮询（账号页可调，默认 1）；关/失效的账号权重自动失效。
     models:                       # 模型目录：可探测补全，也可手动添加（manual: true）
       - id: "claude-sonnet-4-6"
         display_name: "Claude Sonnet 4.6"

@@ -267,6 +267,20 @@ async function toggleEnabled(a, on) {
     ElMessage.success(on ? `${a.id} 已启用，参与轮询` : `${a.id} 已停用，不再接请求`)
   } catch (e) { ElMessage.error(e.message); load() }
 }
+
+// 权重：同源账号间按权重分配流量（默认 1）。关/失效的账号权重自动失效，
+// 分母是可用者的权重和——不用手动重算，后端 pick 按可用者权重加权轮询。
+function weightOf(a) { return a.weight && a.weight > 0 ? a.weight : 1 }
+async function setWeight(a, v) {
+  const w = Math.floor(Number(v))
+  if (!Number.isFinite(w) || w <= 0) { ElMessage.warning('权重须为正整数'); load(); return }
+  if (w === weightOf(a) && a.weight === w) return // 没改就不打接口
+  try {
+    await api.updateAccountWeight(a.id, w)
+    a.weight = w
+    ElMessage.success(`${a.id} 权重 → ${w}`)
+  } catch (e) { ElMessage.error(e.message); load() }
+}
 </script>
 
 <template>
@@ -336,6 +350,11 @@ async function toggleEnabled(a, on) {
         <span class="acct-metric num" :title="rangeLabel + '该账号处理的请求数（含失败）'">{{ healthText(a) }}</span>
         <span class="acct-metric num" :class="errRateClass(a)" :title="rangeLabel + '失败次数与失败率'">{{ errRateText(a) }}</span>
         <span class="acct-status">{{ (STATUS[a.status] || {}).label || a.status }}</span>
+        <span class="acct-weight" title="同源账号间按权重分配流量（默认 1）；关/失效的账号权重自动失效，不用手动重算">
+          <span class="dim">权重</span>
+          <el-input-number :model-value="weightOf(a)" :min="1" :max="100" :step="1" size="small"
+            class="weight-input" @change="v => setWeight(a, v)" />
+        </span>
         <span class="acct-actions" @click.stop>
           <el-switch :model-value="isEnabled(a)" size="small"
             :title="isEnabled(a) ? '启用中：参与轮询，点击停用' : '已停用：不接请求，点击启用'"
@@ -505,6 +524,9 @@ async function toggleEnabled(a, on) {
 .acct-metric.bad { color: var(--bad); }
 .acct-metric.warn { color: var(--warn); }
 .acct-status { margin-left: auto; color: var(--dim); font-size: 12px; }
+.acct-weight { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; flex: none; }
+.weight-input { width: 96px; }
+.weight-input :deep(.el-input__inner) { text-align: center; }
 .acct-actions { display: flex; gap: 4px; flex: none; }
 
 /* 健康状态标识：绿=健康，琥珀=连败超阈值/冷却，红=耗尽/停用 */

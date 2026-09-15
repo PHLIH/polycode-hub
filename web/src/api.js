@@ -107,9 +107,9 @@ export const api = {
   // 改单个模型的协议（空字符串 = 继承 Provider 默认）
   updateProviderModelProtocol: (id, modelId, protocol) =>
     req('PUT', `/admin/api/providers/${encodeURIComponent(id)}/models/${encodeURIComponent(modelId)}/protocol`, { protocol }),
-  // 绑定账号白名单（空数组 = 不限，全部同源账号轮询）
-  updateProviderAccounts: (id, accountIds) =>
-    req('PATCH', `/admin/api/providers/${encodeURIComponent(id)}`, { accountIds }),
+  // 账号权重：PATCH /admin/api/accounts/:id {weight}（正整数，默认 1）
+  updateAccountWeight: (id, weight) =>
+    req('PATCH', `/admin/api/accounts/${encodeURIComponent(id)}`, { weight }),
   // 改单个模型的出口代理（空字符串 = 继承 Provider 默认）
   updateProviderModelEgress: (id, modelId, egress) =>
     req('PUT', `/admin/api/providers/${encodeURIComponent(id)}/models/${encodeURIComponent(modelId)}/egress`, { egress }),

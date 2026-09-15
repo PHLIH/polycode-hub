@@ -42,10 +42,10 @@ export interface AdminApiDeps {
 // PATCH 白名单（只读字段出现即 400；ID 永久不可改；credential 只收引用）。
 const PROVIDER_PATCH_ALLOW = new Set([
   'enabled', 'priority', 'streamOnly', 'displayName', 'riskNote',
-  'credential', 'models', 'probeModel', 'egress', 'accountIds',
+  'credential', 'models', 'probeModel', 'egress',
 ])
 
-const ACCOUNT_PATCH_ALLOW = new Set(['status', 'displayName', 'credential'])
+const ACCOUNT_PATCH_ALLOW = new Set(['status', 'displayName', 'credential', 'weight'])
 
 // ---- 小件 ----
 
@@ -175,15 +175,6 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     const p = parseProvider(raw)
     const verr = providerValidate(p)
     if (verr) return errRes(c, 400, ERR.INVALID_REQUEST, verr)
-    if (p.accountIds && p.accountIds.length > 0) {
-      for (const id of p.accountIds) {
-        const a = accounts.get(id)
-        if (!a) return errRes(c, 400, ERR.INVALID_REQUEST, `accountIds 引用了不存在的账号 ${id}`)
-        if (a.sourceId !== p.sourceId) {
-          return errRes(c, 400, ERR.INVALID_REQUEST, `accountIds 账号 ${id} 归属源 ${a.sourceId}，与 Provider 源 ${p.sourceId} 不一致`)
-        }
-      }
-    }
     if (providers.get(p.id)) {
       return errRes(c, 409, ERR.INVALID_REQUEST, `provider ${p.id} 已存在`)
     }
@@ -273,19 +264,6 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
         if (typeof v !== 'string') return false
         if (v === '') delete p.egress
         else p.egress = v
-        return true
-      },
-      accountIds: (v) => {
-        // 白名单：空数组 = 不限（清除绑定）；非空逐个校验存在性与同源。
-        if (!Array.isArray(v)) return false
-        for (const id of v) {
-          if (typeof id !== 'string' || id === '') return false
-          const a = accounts.get(id)
-          if (!a) return false
-          if (a.sourceId !== p.sourceId) return false
-        }
-        if (v.length === 0) delete p.accountIds
-        else p.accountIds = [...v] as string[]
         return true
       },
     }
@@ -378,6 +356,12 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
       credential: (v) => {
         if (!isObj(v)) return false
         ac.credential = parseCredential(v)
+        return true
+      },
+      weight: (v) => {
+        // 流量权重：正整数；<=0/非数字拒绝（调用方应显式传，不静默归一）。
+        if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) return false
+        ac.weight = Math.floor(v)
         return true
       },
     }

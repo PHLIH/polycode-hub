@@ -122,7 +122,6 @@ const PROVIDER: Record<string, [string, FieldSpec]> = {
   models: ['models', { kind: 'array', item: { kind: 'object', spec: MODEL } }],
   probe_model: ['probeModel', { kind: 'string' }],
   egress: ['egress', { kind: 'string' }],
-  account_ids: ['accountIds', { kind: 'array', item: { kind: 'string' } }],
 }
 
 const EGRESS: Record<string, [string, FieldSpec]> = {

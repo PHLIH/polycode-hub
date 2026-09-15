@@ -365,40 +365,8 @@ describe('指定账号头 x-polycode-account（不轮询、不回退）', () => 
     expect(usage.rows.map((r) => r.accountId)).toEqual(['a1', 'a2'])
   })
 
-  test('Provider 白名单：轮询只在名单内（a1 被排除，连续两次都落 a2）', async () => {
-    const { app, usage } = buildApp({
-      providers: [provider({ headers: { 'x-mode': 'sse' }, accountIds: ['a2'] })],
-      pool: pinnedPool(),
-    })
-    for (let i = 0; i < 2; i++) {
-      const res = await app.request('/v1/messages', {
-        method: 'POST', body: JSON.stringify(pinnedBody()),
-      })
-      expect(res.status).toBe(200)
-      await res.text()
-    }
-    expect(usage.rows.map((r) => r.accountId)).toEqual(['a2', 'a2'])
-  })
-
-  test('显式指定不在白名单内 → 400，不向上游发请求、不记账', async () => {
-    const { app, usage } = buildApp({
-      providers: [provider({ headers: { 'x-mode': 'sse' }, accountIds: ['a2'] })],
-      pool: pinnedPool(),
-    })
-    const res = await app.request('/v1/messages', {
-      method: 'POST',
-      headers: { 'x-polycode-account': 'a1' },
-      body: JSON.stringify(pinnedBody()),
-    })
-    expect(res.status).toBe(400)
-    expect(usage.rows.length).toBe(0)
-  })
-
-  test('显式指定在白名单内 → 正常走该账号', async () => {
-    const { app, usage } = buildApp({
-      providers: [provider({ headers: { 'x-mode': 'sse' }, accountIds: ['a2'] })],
-      pool: pinnedPool(),
-    })
+  test('显式指定账号不受任何 Provider 配置约束（白名单已删除）', async () => {
+    const { app, usage } = buildApp({ providers: pinnedProviders(), pool: pinnedPool() })
     const res = await app.request('/v1/messages', {
       method: 'POST',
       headers: { 'x-polycode-account': 'a2' },

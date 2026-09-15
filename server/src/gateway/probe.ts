@@ -134,8 +134,7 @@ export class Probe {
     const fail = (error: string): ProbeResult => ({ ok: false, error, latencyMs: 0 })
     const acct = this.accounts?.get(accountID)
     if (!acct) return fail(`账号 ${accountID} 不存在`)
-    const p = this.sched.providers().find(
-      (x) => x.sourceId === acct.sourceId && (x.accountIds?.length ? x.accountIds.includes(accountID) : true))
+    const p = this.sched.providers().find((x) => x.sourceId === acct.sourceId)
     if (!p) return fail(`账号 ${accountID} 所属源 ${acct.sourceId} 没有可用的 Provider`)
     const bare = modelID || p.probeModel || p.models.find((m) => m.enabled)?.id || ''
     if (!bare) return fail('该源没有可测模型：先到 Provider 页获取模型列表')

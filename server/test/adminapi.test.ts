@@ -317,59 +317,52 @@ describe('providers CRUD（对齐 Go TestProviderCRUD/PatchReadonly/Validation�
     expect(body).toContain('apiKeyEnv')
   })
 
-  test('accountIds 白名单：同源账号可绑，异源/不存在 400，空数组=不限', async () => {
+  test('accountIds 白名单已删除：PATCH 出现即 400（只读）', async () => {
     const call = caller(build({
       accounts: [
         { id: 'a1', sourceId: 's', credential: {}, status: 'available', fails: 0 },
-        { id: 'a2', sourceId: 's', credential: {}, status: 'available', fails: 0 },
-        { id: 'b1', sourceId: 'other', credential: {}, status: 'available', fails: 0 },
       ],
     }))
     await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })
-    // 同源绑定成功
+    // 白名单字段不再接受：只读字段出现即 400
     expect((await call('PATCH', '/admin/api/providers/p1', {
       key: 'secret', body: { accountIds: ['a1'] },
-    })).status).toBe(200)
-    const got = (await call('GET', '/admin/api/providers', { key: 'secret' })
-      .then((r) => r.json() as Promise<{ providers: Provider[] }>)).providers[0]!
-    expect(got.accountIds).toEqual(['a1'])
-    // 异源 400
-    expect((await call('PATCH', '/admin/api/providers/p1', {
-      key: 'secret', body: { accountIds: ['b1'] },
     })).status).toBe(400)
-    // 不存在 400
-    expect((await call('PATCH', '/admin/api/providers/p1', {
-      key: 'secret', body: { accountIds: ['nope'] },
-    })).status).toBe(400)
-    // 非数组 400
-    expect((await call('PATCH', '/admin/api/providers/p1', {
-      key: 'secret', body: { accountIds: 'a1' },
-    })).status).toBe(400)
-    // 空数组 = 不限（清除绑定）
-    expect((await call('PATCH', '/admin/api/providers/p1', {
-      key: 'secret', body: { accountIds: [] },
-    })).status).toBe(200)
-    const cleared = (await call('GET', '/admin/api/providers', { key: 'secret' })
-      .then((r) => r.json() as Promise<{ providers: Provider[] }>)).providers[0]!
-    expect(cleared.accountIds ?? []).toEqual([])
   })
 
-  test('POST 创建带 accountIds：异源/不存在 400，同源 201', async () => {
+  test('POST 创建带 accountIds：未知字段忽略，照常 201（不存）', async () => {
     const call = caller(build({
       accounts: [
         { id: 'a1', sourceId: 's', credential: {}, status: 'available', fails: 0 },
-        { id: 'b1', sourceId: 'other', credential: {}, status: 'available', fails: 0 },
       ],
     }))
-    expect((await call('POST', '/admin/api/providers', {
-      key: 'secret', body: { ...providerBody, id: 'px', accountIds: ['b1'] },
-    })).status).toBe(400)
-    expect((await call('POST', '/admin/api/providers', {
-      key: 'secret', body: { ...providerBody, id: 'py', accountIds: ['nope'] },
-    })).status).toBe(400)
-    expect((await call('POST', '/admin/api/providers', {
+    const res = await call('POST', '/admin/api/providers', {
       key: 'secret', body: { ...providerBody, id: 'pz', accountIds: ['a1'] },
-    })).status).toBe(201)
+    })
+    expect(res.status).toBe(201)
+    const got = (await call('GET', '/admin/api/providers', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ providers: Provider[] }>)).providers.find((p) => p.id === 'pz')!
+    expect((got as unknown as Record<string, unknown>).accountIds).toBeUndefined()
+  })
+
+  test('账号权重 weight：PATCH 可设；非法值 400', async () => {
+    const call = caller(build({
+      accounts: [
+        { id: 'a1', sourceId: 's', credential: {}, status: 'available', fails: 0 },
+      ],
+    }))
+    expect((await call('PATCH', '/admin/api/accounts/a1', {
+      key: 'secret', body: { weight: 3 },
+    })).status).toBe(200)
+    const got = (await call('GET', '/admin/api/accounts', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ accounts: Account[] }>)).accounts[0]!
+    expect(got.weight).toBe(3)
+    // 非法值：0/负数/非数字
+    for (const bad of [0, -1, 'x', NaN]) {
+      expect((await call('PATCH', '/admin/api/accounts/a1', {
+        key: 'secret', body: { weight: bad },
+      })).status).toBe(400)
+    }
   })
 })
 

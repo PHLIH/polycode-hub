@@ -229,14 +229,11 @@ export class Proxy {
         if (await attempt(pv, null)) break
         continue
       }
-      // Provider 白名单（accountIds）：非空时只在名单内轮询；全冷却后结束（有界，不死循环）。
-      const allow = pv.accountIds && pv.accountIds.length > 0 ? pv.accountIds : null
+      // 同源账号加权轮询；全冷却后结束（有界，不死循环）。
       for (let i = 0; i < cands.length + 1; i++) {
         let acct: Account
         try {
-          acct = allow
-            ? this.accounts.pickFrom(allow, new Date())
-            : this.accounts.pick(pv.sourceId, new Date())
+          acct = this.accounts.pick(pv.sourceId, new Date())
         } catch {
           break // 全冷却
         }
@@ -267,8 +264,7 @@ export class Proxy {
 
   // 指定账号转发（x-polycode-account）：直接走该账号，失败即报错，
   // 禁止静默回退到轮询（否则用户以为走的是指定账号）。
-  // 4xx 语义：账号不存在 → 404；source 不匹配 → 400；冷却中 → 429；
-  // 不在目标 Provider 白名单 → 400（白名单连显式指定也约束，防绕过）。
+  // 4xx 语义：账号不存在 → 404；source 不匹配 → 400；冷却中 → 429。
   private async servePinned(
     inb: InboundCodec, p: Protocol,
     irReq: import('../ir/index.ts').IrRequest, start: number,
@@ -288,13 +284,8 @@ export class Proxy {
       return writeIrErrorStatus(inb,
         irError(ERR.RATE_LIMIT, `指定账号 ${pinnedId} 处于 ${acct.status}，不换号`), 429)
     }
-    // 白名单约束显式指定：命中同源多个 Provider 时，优先选「名单含该账号」的；
-    // 若命中者都有非空名单且都不含 → 400（防白名单被请求头绕过）。
-    let pv = targets.find((t) => !t.accountIds || t.accountIds.length === 0 || t.accountIds.includes(acct.id))
-    if (!pv) {
-      return writeIrErrorStatus(inb, irError(ERR.INVALID_REQUEST,
-        `指定账号 ${pinnedId} 不在 Provider ${targets[0]!.id} 的绑定名单内（不换号）`), 400)
-    }
+    // 同源多个 Provider 命中时取第一个（与轮询路径的候选顺序一致）。
+    const pv = targets[0]!
     const pvv: Provider = { ...pv, credential: acct.credential }
     const [m] = this.sched.modelOf(pv.id, irReq.model)
     if (m.egress) pvv.egress = m.egress

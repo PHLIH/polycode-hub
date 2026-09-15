@@ -215,22 +215,45 @@ describe('AccountPool（对齐 Go internal/pool/account.go）', () => {
     expect(pool.snapshot()[0]!.status).toBe('available')
   })
 
-  test('pickFrom：只在白名单内轮询，冷却/禁用跳过，无可用抛哨兵', () => {
+  test('加权轮询：权重 2:1 按 2:1 分配', () => {
+    const pool = new AccountPool([acct({ id: 'a', weight: 2 }), acct({ id: 'b', weight: 1 })])
+    const seq = [1, 2, 3, 4, 5, 6].map(() => pool.pick('src', NOW)!.id)
+    expect(seq).toEqual(['a', 'a', 'b', 'a', 'a', 'b'])
+  })
+
+  test('加权轮询：缺省/非法权重按 1 处理', () => {
     const pool = new AccountPool([
       acct({ id: 'a' }),
-      acct({ id: 'b' }),
-      acct({ id: 'c', status: 'disabled' }),
-      acct({ id: 'd', status: 'cooldown', cooldownUntil: new Date('2026-09-13T13:00:00Z') }),
-      acct({ id: 'e', sourceId: 'other' }),
+      acct({ id: 'b', weight: 0 }),
+      acct({ id: 'c', weight: -2 }),
+      acct({ id: 'd', weight: NaN }),
     ])
-    // 白名单 [a,b] 交替，不碰 c/d/e
-    expect([1, 2, 3].map(() => pool.pickFrom(['a', 'b'], NOW).id)).toEqual(['a', 'b', 'a'])
-    // 名单含不可用：跳过 c/d
-    expect(pool.pickFrom(['a', 'c', 'd'], NOW).id).toBe('a')
-    // 全不可用 → 抛哨兵
-    expect(() => pool.pickFrom(['c', 'd'], NOW)).toThrow(/no available account/)
-    // 空名单/全不存在 → 抛哨兵
-    expect(() => pool.pickFrom([], NOW)).toThrow(/no available account/)
-    expect(() => pool.pickFrom(['nope'], NOW)).toThrow(/no available account/)
+    // 四个权重全归一成 1：轮转均分
+    const seq = [1, 2, 3, 4].map(() => pool.pick('src', NOW)!.id)
+    expect(seq).toEqual(['a', 'b', 'c', 'd'])
+  })
+
+  test('加权轮询：关/失效的账号权重自动失效，分母重算', () => {
+    const pool = new AccountPool([
+      acct({ id: 'a', weight: 10 }),
+      acct({ id: 'b', weight: 1 }),
+    ])
+    // a 权重 10，本来 b 几乎拿不到；a 冷却后 b 全拿
+    pool.markResult('a', false, 60_000, NOW, 'rate_limit')
+    const seq = [1, 2, 3].map(() => pool.pick('src', NOW).id)
+    expect(seq).toEqual(['b', 'b', 'b'])
+    // a 冷却到期回来，权重恢复
+    const later = new Date(NOW.getTime() + 120_000)
+    const seq2 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map(() => pool.pick('src', later).id)
+    expect(seq2.filter((id) => id === 'b')).toHaveLength(1)
+  })
+
+  test('加权轮询：disabled 账号不占权重', () => {
+    const pool = new AccountPool([
+      acct({ id: 'a', weight: 5, status: 'disabled' }),
+      acct({ id: 'b', weight: 1 }),
+    ])
+    const seq = [1, 2, 3].map(() => pool.pick('src', NOW).id)
+    expect(seq).toEqual(['b', 'b', 'b'])
   })
 })

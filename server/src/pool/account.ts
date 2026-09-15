@@ -1,5 +1,5 @@
 // 账号池（对齐 Go internal/pool/account.go）：
-// 同一批上游账号的平滑加权轮询与冷却。IP 池默认仅 direct（Provider 接口扩展点），不在本包实现。
+// 同源账号的加权轮询与冷却。IP 池默认仅 direct（Provider 接口扩展点），不在本包实现。
 
 import { accountEffectiveStatus, type Account, type AccountStatus } from '../model/index.ts'
 
@@ -14,10 +14,10 @@ export class ErrNoAccount extends Error {
 }
 
 export class AccountPool {
-  // 同源账号的轮询与冷却：pick/pickFrom 只给可用者，markResult 按 kind 惩罚，
+  // 同源账号的加权轮询与冷却：pick 只给可用者，markResult 按 kind 惩罚，
   // 冷却到期自动复位。惩罚经 Persister 落盘（cli 注入写回 admin_accounts）。
   private accounts: Account[]
-  private rr = new Map<string, number>() // sourceID → 上次选中的下标（轮询计数）
+  private rr = new Map<string, number>() // sourceID → 加权轮询计数（单调递增，总权重取模）
   // 惩罚状态回写存储（fails/cooldownUntil）。未注入则不落盘（测试/只读场景照旧）。
   private persist: Persister = noPersist
 
@@ -32,33 +32,28 @@ export class AccountPool {
     return this.accounts.some((a) => a.sourceId === sourceID)
   }
 
-  // 轮询返回 sourceID 下一个可用账号（同源均分流量）。
+  // 加权轮询返回 sourceID 下一个可用账号（权重按 Account.weight，缺省/<=0 按 1）。
   // 跳过 disabled/exhausted/冷却未到期者；冷却到期自动复位。
+  // 关/失效的账号不在 eligible 里，分母是可用者的权重和——自动重算，不用手动调。
   // 无可用账号时抛 ErrNoAccount（调度器据此换源/报错，不静默等待）。
   pick(sourceID: string, now: Date): Account {
     const eligible = this.eligible(this.accounts.filter((a) => a.sourceId === sourceID), now)
     if (eligible.length === 0) throw new ErrNoAccount()
+    const total = eligible.reduce((s, a) => s + weightOf(a), 0)
     const idx = (this.rr.get(sourceID) ?? -1) + 1
-    this.rr.set(sourceID, idx % eligible.length)
-    const best = eligible[idx % eligible.length]!
-    best.lastUsed = now
-    return { ...best }
-  }
-
-  // 按 id 白名单轮询（Provider.accountIds 绑定用）：
-  // 与 pick 同语义（冷却到期自动复位、跳过不可用、无可用抛 ErrNoAccount）。
-  // 名单为空/全不存在/全不可用 → 抛哨兵（调度器据此换源/报错，不静默等待）。
-  pickFrom(ids: string[], now: Date): Account {
-    const want = new Set(ids)
-    const eligible = this.eligible(this.accounts.filter((a) => want.has(a.id)), now)
-    if (eligible.length === 0) throw new ErrNoAccount()
-    // 轮询键按白名单内容稳定，避免不同白名单互相抢计数。
-    const key = `ids:${[...want].sort().join(',')}`
-    const idx = (this.rr.get(key) ?? -1) + 1
-    this.rr.set(key, idx % eligible.length)
-    const best = eligible[idx % eligible.length]!
-    best.lastUsed = now
-    return { ...best }
+    this.rr.set(sourceID, idx)
+    let slot = idx % total
+    for (const a of eligible) {
+      slot -= weightOf(a)
+      if (slot < 0) {
+        a.lastUsed = now
+        return { ...a }
+      }
+    }
+    // total>0 时必在循环内返回；兜底取首个（防整除边界）
+    const first = eligible[0]!
+    first.lastUsed = now
+    return { ...first }
   }
 
   // 回传账号使用结果：失败则 fails++ 并按原因惩罚（落盘）；成功则连败清零、惩罚全清
@@ -171,4 +166,11 @@ export class AccountPool {
     this.persist(a)
     return true
   }
+}
+
+// 权重归一：缺省/非数字/<=0 按 1 处理；小数向下取整到 1（权重是份数，不是比例）。
+function weightOf(a: Account): number {
+  const w = a.weight
+  if (typeof w !== 'number' || !Number.isFinite(w)) return 1
+  return Math.max(1, Math.floor(w))
 }

@@ -141,9 +141,6 @@ export interface Provider {
   tags?: string[]
   models: Model[]
   probeModel?: string
-  // 指定账号白名单：空/缺省 = 不限（全部同源账号轮询，向后兼容）。
-  // 非空时调度只在该列表内轮询；x-polycode-account 显式指定不在名单内也拒绝。
-  accountIds?: string[]
 }
 
 export function providerValidate(p: Provider): string | undefined {
@@ -194,6 +191,10 @@ export interface Account {
   fails: number
   cooldownUntil?: Date
   lastUsed?: Date
+  // 流量权重（同源账号间按权重分配）：缺省/<=0 按 1 处理。
+  // 关（disabled）/失效（exhausted/cooldown）时权重自动失效——eligible 只收可用者，
+  // 分母是可用者的权重和，不用手动重算。
+  weight?: number
 }
 
 // 冷却到期自动复位（不回写，读取时判定）。
