@@ -22,6 +22,7 @@
 
 - **客户端不限**：任何能改 Base URL 的 harness 都能接——Claude Code、Cline 等说 Anthropic 协议的填 `ANTHROPIC_BASE_URL` 即可，OpenAI 兼容工具直接指向网关；换 harness 不影响上游配置
 - **上游不限**：任意 `anthropic-messages` / `openai-completions` / `openai-responses` 兼容源都能加，`base_url` 自由填；额度耗尽时在首字节之前自动切换到下一个源（首字节一旦发出即不换源，避免拼接出错误内容）
+- **凭据不限**：官方 API Key 是最常规的接法——填 `api_key_env`（走环境变量）或 `api_key_file`（走 `config/credentials/` 下的文件）即可，`access_kind` 默认就是 `official`；登录态复用、本地 sidecar 只是另外两种可选路径。密钥全程不落明文，只存引用
 - **三种协议均支持**：`POST /v1/messages`（Anthropic）、`POST /v1/chat/completions`（OpenAI Chat）、`POST /v1/responses`（OpenAI Responses），流式与非流式均可，经 IR 中间表示中转
 - **协议自动识别**：`api` 留空即自动探测，首次成功后记住；管理台「扫描可用性」可批量实测并写回
 - **账号池**：同源轮询，按失败原因冷却（限流 60s / 额度用尽 600s / 鉴权 1800s）；额度用尽只认人工重置或一次成功的测试
@@ -68,6 +69,24 @@ npm start
 ### 首次配置：不用写配置文件
 
 **零配置启动**后直接进管理台，全部在界面上点：
+
+**接一个官方 API Key 源**（最常规）：Providers 页 → 新建 Provider → 填 `base_url`、协议（留空即自动探测）、接入方式保持 `official` → 凭据填环境变量名或凭据文件路径 → 拉模型列表 → 勾选采用。配置文件等价写法（`source_id` 需先在 `sources` 登记）：
+
+```yaml
+sources:
+  - id: "mine"
+
+providers:
+  - id: "my-upstream"
+    source_id: "mine"
+    base_url: "https://api.example.com"    # 任意兼容源；anthropic 协议不含 /v1，openai 系含
+    api: "anthropic-messages"              # 可留空 = 自动探测
+    access_kind: "official"                # 可省略，默认即 official
+    credential:
+      api_key_env: "MY_UPSTREAM_KEY"       # 或 api_key_file: config/credentials/my-key
+```
+
+**接本机已登录的 harness 与免费额度**：
 
 1. **Discover 页 → 一键导入**：自动发现本机装过并登录过的 harness（WorkBuddy / OpenCode Zen 等），点一下就完成「采用 Provider + 账号入池」。
 2. **ZCode 免费额度**：面板里点「一键安装 / 一键启动」拉起本地 sidecar。要 OAuth 登录时到命令行跑 `npx tsx server/src/cli.ts zcode login`（JWT 只打印一次，不保存）。
