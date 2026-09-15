@@ -66,7 +66,8 @@ const pages = {
       <footer class="rail-foot" />
     </aside>
     <main class="main">
-      <component :is="pages[view].comp" />
+      <!-- 视图内跳转（如发现页「去 Provider 页」）：本应用没有 router，靠这个事件切换。 -->
+      <component :is="pages[view].comp" @navigate="view = $event" />
     </main>
   </div>
 </template>

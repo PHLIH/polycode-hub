@@ -72,12 +72,16 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
   app.get('/admin/api/discover', async (c) => {
     if (!discover) return ok(c, 200, { findings: [] })
     const findings = (await discover.scan()).map((f) => ({ ...f }))
-    // 上游源 → 已接管它的 Provider ID（List 顺序首个）
+    // 上游源 → 已接管它的 Provider ID（List 顺序首个）。
+    // 只认 DB 里真实存在的行：删干净之后必须回到「未接管」，
+    // 否则发现页永远显示「已导入」而「一键导入」被禁用 → 用户既导不进来也无处可删。
     const adoptedBy = new Map<string, string>()
     for (const p of providers.list()) {
       if (p.sourceId === '') continue
       if (!adoptedBy.has(p.sourceId)) adoptedBy.set(p.sourceId, p.id)
     }
+    // 同理，id 本身也要能对上：草稿 id 与库里实际 id 不一致时，
+    // 仍然按真实行的 id 报「已接管」，但前端要能拿它去定位/删除那一行。
     for (const f of findings) {
       const hit = adoptedBy.get(f.key)
       if (hit) {

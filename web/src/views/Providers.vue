@@ -777,7 +777,13 @@ async function adoptModels() {
         <div class="name-cell">
           <span class="p-name">{{ row.displayName || row.id }}</span>
         </div>
-        <div class="p-id">ID: {{ row.id }}</div>
+        <div class="p-id">
+          ID: {{ row.id }}
+          <!-- 归属源必须露出来：发现页说「已由 Provider X 接管」，而 X 是上游源 id
+               （opencode/workbuddy…），只显示 displayName+id 时用户按源名根本搜不到这行，
+               就会以为「已导入但看不到、也删不掉」。 -->
+          <span v-if="row.sourceId" class="p-src" :title="`归属上游源：${row.sourceId}`">· 源 {{ row.sourceId }}</span>
+        </div>
       </template>
     </el-table-column>
     <el-table-column label="协议" min-width="150">
@@ -1080,6 +1086,7 @@ async function adoptModels() {
 .p-name { font-weight: 600; }
 .ph-src { font-weight: 600; }
 .p-id { font-size: 11px; color: var(--dim); font-family: var(--mono); margin-top: 1px; }
+.p-src { color: var(--accent); }
 .so-tag {
   margin-left: 6px; font-size: 10px; padding: 0 5px; border-radius: 999px;
   border: 1px solid var(--line); color: var(--dim);

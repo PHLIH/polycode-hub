@@ -837,6 +837,47 @@ describe('discover 端点（DiscoverSource 打桩，对齐 Go discover_test.go�
     expect(list.findings.find((f) => f.key === 'workbuddy')!.adoptedProviderId).toBe('wb-direct')
     expect(list.findings.find((f) => f.key === 'opencode-zen')!.adoptedProviderId).toBe('oc-thing')
   })
+
+  // 真实缺陷（用户报「把 opencode 删了，再导入报错，导致 provider 里既看不到
+  // opencode 也删不掉，而发现页还显示已导入」）：
+  // 删掉 zen-auto 后 config/apps.yaml 里的 zen 仍带 sourceId=opencode，两个后果叠加：
+  //   ① 发现页按 sourceId 判「已接管」→ 显示「已导入」，「一键导入」被禁用 → 永远导不进来；
+  //   ② 那行 Provider 是配置文件种进来的 zen，用户看到的 id 与发现项草稿 id 不同 → 对不上号。
+  // 护栏：已接管只能由真实存在的 Provider 行认定，且必须报出它真正的 id。
+  test('删掉 Provider 后：不得再标「已导入」（否则导入入口被永久锁死）', async () => {
+    const findings: Finding[] = [
+      {
+        key: 'opencode-zen', harness: 'Zen', status: 'ready', detail: '',
+        suggestedProvider: { ...readyProvider('zen-auto'), sourceId: 'opencode' },
+      },
+    ]
+    // DB 里已没有 sourceId=opencode 的任何 Provider（用户刚删干净）
+    const call = caller(build({ discover: new StubDiscover(findings), providers: [] }))
+    const list = await call('GET', '/admin/api/discover', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ findings: Finding[] }>)
+    expect(list.findings.find((x) => x.key === 'opencode-zen')!.adoptedProviderId).toBeUndefined()
+    // 且此时一键导入必须真的能建出来（不能被幂等短路成「已导入」）
+    const res = await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: { key: 'opencode-zen' } })
+    expect(res.status).toBe(200)
+    expect(await call('GET', '/admin/api/providers/' + encodeURIComponent('zen-auto'), { key: 'secret' })).toBeTruthy()
+  })
+
+  test('配置里同 sourceId、不同 id 的 Provider：报出真正的接管者 id（用户才知道删哪行）', async () => {
+    // config/apps.yaml 种下的是 zen（sourceId=opencode），而发现项草稿 id 是 zen-auto。
+    const findings: Finding[] = [
+      {
+        key: 'opencode-zen', harness: 'Zen', status: 'ready', detail: '',
+        suggestedProvider: { ...readyProvider('zen-auto'), sourceId: 'opencode' },
+      },
+    ]
+    const call = caller(build({
+      discover: new StubDiscover(findings),
+      providers: [mkProvider({ id: 'zen', sourceId: 'opencode' })],
+    }))
+    const list = await call('GET', '/admin/api/discover', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ findings: Finding[] }>)
+    expect(list.findings.find((x) => x.key === 'opencode-zen')!.adoptedProviderId).toBe('zen')
+  })
 })
 
 // ---- import-account ----

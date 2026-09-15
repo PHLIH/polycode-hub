@@ -222,10 +222,6 @@ function nextAccountId() {
 }
 
 async function adopt(f) {
-  if (f.adoptedProviderId) {
-    ElMessage.info(`该登录态已由 Provider「${f.adoptedProviderId}」接管，无需重复采用`)
-    return
-  }
   adopting.value = f.key
   try {
     const p = await api.adopt(f.key)
@@ -237,6 +233,14 @@ async function adopt(f) {
     await Promise.all([rescan(), loadPool()])
   } catch (e) { ElMessage.error(e.message) }
   finally { adopting.value = '' }
+}
+
+// gotoProviders：跳 Provider 页。发现页说「已接管」却不给去路时，用户会以为
+// 自己被卡死了（尤其接管者是配置种进来的、id 与发现项草稿不同名的时候）。
+// 本应用没有 vue-router，视图由 App.vue 的 view ref 切换，用自定义事件通知它。
+const emit = defineEmits(['navigate'])
+function gotoProviders() {
+  emit('navigate', 'providers')
 }
 </script>
 
@@ -327,7 +331,10 @@ async function adopt(f) {
       <span class="dot" :class="dotClass[f.status]"></span>
       <div class="finding-main">
         <div class="finding-title">{{ f.harness }} <span class="dim">（{{ statusText[f.status] || f.status }}）</span></div>
-        <div v-if="f.adoptedProviderId" class="adopted-note">已由 Provider「{{ f.adoptedProviderId }}」接管</div>
+        <div v-if="f.adoptedProviderId" class="adopted-note">
+          已由 Provider「{{ f.adoptedProviderId }}」接管
+          <button class="linklike" @click="gotoProviders">去 Provider 页查看/删除</button>
+        </div>
         <div class="finding-detail">{{ f.detail }}</div>
         <ul v-if="(f.actions || []).length" class="finding-actions">
           <li v-for="a in f.actions" :key="a">{{ a }}</li>
@@ -349,9 +356,10 @@ async function adopt(f) {
       <button
         v-if="groupOf(f) === 'ready'"
         class="btn primary"
-        :disabled="adopting === f.key || !!f.adoptedProviderId"
-        @click="adopt(f)">
-        {{ f.adoptedProviderId ? '已采用' : adopting === f.key ? '采用中…' : '采用' }}
+        :disabled="adopting === f.key"
+        :title="f.adoptedProviderId ? `已由「${f.adoptedProviderId}」接管，点此跳到 Provider 页` : ''"
+        @click="f.adoptedProviderId ? gotoProviders() : adopt(f)">
+        {{ f.adoptedProviderId ? '去查看' : adopting === f.key ? '采用中…' : '采用' }}
       </button>
     </div>
   </section>
