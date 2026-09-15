@@ -782,6 +782,53 @@ describe('discover 端点（DiscoverSource 打桩，对齐 Go discover_test.go�
     expect(((await res.json()) as Provider).id).toBe('my-wb')
   })
 
+  // issue #1：采用只落了一个 credential.apiKeyEnv='WB_TOKEN' 的 Provider，池子是空的，
+  // 进程里也没有 WB_TOKEN → 请求不带 Authorization 打到上游被拦成 HTML 401，
+  // 用户看到的却是「上游鉴权失败」。采用必须像一键导入一样把桌面 JWT 一并导入账号池。
+  test('adopt 一并导入活登录态入池（死登录态跳过），凭据文件 0600', async () => {
+    isolateCwd()
+    const alive = makeAuthFile('主号')
+    const dead = makeAuthFile('过期号')
+    const findings: Finding[] = [{
+      key: 'workbuddy', harness: 'WB', status: 'ready', detail: '',
+      suggestedProvider: { ...readyProvider('wb-auto'), sourceId: 'workbuddy', credential: { apiKeyEnv: 'WB_TOKEN' } },
+      suggestedAccounts: [
+        { nickname: '主号', uid: 'u1', alive: true, tokenPath: alive.tokenPath },
+        { nickname: '过期号', uid: 'u2', alive: false, tokenPath: dead.tokenPath },
+      ],
+    }]
+    const call = caller(build({ discover: new StubDiscover(findings) }))
+    const res = await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy' } })
+    expect(res.status).toBe(201)
+
+    // 账号真的进池了，且凭据文件内容就是桌面 token
+    const accts = await call('GET', '/admin/api/accounts', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ accounts: Account[] }>)
+    expect(accts.accounts).toHaveLength(1)
+    expect(accts.accounts[0]!.displayName).toBe('主号')
+    const credFile = accts.accounts[0]!.credential.apiKeyFile!
+    const credPath = join(process.cwd(), credFile)
+    expect(readFileSync(credPath, 'utf8')).toBe(alive.token)
+    expect(statSync(credPath).mode & 0o777).toBe(0o600)
+  })
+
+  test('adopt 幂等：重复采用不再重复建账号', async () => {
+    isolateCwd()
+    const alive = makeAuthFile('主号')
+    const findings: Finding[] = [{
+      key: 'workbuddy', harness: 'WB', status: 'ready', detail: '',
+      suggestedProvider: { ...readyProvider('wb-auto'), sourceId: 'workbuddy', credential: { apiKeyEnv: 'WB_TOKEN' } },
+      suggestedAccounts: [{ nickname: '主号', uid: 'u1', alive: true, tokenPath: alive.tokenPath }],
+    }]
+    const call = caller(build({ discover: new StubDiscover(findings) }))
+    await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy' } })
+    const again = await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy' } })
+    expect(again.status).toBe(200) // 幂等返回已有 Provider
+    const accts = await call('GET', '/admin/api/accounts', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ accounts: Account[] }>)
+    expect(accts.accounts).toHaveLength(1)
+  })
+
   test('未接线：list 200 空列表；adopt/quick-import/import-account 501', async () => {
     const call = caller(build())
     const list = await call('GET', '/admin/api/discover', { key: 'secret' })

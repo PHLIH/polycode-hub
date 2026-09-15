@@ -158,6 +158,7 @@ export class Upstream {
           dispatcher: this.dispatcherFor(p) as never,
         })
       } catch (err) {
+        if (err instanceof UpstreamError) throw err // 凭据缺失等本地错误：原样上报，别降级成 network
         throw new UpstreamError(0, UPSTREAM.NETWORK, (err as Error).message)
       }
       if (resp.status >= 200 && resp.status <= 299) {
@@ -176,6 +177,10 @@ export class Upstream {
 
   // 按协议设置鉴权与必要头（传输层知识，不属于 IR 消息边界）。
   // 顺序：静态自定义头 → 动态铸币头（覆盖同名静态）→ 内建鉴权/协议头（优先级最高，防覆盖）。
+  //
+  // 凭据解析失败一律抛错、绝不「省略 Authorization 照发」：issue #1 实测——空 WB_TOKEN
+  // 打到腾讯 Copilot 前的 APISIX，被拦成一段 HTML 401，UI 原样显示成「上游鉴权失败」，
+  // 用户完全看不出是自己没配凭据。宁可本地报错，也不打这种必然失败还误导人的上游请求。
   private buildHeaders(
     p: Provider, stream: boolean, dyn: Record<string, string> | null, proto: Protocol,
   ): Record<string, string> {
@@ -184,10 +189,10 @@ export class Upstream {
     for (const [k, v] of Object.entries(p.headers ?? {})) h[k] = v
     for (const [k, v] of Object.entries(dyn ?? {})) h[k] = v
     let key = ''
-    if ((p.credential.apiKeyEnv || p.credential.apiKeyFile)) {
+    if (p.credential.apiKeyEnv || p.credential.apiKeyFile) {
       const [v, ok] = credentialResolve(p.credential, this.credLookup)
-      if (ok) key = v
-      else console.warn(`凭据引用无法解析 provider=${p.id}`)
+      if (!ok) throw new UpstreamError(0, UPSTREAM.AUTH, missingCredentialMessage(p))
+      key = v
     }
     if (proto === 'anthropic-messages') {
       if (key) {
@@ -212,6 +217,7 @@ export class Upstream {
     try {
       resp = await this.fetch(url, { headers: this.buildHeaders(p, false, dyn, p.api), dispatcher: this.dispatcherFor(p) as never })
     } catch (err) {
+      if (err instanceof UpstreamError) throw err // 凭据缺失等本地错误：原样上报，别降级成 network
       throw new UpstreamError(0, UPSTREAM.NETWORK, (err as Error).message)
     }
     if (resp.status < 200 || resp.status > 299) {
@@ -277,6 +283,7 @@ export class Upstream {
         dispatcher: this.dispatcherFor(p) as never,
       })
     } catch (err) {
+      if (err instanceof UpstreamError) throw err // 凭据缺失等本地错误：原样上报，别降级成 network
       throw new UpstreamError(0, UPSTREAM.NETWORK, (err as Error).message)
     }
     if (resp.status >= 200 && resp.status <= 299) return resp.body!
@@ -284,6 +291,18 @@ export class Upstream {
     const text = await resp.text()
     throw new UpstreamError(resp.status, classifyUpstreamError(resp.status, text), text.slice(0, 512).trim())
   }
+}
+
+// 凭据解析失败的对外文案：必须点名缺的是哪个变量/文件，并给可执行的下一步。
+// 只说「凭据无效」用户仍不知道去哪配；照抄上游 HTML 401 更是误导（issue #1）。
+export function missingCredentialMessage(p: Provider): string {
+  if (p.credential.apiKeyFile) {
+    return `凭据文件读不到 provider=${p.id} file=${p.credential.apiKeyFile}`
+      + `（先确认文件存在且可读；Discover「一键导入」会把桌面登录态写入该文件）`
+  }
+  const env = p.credential.apiKeyEnv ?? ''
+  return `环境变量 ${env} 未设置 provider=${p.id}`
+    + `（先 export ${env}=... 并重启网关，或到 Providers 点「一键导入」把桌面登录态导入账号池）`
 }
 
 // 403 语义细分：上游对「模型不在本端点/本出口」也回 403（实测 zen muse 系 RegionError）。

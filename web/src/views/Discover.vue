@@ -11,7 +11,7 @@ const scannedAt = ref('')
 const elapsed = ref('')
 
 const GROUP = {
-  ready: { title: '可采用', hint: '登录态有效，点采用即生成 Provider' },
+  ready: { title: '可采用', hint: '登录态有效，点采用即生成 Provider 并把桌面登录态导入账号池' },
   attention: { title: '需处理', hint: '照下面的提示处理好再采用' },
   missing: { title: '未发现', hint: '本机没装或没登录过这些 harness' }
 }
@@ -229,8 +229,12 @@ async function adopt(f) {
   adopting.value = f.key
   try {
     const p = await api.adopt(f.key)
-    ElMessage.success(`已采用为 Provider「${p.id}」，去 Provider 页确认模型`)
-    await rescan()
+    const accts = (f.suggestedAccounts || []).filter(a => a.alive).length
+    ElMessage.success(accts > 0
+      ? `已采用为 Provider「${p.id}」，${accts} 个登录态已入账号池，去 Provider 页确认模型`
+      : `已采用为 Provider「${p.id}」，去 Provider 页确认模型`)
+    for (const w of p.warnings || []) ElMessage.warning(w, { duration: 6000 })
+    await Promise.all([rescan(), loadPool()])
   } catch (e) { ElMessage.error(e.message) }
   finally { adopting.value = '' }
 }
