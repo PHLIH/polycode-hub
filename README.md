@@ -35,7 +35,7 @@
 
 ![polycode-hub 架构图](docs/architecture.png)
 
-矢量版 [`docs/architecture.svg`](docs/architecture.svg)，图源文件 [`docs/polycode-hub.architecture.json`](docs/polycode-hub.architecture.json)（由 [archify](https://github.com/tt-a1i/archify) 生成；另有可搜索/缩放的可交互版本，体积较大，故未入库）。
+矢量版 [`docs/architecture.svg`](docs/architecture.svg)，图源文件 [`docs/polycode-hub.architecture.json`](docs/polycode-hub.architecture.json)（由 [archify](https://github.com/tt-a1i/archify) 生成）。
 
 ---
 
@@ -58,9 +58,7 @@ npm start
 | 改后端代码自动重启 | `npm run dev`（`tsx watch`） |
 | 后台常驻 + 改完前端一键重启 | `./update.sh`（构建前端 → 重启进程 → 健康检查，日志在 `data/gateway.log`） |
 
-> 运行时只有**一个服务、一个端口**：网关进程自己托管前端构建产物 `web/dist`，所以**改了 `web/` 下任何东西都要重新构建**（`npm run build:web`），否则页面还是旧的。开发时例外，见[开发](#开发)。
->
-> **`web/dist` 不入库**（与 Java 的 `target/` 同口径：要用就自己打包）。clone 后**必须先 `npm run setup`**，否则服务照常启动、API 照常可用，但 `/admin` 全 404——启动日志会打一条「前端产物缺失」警告提醒你。仓库里只留前端源码，产物由你本地构建。
+> 网关进程自己托管管理台，只有一个服务、一个端口。**改了 `web/` 下的东西要重新构建**（`npm run build:web`）才会生效；开发时用 `npm run dev:web` 走 HMR，不必反复构建。
 >
 > 报 `EADDRINUSE` 说明 3000 已被占用，通常另有一个实例在跑。先 `curl -sf -o /dev/null http://127.0.0.1:3000/admin/` 确认是否健康——健康就直接用，不必再启。
 
@@ -125,9 +123,9 @@ providers:
       api_key_env: "COMPANY_GW_KEY"   # 密钥走环境变量，配置不落明文
 ```
 
-> **注意**：配置文件是**严格模式**——写错字段名会直接拒绝启动（防拼错，也强制凭据不落明文）。错误信息会点名是哪个字段。示例文件本身一定是能解析的（有测试守着）。
+> **注意**：配置文件是**严格模式**——写错字段名会直接拒绝启动，错误信息会点名是哪个字段。示例文件一定是能解析的（有测试守着）。
 >
-> **存储**：配置只在**空库时播种一次**，之后 SQLite（`data/admin.db`）是唯一真相源——运行时在界面上的增删改重启不丢，YAML 后续改动不再生效（配置文件里的 Provider 定义在库里缺失时会被补回）。运维入口以管理台为准。
+> **存储**：运行时以 SQLite（`data/admin.db`）为准——在管理台上的增删改重启不丢，运维入口以管理台为准。
 >
 > **凭据热轮换**：改 `config/credentials/` 下的文件内容即生效（下次请求自动读新值），再调 `POST /admin/api/accounts/{id}/recheck` 清冷却立刻恢复，**全程不重启**。`api_key_env` 引的环境变量改值需重启进程。
 
