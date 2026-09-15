@@ -1,0 +1,42 @@
+{
+  "name": "polycode-hub",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "多源 Coding Agent 免费额度统一反代网关（Node/TS）",
+  "bin": {
+    "polycode-hub": "./bin/polycode-hub.mjs"
+  },
+  "files": [
+    "bin",
+    "server/src",
+    "web/src",
+    "web/index.html",
+    "web/package.json",
+    "web/vite.config.js"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "setup": "npm install && npm install --prefix web && npm run build:web",
+    "build:web": "npm run build --prefix web",
+    "dev": "tsx watch server/src/cli.ts serve",
+    "dev:web": "npm run dev --prefix web",
+    "start": "tsx server/src/cli.ts serve",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.0",
+    "hono": "^4.6.0",
+    "tsx": "^4.19.0",
+    "undici": "^8.10.2",
+    "yaml": "^2.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.0"
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "model": "glm-5.2",
+  "system": [
+    {
+      "text": "你是编程助手。",
+      "type": "text"
+    }
+  ],
+  "max_tokens": 1024,
+  "stream": true,
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "查询指定城市天气",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ]
+      }
+    }
+  ],
+  "tool_choice": {
+    "type": "auto"
+  },
+  "messages": [
+    {
+      "role": "user",
+      "content": "北京天气怎么样？"
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "call_1",
+          "name": "get_weather",
+          "input": {
+            "city": "北京"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "call_1",
+          "content": [
+            {
+              "type": "text",
+              "text": "晴 25 度"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

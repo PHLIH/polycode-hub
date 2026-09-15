@@ -1,0 +1,87 @@
+# 构建产物
+/dist/
+/polycode-hub
+*.exe
+*.test
+*.out
+
+# 前端构建产物不入库（Java 的 target/ 口径：要用就自己打包）。
+# 网关运行时现读 web/dist 挂载 /admin，所以 clone 后必须先 `npm run setup`
+# （含 build）或 `npm run build --prefix web` 才能打开控制台，否则 /admin 全 404。
+# 文件名带内容 hash，入库会导致每次前端改动都在历史里留下一次完整产物的增删。
+/web/dist/
+
+# 本地配置（含密钥，勿提交）
+/config/apps.yaml
+/config/credentials/*
+!/config/credentials/.gitkeep
+/config/credentials/*.pem
+/data/
+
+# ZCode sidecar 运行产物（二进制 63MB + 含 proxyApiKey 的 config + 日志）
+/config/zcode-proxy/
+# launchd 部署样板：只入库 .example（占位路径），真实 plist 含本机用户名与绝对路径，不入库
+/config/*.launchd.plist
+!/config/*.launchd.plist.example
+
+# 敏感凭据类文件（任何形态都不入库）
+*.key
+*.pem
+*.p12
+*.pfx
+.env
+.env.*
+!.env.example
+
+# sidecar 构建产物（若在本仓构建上游工具）
+zcode-proxy
+zcode-proxy-*
+
+# Go
+/vendor/
+go.work
+go.work.sum
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 日志
+*.log
+
+# 远端只留 README：docs/ 与根目录文档已下架，备份在这里仅供本地查阅。
+# 历史已用 filter-branch 重写，这些文件在远端不再可见。
+.local-docs/
+
+# Agent 记忆（非项目交付物）
+.workbuddy/
+.worktrees/
+# superpowers 运行产物（sdd 任务痕迹、临时 diff）。
+# 它自带 sdd/.gitignore 写了 *，但那是外部工具的自我约束——
+# 显式声明一次，避免换版本/改结构后误把过程文件提进来。
+# 注意：只忽略运行产物，skills/superpowers/（技能本身）是入库的。
+.superpowers/
+/web/node_modules/
+
+# 远端只留 README：docs/ 整体下架（与 .local-docs/、/skills/ 同口径）。
+# 含 FEATURES.md、架构图（html/png/svg 体积大且是生成物）、交棒笔记等，本地保留、永不入库。
+/docs/
+
+# Agent 本地规划状态（非项目交付物）
+.zcode/
+
+# 项目板块运行时状态
+/config/projects/
+
+# Node
+node_modules/
+*.tgz
+
+# 测试运行数据（零配置起服的临时数据目录）
+/data-zero/
+
+# 远端只留 README：skills/ 一并下架（此前按"项目交付物"入库，现已改口径）。
+# 文件保留在本机 .local-docs/skills/ 备份，此处目录仅本地可用、永不入库。
+/skills/

@@ -1,0 +1,28 @@
+{
+  "model": "glm-5.2",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "这两张图有什么区别？"
+        },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/png;base64,iVBORw0KGgo="
+          }
+        },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "https://example.com/a.png"
+          }
+        }
+      ]
+    }
+  ],
+  "max_tokens": 512,
+  "stream": false
+}

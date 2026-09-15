@@ -1,0 +1,19 @@
+{
+  "model": "glm-5.2",
+  "instructions": "你是编程助手。",
+  "input": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "写个快速排序"
+        }
+      ]
+    }
+  ],
+  "max_output_tokens": 1024,
+  "temperature": 0.2,
+  "top_p": 0.9,
+  "stream": false
+}

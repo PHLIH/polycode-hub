@@ -1,0 +1,24 @@
+{
+  "model": "glm-5.2",
+  "system": [
+    {
+      "text": "你是编程助手。",
+      "type": "text"
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "text": "写个快速排序",
+          "type": "text"
+        }
+      ]
+    }
+  ],
+  "maxTokens": 1024,
+  "temperature": 0.2,
+  "topP": 0.9,
+  "stream": false
+}

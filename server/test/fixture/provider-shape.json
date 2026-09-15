@@ -1,0 +1,30 @@
+{
+  "id": "demo",
+  "sourceId": "src",
+  "displayName": "Demo",
+  "accessKind": "official",
+  "risk": "low",
+  "stability": "stable",
+  "api": "",
+  "baseUrl": "https://x.example",
+  "credential": {
+    "apiKeyEnv": "K"
+  },
+  "headers": {
+    "X-Title": "t"
+  },
+  "enabled": true,
+  "priority": 0,
+  "streamOnly": true,
+  "models": [
+    {
+      "id": "m1",
+      "providerId": "demo",
+      "input": [
+        "text"
+      ],
+      "manual": false,
+      "enabled": true
+    }
+  ]
+}

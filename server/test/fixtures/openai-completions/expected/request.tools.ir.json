@@ -1,0 +1,70 @@
+{
+  "model": "glm-5.2",
+  "system": [
+    {
+      "text": "你是编程助手。",
+      "type": "text"
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "text": "北京天气怎么样？",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "id": "call_1",
+          "input": {
+            "city": "北京"
+          },
+          "name": "get_weather",
+          "type": "tool_use"
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "content": [
+            {
+              "text": "晴 25 度",
+              "type": "text"
+            }
+          ],
+          "toolUseId": "call_1",
+          "type": "tool_result"
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "查询指定城市天气",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ]
+      }
+    }
+  ],
+  "toolChoice": {
+    "mode": "auto"
+  },
+  "maxTokens": 1024,
+  "stream": true
+}

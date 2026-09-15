@@ -1,0 +1,18 @@
+{
+  "id": "resp_test1",
+  "model": "glm-5.2",
+  "created": 1720000000,
+  "content": [
+    {
+      "text": "你好！",
+      "type": "text"
+    }
+  ],
+  "stopReason": "end_turn",
+  "usage": {
+    "inputTokens": 12,
+    "outputTokens": 34,
+    "cacheReadTokens": 8,
+    "accuracy": "exact"
+  }
+}

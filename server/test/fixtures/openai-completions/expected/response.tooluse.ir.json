@@ -1,0 +1,25 @@
+{
+  "id": "chatcmpl-test2",
+  "model": "glm-5.2",
+  "created": 1720000000,
+  "content": [
+    {
+      "text": "我来查天气。",
+      "type": "text"
+    },
+    {
+      "id": "call_1",
+      "input": {
+        "city": "北京"
+      },
+      "name": "get_weather",
+      "type": "tool_use"
+    }
+  ],
+  "stopReason": "tool_use",
+  "usage": {
+    "inputTokens": 20,
+    "outputTokens": 40,
+    "accuracy": "exact"
+  }
+}

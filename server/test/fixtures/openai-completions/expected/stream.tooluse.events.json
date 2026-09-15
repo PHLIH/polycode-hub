@@ -1,0 +1,60 @@
+[
+  {
+    "type": "message_start",
+    "id": "chatcmpl_s2",
+    "model": "glm-5.2",
+    "created": 1720000100
+  },
+  {
+    "type": "content_block_start",
+    "block": {
+      "type": "text"
+    }
+  },
+  {
+    "type": "content_block_delta",
+    "delta": {
+      "kind": "text",
+      "text": "查天气中"
+    }
+  },
+  {
+    "type": "content_block_stop"
+  },
+  {
+    "type": "content_block_start",
+    "index": 1,
+    "block": {
+      "type": "tool_use",
+      "id": "call_1",
+      "name": "get_weather"
+    }
+  },
+  {
+    "type": "content_block_delta",
+    "index": 1,
+    "delta": {
+      "kind": "tool_json",
+      "partialJson": "{\"city\":"
+    }
+  },
+  {
+    "type": "content_block_delta",
+    "index": 1,
+    "delta": {
+      "kind": "tool_json",
+      "partialJson": "\"北京\"}"
+    }
+  },
+  {
+    "type": "content_block_stop",
+    "index": 1
+  },
+  {
+    "type": "message_delta",
+    "stopReason": "tool_use"
+  },
+  {
+    "type": "message_stop"
+  }
+]

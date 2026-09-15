@@ -1,0 +1,32 @@
+{
+  "id": "resp_test1",
+  "object": "response",
+  "created": 1720000000,
+  "model": "glm-5.2",
+  "status": "completed",
+  "output": [
+    {
+      "type": "message",
+      "id": "msg_1",
+      "role": "assistant",
+      "status": "completed",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "你好！"
+        }
+      ]
+    }
+  ],
+  "usage": {
+    "input_tokens": 12,
+    "output_tokens": 34,
+    "total_tokens": 46,
+    "input_tokens_details": {
+      "cached_tokens": 8
+    },
+    "output_tokens_details": {
+      "reasoning_tokens": 0
+    }
+  }
+}

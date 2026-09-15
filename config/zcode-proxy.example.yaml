@@ -1,0 +1,11 @@
+server:
+  port: 8080
+  host: "127.0.0.1"
+
+auth:
+  proxyApiKey: "<your-random-proxy-api-key>"
+
+provider: zai
+plan: start-plan
+
+defaultModel: glm-5.3-flash

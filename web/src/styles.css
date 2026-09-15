@@ -1,0 +1,108 @@
+/* polycode-hub 控制台 —— 设计令牌
+   方向：「终端信号面板」。深板岩底，状态色承担语义（不是装饰）：
+   绿=可用/低风险，琥珀=冷却/中风险，红=耗尽/高风险，信号蓝=交互。
+   度量数字一律 mono（token、次数、延迟），正文用系统无衬线。 */
+
+:root {
+  --bg: #10151c;
+  --panel: #171e27;
+  --panel-2: #1b2431;
+  --line: #232d3a;
+  --text: #d7dde6;
+  --dim: #7d8a99;
+  --accent: #4da3ff;
+  --ok: #3fb68b;
+  --warn: #d9a13c;
+  --bad: #e0604f;
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+html, body, #app { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+}
+
+/* 键盘焦点环：自绘 .btn 原先只剩 UA 默认描边（UI-REVIEW §4-10）。
+   各 view 内 .btn 定义重复，焦点样式统一放这里，避免五处各写一遍。 */
+.btn:focus-visible, .nav-item:focus-visible, .linklike:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+
+/* 文字按钮（复制/编辑/删除这类低频操作）：统一在全局定义。
+   原先散在 Accounts/Providers 两处，Dashboard/Discover 用了没定义，
+   露出 UA 默认白底按钮（丑按钮问题的来源之一）。 */
+.linklike {
+  border: 0; background: none; color: var(--accent); cursor: pointer;
+  font-size: 13px; padding: 0 8px 0 0;
+}
+.linklike:disabled { opacity: .5; cursor: default; }
+.linklike.danger { color: var(--bad); }
+
+/* 度量与代码形态的数据用 mono */
+.num, .ph-id, .ph-url { font-family: var(--mono); }
+.num { font-variant-numeric: tabular-nums; }
+
+/* 状态点：池子健康度的最小可视单元 */
+.dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--dim); margin-right: 6px; vertical-align: 1px;
+}
+.dot.ok { background: var(--ok); }
+.dot.warn { background: var(--warn); }
+.dot.bad { background: var(--bad); }
+
+/* Element Plus 深色适配（仅覆盖必要项） */
+/* EP dark 模式（main.js 加了 html.dark）：把官方深色变量接到本项目色板上，
+   输入框/下拉面板/分页/日期选择等全部组件统一深色，不再出现白底 */
+html.dark {
+  --el-bg-color: var(--panel);
+  --el-bg-color-overlay: var(--panel-2);
+  --el-bg-color-page: var(--bg);
+  --el-fill-color-blank: var(--panel);
+  --el-fill-color: var(--panel-2);
+  --el-fill-color-light: var(--panel-2);
+  --el-fill-color-lighter: var(--panel-2);
+  --el-border-color: var(--line);
+  --el-border-color-light: var(--line);
+  --el-border-color-lighter: var(--line);
+  --el-border-color-extra-light: var(--line);
+  --el-text-color-primary: var(--text);
+  --el-text-color-regular: var(--text);
+  --el-text-color-secondary: var(--dim);
+  --el-text-color-placeholder: var(--dim);
+  --el-text-color-disabled: var(--dim);
+  --el-color-primary: var(--accent);
+  --el-color-primary-light-3: color-mix(in srgb, var(--accent) 70%, var(--panel));
+  --el-color-primary-light-5: color-mix(in srgb, var(--accent) 50%, var(--panel));
+  --el-color-primary-light-7: color-mix(in srgb, var(--accent) 30%, var(--panel));
+  --el-color-primary-light-8: color-mix(in srgb, var(--accent) 20%, var(--panel));
+  --el-color-primary-light-9: color-mix(in srgb, var(--accent) 10%, var(--panel));
+  --el-color-primary-dark-2: color-mix(in srgb, var(--accent) 80%, #000);
+  --el-disabled-bg-color: var(--panel-2);
+  --el-disabled-border-color: var(--line);
+}
+.el-table { --el-table-bg-color: var(--panel); --el-table-tr-bg-color: var(--panel);
+  --el-table-header-bg-color: var(--panel-2); --el-table-border-color: var(--line);
+  --el-table-row-hover-bg-color: var(--panel-2); --el-table-text-color: var(--text);
+  --el-table-header-text-color: var(--dim); }
+.el-card { --el-card-bg-color: var(--panel); border-color: var(--line); }
+.el-dialog { --el-dialog-bg-color: var(--panel); }
+/* 弹框页脚：Element Plus 默认 display:block，相邻按钮会贴成 0 间距（挤成一坨）。
+   这里统一改成 flex + 留白 + 分隔线，各页脚不必再各自处理。
+   注意：只对「直接子元素是按钮」的页脚生效，自定义页脚（如获取模型）自己管布局。 */
+.el-dialog__footer { display: flex; align-items: center; justify-content: flex-end; gap: 10px;
+  border-top: 1px solid var(--line); }
+.el-form-item__label { color: var(--dim); }
+.el-button--primary { --el-button-bg-color: var(--accent); --el-button-border-color: var(--accent); }
+.el-input__wrapper, .el-select__wrapper, .el-textarea__inner {
+  background-color: var(--panel-2); box-shadow: 0 0 0 1px var(--line) inset; }
+.el-input__inner { color: var(--text); }
+.el-select__placeholder, .el-input__inner::placeholder { color: var(--dim); }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}

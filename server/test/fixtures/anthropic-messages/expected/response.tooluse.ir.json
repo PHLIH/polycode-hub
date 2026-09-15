@@ -1,0 +1,24 @@
+{
+  "id": "msg_test2",
+  "model": "glm-5.2",
+  "content": [
+    {
+      "text": "我来查天气。",
+      "type": "text"
+    },
+    {
+      "id": "call_1",
+      "input": {
+        "city": "北京"
+      },
+      "name": "get_weather",
+      "type": "tool_use"
+    }
+  ],
+  "stopReason": "tool_use",
+  "usage": {
+    "inputTokens": 20,
+    "outputTokens": 40,
+    "accuracy": "exact"
+  }
+}

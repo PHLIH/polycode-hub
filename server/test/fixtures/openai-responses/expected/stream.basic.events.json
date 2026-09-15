@@ -1,0 +1,44 @@
+[
+  {
+    "type": "message_start",
+    "id": "resp_s1",
+    "model": "glm-5.2",
+    "created": 1720000100
+  },
+  {
+    "type": "content_block_start",
+    "block": {
+      "type": "text"
+    }
+  },
+  {
+    "type": "content_block_delta",
+    "delta": {
+      "kind": "text",
+      "text": "你好"
+    }
+  },
+  {
+    "type": "content_block_delta",
+    "delta": {
+      "kind": "text",
+      "text": "！"
+    }
+  },
+  {
+    "type": "content_block_stop"
+  },
+  {
+    "type": "message_delta",
+    "stopReason": "end_turn",
+    "usage": {
+      "inputTokens": 12,
+      "outputTokens": 2,
+      "cacheReadTokens": 8,
+      "accuracy": "exact"
+    }
+  },
+  {
+    "type": "message_stop"
+  }
+]

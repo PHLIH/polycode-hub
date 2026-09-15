@@ -1,0 +1,24 @@
+{
+  "id": "chatcmpl-test1",
+  "object": "chat.completion",
+  "created": 1720000000,
+  "model": "glm-5.2",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "你好！"
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 12,
+    "completion_tokens": 34,
+    "total_tokens": 46,
+    "prompt_tokens_details": {
+      "cached_tokens": 8
+    }
+  }
+}

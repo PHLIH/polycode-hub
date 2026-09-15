@@ -1,0 +1,19 @@
+{
+  "id": "msg_test1",
+  "type": "message",
+  "role": "assistant",
+  "model": "glm-5.2",
+  "content": [
+    {
+      "type": "text",
+      "text": "你好！"
+    }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 12,
+    "output_tokens": 34,
+    "cache_read_input_tokens": 8
+  }
+}

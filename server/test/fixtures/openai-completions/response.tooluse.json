@@ -1,0 +1,31 @@
+{
+  "id": "chatcmpl-test2",
+  "object": "chat.completion",
+  "created": 1720000000,
+  "model": "glm-5.2",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "我来查天气。",
+        "tool_calls": [
+          {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"city\":\"北京\"}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 20,
+    "completion_tokens": 40,
+    "total_tokens": 60
+  }
+}

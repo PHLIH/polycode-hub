@@ -1,0 +1,7 @@
+{
+  "error": {
+    "message": "限流了",
+    "type": "rate_limit_error",
+    "code": "rate_limit"
+  }
+}

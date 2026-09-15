@@ -1,0 +1,26 @@
+{
+  "id": "msg_test2",
+  "type": "message",
+  "role": "assistant",
+  "model": "glm-5.2",
+  "content": [
+    {
+      "type": "text",
+      "text": "我来查天气。"
+    },
+    {
+      "type": "tool_use",
+      "id": "call_1",
+      "name": "get_weather",
+      "input": {
+        "city": "北京"
+      }
+    }
+  ],
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 20,
+    "output_tokens": 40
+  }
+}
