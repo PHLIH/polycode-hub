@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, reactive } from 'vue'
+import { ref, computed, onMounted, reactive, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api.js'
 import { shareOf, shareTitle } from '../share'
@@ -11,6 +11,53 @@ const err = ref('')
 const dialog = ref(false)
 const editing = ref(null)
 
+// 时间胶囊（与概览归因区同款：今天/7/30/自定义短区间）。默认「今天」。
+const range = ref({ mode: 'today' })  // {mode:'today'|'7d'|'30d'} 或 {mode:'custom', since, until}
+const RANGE_LABELS = { today: '今天', '7d': '近 7 天', '30d': '近 30 天' }
+const rangeLabel = computed(() =>
+  range.value.mode === 'custom'
+    ? `自定义 ${range.value.since.slice(5)}~${range.value.until.slice(5)}`
+    : RANGE_LABELS[range.value.mode])
+const RANGE_DAYS = { today: 1, '7d': 7, '30d': 30 }
+function localDay(d) {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const dd = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${dd}`
+}
+const rangeQuery = computed(() => {
+  if (range.value.mode === 'custom') return { since: range.value.since, until: range.value.until }
+  const end = new Date()
+  end.setHours(0, 0, 0, 0)
+  const start = new Date(end)
+  start.setDate(start.getDate() - ((RANGE_DAYS[range.value.mode] ?? 30) - 1))
+  return { since: localDay(start), until: localDay(end) }
+})
+const pillOpen = ref(false)
+const customRange = ref([])
+const canApplyCustom = computed(() =>
+  Array.isArray(customRange.value) && !!customRange.value[0] && !!customRange.value[1])
+const noFuture = (d) => d.getTime() > Date.now()
+watch(pillOpen, (open) => {
+  if (!open) return
+  customRange.value = range.value.mode === 'custom' ? [range.value.since, range.value.until] : []
+})
+function pick(mode) {
+  range.value = { mode }
+  pillOpen.value = false
+  loadHealth()
+}
+function applyCustom() {
+  const [since, until] = customRange.value || []
+  if (!since || !until || until < since) {
+    ElMessage.warning('请选择有效的起止日期')
+    return
+  }
+  range.value = { mode: 'custom', since, until }
+  pillOpen.value = false
+  loadHealth()
+}
+
 // 账号健康（ACCOUNT-HEALTH §3.6）： accountId → {requests, errorRate, byKind, lastErrorKind, models}
 // 按 accountId join 到账号表；「失败率」是本页核心交互——支持排序。
 const health = ref({})
@@ -19,7 +66,7 @@ const healthLoading = ref(false)
 async function loadHealth() {
   healthLoading.value = true
   try {
-    const rows = await api.usageAccounts({ days: 30 })
+    const rows = await api.usageAccounts(rangeQuery.value)
     const map = {}
     for (const r of rows || []) {
       if (!r.accountId) continue // Provider 级凭据单独成组，不属于任何具体账号
@@ -31,7 +78,7 @@ async function loadHealth() {
 }
 
 function hOf(row) { return health.value[row.id] }
-// 近 30 天该账号处理的请求数（含失败账）：裸数字看不出是什么，标题说清楚。
+// 当前区间该账号处理的请求数（含失败账）：裸数字看不出是什么，标题说清楚。
 function healthText(row) {
   const h = hOf(row)
   if (!h || !h.requests) return '—'
@@ -224,8 +271,39 @@ async function toggleEnabled(a, on) {
 
 <template>
   <header class="page-head">
-    <h2>账号池</h2>
-    <p class="sub">同一上游源的多账号轮换；耗尽/限流自动冷却并换号。凭据只存环境变量引用，明文不落盘、不回显。</p>
+    <div class="head-row">
+      <div>
+        <h2>账号池</h2>
+        <p class="sub">同一上游源的多账号轮换；耗尽/限流自动冷却并换号。凭据只存环境变量引用，明文不落盘、不回显。</p>
+      </div>
+      <!-- 时间胶囊：只管健康数据区间（与概览归因区同款） -->
+      <div class="range-pill-wrap">
+        <button class="range-pill" :class="{ on: pillOpen }" @click.stop="pillOpen = !pillOpen">
+          <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+            <rect x="1.5" y="2.5" width="13" height="11" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/>
+            <path d="M1.5 6.2h13M5 1.2v2.6M11 1.2v2.6" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+          </svg>
+          {{ rangeLabel }}
+          <span class="range-caret" aria-hidden="true">▾</span>
+        </button>
+        <div v-if="pillOpen" class="range-card" @click.stop>
+          <div class="range-presets">
+            <button v-for="m in ['today', '7d', '30d']" :key="m" class="range-item"
+              :class="{ on: range.mode === m }" @click="pick(m)">{{ RANGE_LABELS[m] }}</button>
+          </div>
+          <div class="range-sep" />
+          <div class="range-custom-title">自定义区间</div>
+          <el-date-picker v-model="customRange" type="daterange" range-separator="→"
+            start-placeholder="开始日期" end-placeholder="结束日期" size="small"
+            value-format="YYYY-MM-DD" format="MM-DD" :disabled-date="noFuture"
+            @keydown.enter="applyCustom" />
+          <div class="range-foot">
+            <span class="dim range-hint">含起止当日，最多回看一年</span>
+            <button class="range-apply" :disabled="!canApplyCustom" @click="applyCustom">应用</button>
+          </div>
+        </div>
+      </div>
+    </div>
   </header>
 
   <p v-if="err" class="err">加载失败：{{ err }}</p>
@@ -255,8 +333,8 @@ async function toggleEnabled(a, on) {
           {{ (a.credential && a.credential.apiKeyEnv) || '—' }}
         </span>
         <span class="acct-health" :class="healthOf(a).cls" :title="healthOf(a).title">{{ healthOf(a).label }}</span>
-        <span class="acct-metric num" :title="'近 30 天该账号处理的请求数（含失败）'">{{ healthText(a) }}</span>
-        <span class="acct-metric num" :class="errRateClass(a)" title="近 30 天失败次数与失败率">{{ errRateText(a) }}</span>
+        <span class="acct-metric num" :title="rangeLabel + '该账号处理的请求数（含失败）'">{{ healthText(a) }}</span>
+        <span class="acct-metric num" :class="errRateClass(a)" :title="rangeLabel + '失败次数与失败率'">{{ errRateText(a) }}</span>
         <span class="acct-status">{{ (STATUS[a.status] || {}).label || a.status }}</span>
         <span class="acct-actions" @click.stop>
           <el-switch :model-value="isEnabled(a)" size="small"
@@ -312,7 +390,7 @@ async function toggleEnabled(a, on) {
             </tbody>
           </table>
         </template>
-        <span v-else class="dim">近 30 天无用量记录。</span>
+        <span v-else class="dim">{{ rangeLabel }}无用量记录。</span>
       </div>
     </div>
   </section>
@@ -342,6 +420,50 @@ async function toggleEnabled(a, on) {
 .page-head { margin-bottom: 16px; }
 .page-head h2 { margin: 0 0 4px; font-size: 18px; }
 .sub { color: var(--dim); margin: 0 0 10px; font-size: 12px; }
+.head-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+
+/* ---- 时间胶囊（与概览归因区同款，见 Dashboard.vue） ---- */
+.range-pill-wrap { position: relative; flex: none; margin-top: 2px; }
+.range-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid var(--line); background: var(--panel-2); color: var(--text);
+  border-radius: 999px; padding: 5px 13px; font-size: 12px; cursor: pointer; white-space: nowrap;
+  transition: border-color .15s, background .15s;
+}
+.range-pill svg { color: var(--dim); }
+.range-pill:hover { border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); }
+.range-pill.on { border-color: var(--accent); }
+.range-pill:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.range-caret { color: var(--dim); font-size: 10px; transition: transform .15s; }
+.range-pill.on .range-caret { transform: rotate(180deg); }
+.range-card {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 30; width: 264px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px; box-shadow: 0 12px 32px rgb(0 0 0 / 50%);
+}
+.range-presets { display: flex; gap: 6px; }
+.range-item {
+  flex: 1; padding: 6px 0; font-size: 12px; text-align: center;
+  color: var(--dim); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 6px; cursor: pointer; transition: color .15s, border-color .15s, background .15s;
+}
+.range-item:hover { color: var(--text); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.range-item.on {
+  color: var(--accent); border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg)); font-weight: 600;
+}
+.range-sep { border-top: 1px solid var(--line); margin: 10px 0 8px; }
+.range-custom-title { font-size: 11px; color: var(--dim); margin: 0 2px 6px; }
+.range-card :deep(.el-date-editor) { width: 100%; }
+.range-foot { display: flex; align-items: center; justify-content: space-between; margin-top: 8px; }
+.range-hint { font-size: 11px; }
+.range-apply {
+  border: 1px solid var(--accent); color: var(--accent); background: none;
+  border-radius: 6px; padding: 4px 16px; font-size: 12px; cursor: pointer;
+  transition: background .15s, opacity .15s;
+}
+.range-apply:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.range-apply:disabled { opacity: .4; cursor: default; }
 .btn {
   background: var(--accent); color: #0b1119; border: 0; border-radius: 6px;
   padding: 6px 14px; font-size: 13px; font-weight: 600; cursor: pointer;

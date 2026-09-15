@@ -50,12 +50,20 @@ describe('ir 错误分类（对齐 Go internal/ir/errors.go）', () => {
 })
 
 describe('IR 用量（缓存独立字段硬约束）', () => {
-  test('usageTotal：separate（Anthropic 系）= input+output+缓存两项（reasoning 不重复计）', () => {
+  test('usageTotal：默认 subset（OpenAI 系）= input+output（cached/miss 是 input 子集，不另加）', () => {
     const u: Usage = {
       inputTokens: 10, outputTokens: 20, cacheReadTokens: 5,
       cacheCreationTokens: 3, reasoningTokens: 8, accuracy: 'exact',
     }
-    expect(usageTotal(u)).toBe(38) // 默认 separate，向后兼容
+    expect(usageTotal(u)).toBe(30) // 默认 subset
+    expect(usageTotal(u, 'subset')).toBe(30)
+  })
+
+  test('usageTotal：separate 显式标注时才另加缓存两项', () => {
+    const u: Usage = {
+      inputTokens: 10, outputTokens: 20, cacheReadTokens: 5,
+      cacheCreationTokens: 3, reasoningTokens: 8, accuracy: 'exact',
+    }
     expect(usageTotal(u, 'separate')).toBe(38)
   })
 

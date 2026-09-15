@@ -76,11 +76,11 @@ export interface Usage {
 
 export type CacheSemantics = 'subset' | 'separate'
 
-// 上游语义下的行总量（与 usage/store.ts Store.totalOf 同公式，单行内存版）：
-// subset（OpenAI 系，cached 已含在 input 内）= input+output；
-// separate（Anthropic 系，read 独立成块）= input+output+read+creation。
-// reasoning 已含于 output，不重复计。注意：SQL 侧与此处必须同公式，改一处改两处。
-export function usageTotal(u: Usage, sem: CacheSemantics = 'separate'): number {
+// 上游 wire 总量 = input + output（OpenAI 系 prompt 已含 cached/miss 全量，
+// cached/miss 都是 prompt 的子集，另加即重复计数；实抓 prompt=425/cached=320/
+// miss=105 时 wire=435）。sem 参数保留供调用方显式标注语义，默认 subset。
+// reasoning 已含于 output，不重复计。
+export function usageTotal(u: Usage, sem: CacheSemantics = 'subset'): number {
   const base = (u.inputTokens ?? 0) + u.outputTokens
   return sem === 'separate'
     ? base + (u.cacheReadTokens ?? 0) + (u.cacheCreationTokens ?? 0)

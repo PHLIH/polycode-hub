@@ -3,6 +3,7 @@ import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '../api.js'
 import { shareOf, shareTitle } from '../share'
+import { applyGroups, applyGroupsReport, rowKey } from '../mergeGroups'
 
 // 概览页：用量仪表盘。三块——
 //   ① 热力图（每天一格，token 越多越绿，GitHub 贡献图那种）
@@ -304,15 +305,14 @@ onUnmounted(() => clearTimeout(copyTimer))
 
 const totals = computed(() => (attrBd.value && attrBd.value.totals) || {})
 
-// 计费输入（命中率分母）= 未缓存输入 + 缓存读取 + 缓存写入。
-// 本项目 totals.inputTokens 存上游原值（已含 cacheRead），故等价于 input + 写入。
+// 总输入 = input_tokens 本身（OpenAI 系 prompt_tokens 已含 cached 全量）。
 // 分子是「缓存读取」——与后端 hitRate 同源，卡片的分子/分母直接显示这两个数。
-const billedInput = computed(() => (totals.value.inputTokens || 0) + (totals.value.cacheCreationTokens || 0))
+const billedInput = computed(() => (totals.value.inputTokens || 0))
 
 // 缓存写入（cache_creation）不展示：只有 anthropic-messages 上游会报这个字段，
 // OpenAI 系（zen/workbuddy）只有 cached_tokens，绝大多数上游恒 0 = 「上游没给」
 // 而非「真的没写」，摆出来只会误导（用户核对时也对不上）。数据仍在库中，未丢弃。
-// 展示口径对齐 DSH：命中率 / 未缓存输入 / 缓存读取 / 输出。
+// 展示口径：命中率 / 总输入 / 缓存读取 / 输出。
 
 // 失败率着色：>10% 红，>0 琥珀，0 保持暗色（状态色承担语义，UI-REVIEW §2-5）
 function failClass(rate) {
@@ -324,7 +324,7 @@ function failClass(rate) {
 const FIELDS = ['requests', 'inputTokens', 'outputTokens', 'cacheReadTokens',
   'cacheCreationTokens', 'reasoningTokens', 'totalTokens', 'errors']
 // 由「后端算好的命中率」反推该行的分母（命中数 / 命中率）。
-// 这样前端不必知道上游语义（subset/separate），也不会用错公式重算。
+// 这样前端不必区分上游语义，也不会用错公式重算。
 function denomOf(r) {
   const rate = r.cacheHitRate
   return (rate != null && rate > 0) ? (r.cacheReadTokens || 0) / rate : 0
@@ -351,8 +351,7 @@ const byModel = computed(() => {
       acc._denom = (acc._denom ?? denomOf(acc)) + denomOf(m)
     }
   }
-  // 命中率由后端按 DSH 口径算好（cacheHitRate = cacheRead / (input + cacheCreation)，
-  // 见 usage/store.ts hitRate，与上游语义无关）：
+  // 命中率由后端算好（cacheHitRate = cacheRead / input，见 usage/store.ts hitRate）：
   // 前端不再自行用单一公式重算（那正是之前的错误来源）。
   // 只有发生跨 source 合并（_denom 被写入）的行才需要按反推的分母重算。
   for (const m of merged.values()) {
@@ -365,10 +364,10 @@ const byModel = computed(() => {
 })
 // 占比：相对区间总 token（不是相对最大值——那样第一名恒为 100%，条子永远满格）
 function share(x) {
-  return shareOf(byModel.value, x)
+  return shareOf(groupedModels.value, x)
 }
 function shareTip(x) {
-  return shareTitle(byModel.value, x)
+  return shareTitle(groupedModels.value, x)
 }
 
 // sourceName：优先按 providerId 精确匹配显示名，再退回 sourceId。
@@ -387,9 +386,112 @@ const page = ref(1)
 const PAGE_SIZE = 20
 const SORTABLE = ['requests', 'inputTokens', 'outputTokens', 'avgTps', 'cacheReadTokens', 'cacheHitRate', 'totalTokens', 'errors']
 
+// ---- 手动合并组（纯前端，localStorage 持久化） ----
+// 场景：zen（手配）与 zen-auto（自动发现）是同一类上游，理应算一笔账。
+// 规则只存本机浏览器：[{ id, name, keys: ['providerId/modelId'] }]。
+const MERGE_KEY = 'polycode-hub.mergeGroups.v1'
+function loadGroups() {
+  try {
+    const raw = localStorage.getItem(MERGE_KEY)
+    if (!raw) return []
+    const arr = JSON.parse(raw)
+    return Array.isArray(arr) ? arr.filter(g => g && g.id && g.name && Array.isArray(g.keys)) : []
+  } catch { return [] }
+}
+const mergeGroups = ref(loadGroups())
+function saveGroups() {
+  try { localStorage.setItem(MERGE_KEY, JSON.stringify(mergeGroups.value)) }
+  catch { /* 配额满就当没存住，下次重配 */ }
+}
+// 合并模式：右上角「合并」按钮开启后，各行出现勾选框；选中 2+ 行即弹出组名浮层确认
+const merging = ref(false)
+const checkedKeys = ref(new Set()) // 勾选中的行 key（rowKey）
+const mergeName = ref('') // 合并时用户起的组名
+const expandedGroups = ref(new Set()) // 展开看明细的组 id
+function toggleMergeMode() {
+  merging.value = !merging.value
+  checkedKeys.value = new Set()
+  mergeName.value = ''
+}
+function toggleCheck(k) {
+  const s = new Set(checkedKeys.value)
+  if (s.has(k)) s.delete(k)
+  else s.add(k)
+  checkedKeys.value = s
+}
+// 行 key：组行不可勾选（避免组套组）；明细展开行也不进勾选
+function checkKeyOf(m) {
+  return m._groupId ? null : (m.providerId + '/' + m.modelId)
+}
+const canMerge = computed(() => checkedKeys.value.size >= 2)
+function doMerge() {
+  const keys = [...checkedKeys.value]
+  if (keys.length < 2) return
+  const name = mergeName.value.trim() || ('合并组' + (mergeGroups.value.length + 1))
+  const g = { id: 'group-' + Date.now(), name, keys }
+  // 先验：选中的 key 是否都在当前行列表里（分页/搜索可能藏起行，导致合了个寂寞）
+  const { unmatched } = applyGroupsReport(byModel.value, [...mergeGroups.value, g])
+  mergeGroups.value = [...mergeGroups.value, g]
+  saveGroups()
+  merging.value = false
+  checkedKeys.value = new Set()
+  mergeName.value = ''
+  page.value = 1
+  if (unmatched.includes(g.id)) {
+    ElMessage.warning('合并未生效：选中的行不在当前数据里（可能被搜索/时间范围过滤了），已保存规则，调整筛选后自动生效')
+  } else {
+    ElMessage.success(`已合并为「${name}」`)
+  }
+}
+function unmerge(id) {
+  mergeGroups.value = mergeGroups.value.filter(g => g.id !== id)
+  saveGroups()
+  const s = new Set(expandedGroups.value)
+  s.delete(id)
+  expandedGroups.value = s
+}
+// 重命名：组行「重命名」→ 组名变输入框，回车/失焦保存，Esc 取消
+const renamingId = ref(null)
+const renamingName = ref('')
+function startRename(m) {
+  renamingId.value = m._groupId
+  renamingName.value = m.providerId
+  nextTick(() => {
+    const el = document.querySelector('.rename-input input')
+    if (el) { el.focus(); el.select() }
+  })
+}
+function commitRename() {
+  if (!renamingId.value) return
+  const name = renamingName.value.trim()
+  if (name) {
+    mergeGroups.value = mergeGroups.value.map((g) =>
+      g.id === renamingId.value ? { ...g, name } : g)
+    saveGroups()
+    ElMessage.success(`已重命名为「${name}」`)
+  }
+  renamingId.value = null
+  renamingName.value = ''
+}
+function cancelRename() {
+  renamingId.value = null
+  renamingName.value = ''
+}
+function toggleExpand(id) {
+  const s = new Set(expandedGroups.value)
+  if (s.has(id)) s.delete(id)
+  else s.add(id)
+  expandedGroups.value = s
+}
+// byModel（后端按 provider+model 聚合后）再叠手动合并组；占比/排序/分页都吃合并后的行
+const groupedModels = computed(() => applyGroups(byModel.value, mergeGroups.value))
+
 const filteredModels = computed(() => {
   const kw = q.value.trim().toLowerCase()
-  const rows = kw ? byModel.value.filter(m => m.modelId.toLowerCase().includes(kw)) : byModel.value
+  const rows = kw
+    ? groupedModels.value.filter(m =>
+      (m.modelId || '').toLowerCase().includes(kw) || (m.providerId || '').toLowerCase().includes(kw))
+    : groupedModels.value
   const d = sortDir.value === 'desc' ? -1 : 1
   return [...rows].sort((a, b) =>
     sortKey.value === 'model' ? d * a.modelId.localeCompare(b.modelId) : d * ((a[sortKey.value] || 0) - (b[sortKey.value] || 0)))
@@ -445,8 +547,8 @@ function ttftText(m) {
     <div class="card">
       <div class="card-label">总 token</div>
       <div class="card-value num">{{ fmt(totals.totalTokens) }}</div>
-      <!-- 总量 = 计费输入 + 输出 -->
-      <div class="card-foot dim">计费输入 {{ fmt(billedInput) }} · 输出 {{ fmt(totals.outputTokens) }}</div>
+      <!-- 总量 = 总输入 + 输出 -->
+      <div class="card-foot dim">总输入 {{ fmt(billedInput) }} · 输出 {{ fmt(totals.outputTokens) }}</div>
     </div>
     <div class="card">
       <div class="card-label">请求数</div>
@@ -460,7 +562,7 @@ function ttftText(m) {
     <div class="card">
       <div class="card-label">缓存命中率</div>
       <div class="card-value num">{{ pct(totals.cacheHitRate) }}</div>
-      <!-- 分子 / 分母直接写出来，便于核对口径（命中 / 计费输入） -->
+      <!-- 分子 / 分母直接写出来，便于核对口径（命中 / 总输入） -->
       <div class="card-foot dim">
         {{ fmt(totals.cacheReadTokens) }} / {{ fmt(billedInput) }}
       </div>
@@ -518,6 +620,10 @@ function ttftText(m) {
       <h3>用量归因（provider / 模型）</h3>
       <div class="controls">
         <el-input v-if="byModel.length" v-model="q" size="small" clearable placeholder="搜索模型名" style="width:160px" />
+        <!-- 合并模式开关：时间胶囊右边。开启后各行出现勾选框，选中即合 -->
+        <button v-if="byModel.length" class="merge-toggle" :class="{ on: merging }" @click="toggleMergeMode">
+          {{ merging ? '取消合并' : '合并' }}
+        </button>
         <!-- 时间胶囊只管归因区（stat card + 归因表），管不到热力图 -->
         <div class="range-pill-wrap">
           <button class="range-pill" :class="{ on: pillOpen }" @click.stop="pillOpen = !pillOpen">
@@ -549,9 +655,19 @@ function ttftText(m) {
     </div>
     <p v-if="!byModel.length" class="dim">还没有用量记录 —— 发一次请求后这里会出现明细。</p>
     <p v-else-if="!filteredModels.length" class="dim">没有匹配「{{ q }}」的模型。</p>
-    <table v-else class="attr">
+    <!-- 合并确认条：独立 v-if，不进上面的互斥链——否则它一出现就把表格挤掉。
+         回车只收起键盘（blur），真正合并只走「确认合并」按钮，避免输一半误触 -->
+    <div v-if="byModel.length && filteredModels.length && merging && canMerge" class="merge-bar">
+      <span class="dim">已选 {{ checkedKeys.size }} 行，合并为</span>
+      <el-input v-model="mergeName" size="small" clearable placeholder="组名，如 Zen"
+        style="width:160px" @keydown.enter="$event.isComposing ? null : $event.target.blur()" />
+      <button type="button" class="merge-apply" @click="doMerge">确认合并</button>
+    </div>
+    <p v-if="byModel.length && filteredModels.length && merging && !canMerge" class="dim merge-hint">勾选要合并的行（至少选两行）</p>
+    <table v-if="filteredModels.length" class="attr">
       <thead>
         <tr>
+          <th v-if="merging" class="check-col"></th>
           <th>Provider / 模型</th>
           <th v-for="k in SORTABLE" :key="k" class="n sortable" @click="setSort(k)">
             {{ { requests:'请求', inputTokens:'输入', outputTokens:'输出', avgTps:'输出速度', cacheReadTokens:'缓存读取', cacheHitRate:'命中率', totalTokens:'总 token', errors:'失败' }[k] }}
@@ -562,10 +678,34 @@ function ttftText(m) {
         </tr>
       </thead>
       <tbody>
-        <tr v-for="m in pagedModels" :key="m.sourceId + '/' + m.providerId + '/' + m.modelId">
+        <template v-for="m in pagedModels" :key="(m._groupId || '') + m.sourceId + '/' + m.providerId + '/' + m.modelId">
+        <tr>
+          <td v-if="merging" class="check-col">
+            <input v-if="checkKeyOf(m)" type="checkbox" :checked="checkedKeys.has(checkKeyOf(m))"
+              @change="toggleCheck(checkKeyOf(m))" :aria-label="'选择 ' + m.providerId + '/' + m.modelId" />
+          </td>
           <td>
-            <div class="src-name">{{ sourceName(m.sourceId, m.providerId) }}</div>
-            <div class="model-line"><span class="model-name">{{ m.modelId }}</span></div>
+            <!-- 组行：组名 + 展开/重命名/拆分；明细行：原 provider 显示名 + 模型 -->
+            <template v-if="m._groupId">
+              <div v-if="renamingId === m._groupId" class="rename-wrap">
+                <!-- 中文输入法选字时的回车（isComposing）不提交，等组词完成后的回车才保存 -->
+                <el-input v-model="renamingName" size="small" class="rename-input" style="width:140px"
+                  @keydown.enter="e => { if (!e.isComposing) commitRename() }"
+                  @keydown.esc="cancelRename" @blur="commitRename" />
+              </div>
+              <div v-else class="src-name">{{ m.providerId }}
+                <button class="link-btn" @click="toggleExpand(m._groupId)">
+                  {{ expandedGroups.has(m._groupId) ? '收起' : '展开' }}({{ m._members.length }})
+                </button>
+                <button class="link-btn" @click="startRename(m)">重命名</button>
+                <button class="link-btn danger" @click="unmerge(m._groupId)">拆分</button>
+              </div>
+              <div class="model-line dim">手动合并组</div>
+            </template>
+            <template v-else>
+              <div class="src-name">{{ sourceName(m.sourceId, m.providerId) }}</div>
+              <div class="model-line"><span class="model-name">{{ m.modelId }}</span></div>
+            </template>
           </td>
           <td class="n num">{{ fmt(m.requests) }}</td>
           <td class="n num">{{ fmt(m.inputTokens) }}</td>
@@ -573,7 +713,7 @@ function ttftText(m) {
           <!-- TPS/TTFT 成对展示（DSH 口径）；sampled=0 显示 —，缺数据不产出 0.0 -->
           <td class="n num" :class="{ dim: m.sampled === 0 }">{{ tpsText(m) }}</td>
           <td class="n num">{{ fmt(m.cacheReadTokens) }}</td>
-          <!-- 命中率：后端下发的 cacheHitRate（DSH 口径，见 usage/store.ts hitRate）；无输入显示 — -->
+          <!-- 命中率：后端下发的 cacheHitRate（缓存读取 / 总输入，见 usage/store.ts hitRate）；无输入显示 — -->
           <td class="n num" :class="{ dim: m.cacheHitRate == null }">
             {{ m.cacheHitRate == null ? '—' : pct(m.cacheHitRate) }}
           </td>
@@ -582,6 +722,28 @@ function ttftText(m) {
           <td class="n num" :class="{ dim: m.avgTtftMs == null }">{{ ttftText(m) }}</td>
           <td class="bar-col"><div class="bar" :title="shareTip(m)"><div class="bar-fill" :style="{ width: (share(m) * 100) + '%' }" /></div></td>
         </tr>
+        <!-- 展开的组明细：缩进展示原行 -->
+        <tr v-if="m._groupId && expandedGroups.has(m._groupId)" v-for="sub in m._members"
+          :key="'sub-' + sub.sourceId + '/' + sub.providerId + '/' + sub.modelId" class="sub-row">
+          <td v-if="merging" class="check-col"></td>
+          <td>
+            <div class="src-name sub-name">{{ sourceName(sub.sourceId, sub.providerId) }}</div>
+            <div class="model-line"><span class="model-name">{{ sub.modelId }}</span></div>
+          </td>
+          <td class="n num">{{ fmt(sub.requests) }}</td>
+          <td class="n num">{{ fmt(sub.inputTokens) }}</td>
+          <td class="n num">{{ fmt(sub.outputTokens) }}</td>
+          <td class="n num" :class="{ dim: sub.sampled === 0 }">{{ tpsText(sub) }}</td>
+          <td class="n num">{{ fmt(sub.cacheReadTokens) }}</td>
+          <td class="n num" :class="{ dim: sub.cacheHitRate == null }">
+            {{ sub.cacheHitRate == null ? '—' : pct(sub.cacheHitRate) }}
+          </td>
+          <td class="n num">{{ fmt(sub.totalTokens) }}</td>
+          <td class="n num" :class="{ 'err': sub.errors > 0 }">{{ sub.errors || '' }}</td>
+          <td class="n num" :class="{ dim: sub.avgTtftMs == null }">{{ ttftText(sub) }}</td>
+          <td class="bar-col"><div class="bar" :title="shareTip(sub)"><div class="bar-fill" :style="{ width: (share(sub) * 100) + '%' }" /></div></td>
+        </tr>
+        </template>
       </tbody>
     </table>
     <div v-if="pageCount > 1" class="pager">
@@ -723,6 +885,42 @@ function ttftText(m) {
 
 /* ---- 归因表 ---- */
 .attr { width: 100%; border-collapse: collapse; font-size: 12px; }
+/* 右上角合并开关：与时间胶囊并排的轻量按钮 */
+.merge-toggle {
+  border: 1px solid var(--line); background: var(--panel-2); color: var(--dim);
+  border-radius: 999px; padding: 5px 13px; font-size: 12px; cursor: pointer; white-space: nowrap;
+  transition: border-color .15s, color .15s;
+}
+.merge-toggle:hover { color: var(--text); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.merge-toggle.on { color: var(--accent); border-color: var(--accent); }
+/* 合并确认条：合并模式下选中 2+ 行后出现 */
+.merge-bar {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 10px; padding: 8px 12px;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+  font-size: 12px;
+}
+.merge-hint { margin: 0 0 10px; font-size: 12px; }
+.merge-apply {
+  border: 1px solid var(--accent); color: var(--accent); background: none;
+  border-radius: 6px; padding: 3px 14px; font-size: 12px; cursor: pointer;
+}
+.merge-apply:hover { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.check-col { width: 28px; }
+.check-col input { cursor: pointer; accent-color: var(--accent); }
+/* 组行操作：展开/拆分是行内小字按钮，不是主要操作 */
+.link-btn {
+  border: none; background: none; color: var(--accent);
+  font-size: 11px; cursor: pointer; padding: 0 4px;
+}
+.link-btn:hover { text-decoration: underline; }
+.link-btn.danger { color: var(--dim); }
+.link-btn.danger:hover { color: var(--bad); }
+/* 重命名输入框：行内小输入，与小字按钮同高 */
+.rename-wrap { display: flex; align-items: center; }
+/* 展开的明细行：缩进 + 弱化，表明从属关系 */
+.sub-row td { background: color-mix(in srgb, var(--panel-2) 55%, transparent); }
+.sub-name { padding-left: 14px; }
 .attr th { text-align: left; color: var(--dim); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--line); }
 .attr td { padding: 7px 8px; border-bottom: 1px solid var(--line); }
 .attr tr:last-child td { border-bottom: 0; }

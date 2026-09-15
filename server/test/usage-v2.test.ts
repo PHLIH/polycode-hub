@@ -218,38 +218,33 @@ describe('账号维度聚合（ACCOUNT-HEALTH §3.4）', () => {
   })
 })
 
-describe('缓存命中率对齐 DSH 口径（TokenUsage 互斥三桶）', () => {
-  // DSH 定义（dsh-client-ui-chat StatsPills.cacheHitPercent + dsh-llm-deepseek mapUsage）：
-  //   上游 prompt_tokens 已含 cache hit → DSH 落库时把命中数减出去（互斥计数）：
-  //     uncachedInputTokens = prompt_tokens - cacheRead
-  //   命中率分母 = 三个互斥桶相加 = uncachedInput + cacheRead + cacheWrite
-  //   命中率     = cacheRead / billedInputTokens
-  // 本项目 input_tokens 存上游原值（含 read），所以等价分母 = input + cacheCreation。
-  test('breakdown.totals：分母 = input + cacheCreation（read 不再重复计入）', async () => {
+describe('缓存命中率 = 缓存读取 / 总输入', () => {
+  // OpenAI 系 input（prompt_tokens）已含 cached → 总输入 = input 本身。
+  test('breakdown.totals：命中率 = read / input（creation 是 input 子集，不另加）', async () => {
     const store = await Store.open(join(dir, 'hit-dsh.db'))
     const mk = (over: Partial<UsageLog>) => log({
       ts: new Date('2026-09-13T12:00:00Z'), providerId: 'p1', sourceId: 's', modelId: 'm1', ...over,
     })
-    // 上游 prompt=1000 含 read=800，write=100 → DSH: uncached=200, denom=200+800+100=1100
-    await store.insertLog(mk({ requestId: 'a', status: 'ok', inputTokens: 1000, cacheReadTokens: 800, cacheCreationTokens: 100 }))
+    // 实抓形态：prompt=425 含 read=320，miss=105 → 320/425
+    await store.insertLog(mk({ requestId: 'a', status: 'ok', inputTokens: 425, cacheReadTokens: 320, cacheCreationTokens: 105 }))
     const bd = await store.breakdown(new Date(0))
-    // 旧口径 read/input = 800/1000 = 0.8（偏低）；DSH 口径 = 800/1100
-    expect(bd.totals.cacheHitRate).toBeCloseTo(800 / 1100, 10)
+    // 旧口径 read/(input+creation) = 320/530（偏低）
+    expect(bd.totals.cacheHitRate).toBeCloseTo(320 / 425, 10)
     await store.close()
   })
 
-  test('byModel：每行命中率同口径（分母 = input + cacheCreation）', async () => {
+  test('byModel：每行命中率同口径（分母 = input）', async () => {
     const store = await Store.open(join(dir, 'hit-dsh-model.db'))
     await store.insertLog(log({
       requestId: 'a', providerId: 'p1', sourceId: 's', modelId: 'm1',
       inputTokens: 1000, cacheReadTokens: 800, cacheCreationTokens: 100, status: 'ok',
     }))
     const bd = await store.breakdown(new Date(0))
-    expect(bd.byModel[0]!.cacheHitRate).toBeCloseTo(800 / 1100, 10)
+    expect(bd.byModel[0]!.cacheHitRate).toBeCloseTo(800 / 1000, 10)
     await store.close()
   })
 
-  test('无 cacheCreation 时两口径恒等（read/input）', async () => {
+  test('无 cacheCreation 时恒为 read/input', async () => {
     const store = await Store.open(join(dir, 'hit-equal.db'))
     await store.insertLog(log({
       requestId: 'a', providerId: 'p1', sourceId: 's', modelId: 'm1',
@@ -261,7 +256,7 @@ describe('缓存命中率对齐 DSH 口径（TokenUsage 互斥三桶）', () => 
     await store.close()
   })
 
-  test('输入侧为 0 → null（缺数据不产出 0.0，DSH 返回 null）', async () => {
+  test('输入侧为 0 → null（缺数据不产出 0.0）', async () => {
     const store = await Store.open(join(dir, 'hit-null.db'))
     await store.insertLog(log({ requestId: 'a', providerId: 'p1', sourceId: 's', modelId: 'm1', status: 'upstream_error' }))
     const bd = await store.breakdown(new Date(0))
@@ -269,14 +264,14 @@ describe('缓存命中率对齐 DSH 口径（TokenUsage 互斥三桶）', () => 
     await store.close()
   })
 
-  test('零命中的 provider 不再排除出分母（DSH 把所有 billed input 计入）', async () => {
+  test('零命中的 provider 计入分母（不稀释不行）', async () => {
     const store = await Store.open(join(dir, 'hit-zero.db'))
     const mk = (over: Partial<UsageLog>) => log({
       ts: new Date('2026-09-13T12:00:00Z'), sourceId: 's', modelId: 'm1', ...over,
     })
-    // p1 全命中：read=100, input=100 → DSH denom=100
+    // p1 全命中：read=100, input=100
     await store.insertLog(mk({ requestId: 'a', providerId: 'p1', status: 'ok', inputTokens: 100, cacheReadTokens: 100 }))
-    // p2 零命中：input=900 → DSH denom=900（旧实现把它整个丢掉，导致整体虚高）
+    // p2 零命中：input=900（旧实现把它整个丢掉，导致整体虚高）
     await store.insertLog(mk({ requestId: 'b', providerId: 'p2', status: 'ok', inputTokens: 900 }))
     const bd = await store.breakdown(new Date(0))
     expect(bd.totals.cacheHitRate).toBeCloseTo(100 / 1000, 10)

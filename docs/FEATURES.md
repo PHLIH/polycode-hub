@@ -143,9 +143,9 @@
 
 SQLite 持久化（`usage/store.ts`，schema v2，`user_version` 前向迁移，建表恒最新、缺列 ALTER 且幂等，`:1-8`）。硬规则：`cacheRead / cacheCreation` 独立字段存储，绝不混入 input；accuracy 原样保存，估算值仅展示不可计费；P0 不记金额（`:2-4`）。
 
-- **total**：`totalOf:259-263`，`total = input + creation + output`（reasoning 已含 output，不重复计；旧公式重复计 read 已废弃，读时重算不读存量列）。
+- **total**：`totalOf`，`total = input + output`（上游 wire 总量；reasoning 已含 output 不重复计；cacheCreation/miss 是 input 子集不另加；读时重算不读存量列）。
 - **TPS**：总输出 / 总“生成段”耗时（tok/s）。SQL：`avgTps = SUM(守卫内 output) * 1000 / SUM(守卫内 latency_ms - first_token_ms)`，分母已扣 TTFT（decode 段）。守卫：`status='ok' AND stream=1 AND first_token_ms>0 AND latency_ms>first_token_ms`（缺失字段行被排除）；无样本时 `avgTps / avgTtftMs` 为 null，前端显示 —（`usage/store.ts:58-63,347-364`，`Dashboard.vue:412-420`）。
-- **缓存命中率**：`hitRate = read / (input + creation)`（`usage/store.ts:279-284`），无输入返回 null；零命中源计入分母（`:302-309`）。Anthropic 系 read 独立成块（separate），OpenAI 系 cached 已含 input 内（subset）——总量公式见 `ir/types.ts:79-88 usageTotal`，SQL 侧同公式。
+- **缓存命中率**：`hitRate = read / input`（缓存命中 / 总输入；OpenAI 系 input 已含 cached，`usage/store.ts`），无输入返回 null；零命中源计入分母。总量公式见 `ir/types.ts usageTotal`。
 - **账号维度**：哪个号被限额一眼认出（`usage/store.ts:72-96 AccountUsage`：requests / errors / errorRate / byKind{quota/rate_limit/auth/…} / tokens / lastErrorAt / models 明细）。
 
 ## 10. ZCode sidecar（本地引擎托管，胶水层）

@@ -696,9 +696,8 @@ describe('stats/breakdown（真实 usage Store）', () => {
       expect(stats.tokens.inputTokens).toBe(11)
       expect(stats.tokens.outputTokens).toBe(20)
       expect(stats.tokens.cacheReadTokens).toBe(5)
-      // DSH 计费口径：r1 billedInput(10+3)+output(20)=33，r2=1+0=1 → 34
-      // （旧公式 31 漏了 cacheCreation，更早的公式还会把子集缓存重复计入）
-      expect(stats.tokens.totalTokens).toBe(34)
+      // 上游 wire 口径：r1 input(10)+output(20)=30，r2=1+0=1 → 31
+      expect(stats.tokens.totalTokens).toBe(31)
 
       const bdAll = await call('GET', '/admin/api/breakdown', { key: 'secret' })
         .then((r) => r.json()) as Breakdown

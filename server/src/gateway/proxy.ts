@@ -55,8 +55,7 @@ export function mapUpstreamError(ue: UpstreamError | undefined): IrError {
 }
 
 // 按字段级「最新优先」把流事件中的 usage 合并进用量记录。
-// totalTokens 不在此逐事件重算：同 provider 语义未知时（读半截流无法判定 subset/separate）
-// 早算必错一边；落库时 Store.insertLog 按全库判据统一口径。
+// totalTokens 不在此逐事件重算：落库时 Store.insertLog 按上游 wire 口径统一求和。
 export function mergeStreamUsage(ul: UsageLog, ev: StreamEvent): void {
   const u = ev.usage
   if (!u) return

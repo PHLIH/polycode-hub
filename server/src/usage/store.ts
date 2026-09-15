@@ -52,7 +52,7 @@ export interface ModelPoint {
   cacheCreationTokens: number
   totalTokens: number
   errors: number
-  // 该模型的缓存命中率，分母为 DSH 口径的 billed input（见 hitRate）。
+  // 该模型的缓存命中率 = 缓存读取 / 总输入（见 hitRate）。
   // 无输入侧流量为 null（显示 —，不假装 0）。
   cacheHitRate: number | null
   // TPS（DSH 口径，P2）：总输出 / 总「生成段」耗时（tok/s）。
@@ -96,7 +96,7 @@ export interface AccountUsage {
 }
 
 export class Store {
-  // 用量落盘与聚合：insertLog 按 DSH 口径（input + creation + output）求 total；
+  // 用量落盘与聚合：insertLog 按上游 wire 口径（input + output）求 total；
   // summarize/breakdown/accountBreakdown 读时重算总量（不读存量列，历史脏行不污染口径）。
   private db: InstanceType<typeof DatabaseSync>
 
@@ -142,10 +142,7 @@ export class Store {
     this.db.close()
   }
 
-  // 写入一条用量记录。total_tokens 按 DSH 计费口径求和落盘：
-  //   total = input + cacheCreation + output（推导见 totalOf）
-  // 与 provider 语义无关，故不再需要「首次判定 separate 后回填老行」的 UPDATE——
-  // 那段回填用的正是会重复计 read 的旧公式，留着反而会持续制造脏行。
+  // 写入一条用量记录。total_tokens = input + output（上游 wire 总量口径）。
   // 旧库曾有 7 条 account_id='-' 脏数据（历史写入，已整体清空），此处守卫防复发。
   async insertLog(l: UsageLog): Promise<void> {
     const total = Store.totalOf(l.inputTokens, l.outputTokens, l.cacheCreationTokens)
@@ -211,8 +208,8 @@ export class Store {
   }
 
   // 聚合 since（含）之后、until（不含）之前的请求；accountID 非空时只统计该账号。
-  // 总量按 DSH 计费口径（billedInput + output）逐组求和再汇总，口径与 provider 语义无关。
-  // 总量不读存量 total_tokens 列，一律读时重算——历史脏行（旧公式会重复计 read）不再污染口径。
+  // 总量 = input + output（上游 wire 总量口径），逐组求和再汇总。
+  // 总量不读存量 total_tokens 列，一律读时重算——历史脏行（旧公式另加 creation）不再污染口径。
   async summarize(since: Date, until?: Date, accountId = ''): Promise<Summary> {
     const acct = accountId ? ' AND account_id = @accountId' : ''
     const rows = this.db.prepare(`SELECT
@@ -244,69 +241,50 @@ export class Store {
     return sum
   }
 
-  // ---- 语义感知总量（与命中率同判据）----
+  // ---- 总量与命中率（与命中率同判据）----
 
-  // 单行总量：对齐 DSH 计费口径（dsh-client-ui-chat UsagePill, client.js:4016）：
-  //   total = billedInputTokens + outputTokens
-  // 其中 billedInput = 三个互斥桶之和 = uncachedInput + cacheRead + cacheWrite。
-  //
-  // 本项目 input_tokens 存上游原值（OpenAI/DeepSeek 系已含 read；anthropic 系 read 独立），
-  // 两种协议下 "input + read + creation" 的含义不同，但换算到 DSH 的互斥口径后
-  // 结果统一为：
-  //   billedInput = (input - read) + read + creation = input + creation
-  // 故 total = input + creation + output —— 与语义无关。
-  //
-  // 修正的旧 bug：separate 语义下用 input+output+read+creation，而 input 已含 read，
-  // 等于把缓存读重复计一遍（实测全库虚高 5600 万）。reasoning 已含于 output，不重复计。
+  // 单行总量 = 上游 wire 总量：input + output。
+  // OpenAI 系（workbuddy/zen，openai-completions/responses）prompt_tokens 已含
+  // cached 全量，wire total = prompt + completion；cacheCreation（miss）是 prompt
+  // 的子集，另加即重复计数（实抓：prompt=425/cached=320/miss=105 时 wire=435，
+  // input+creation+output=540）。Anthropic 系三桶互斥，理论总量应另加 read+creation，
+  // 但本机现行流量 100% OpenAI 系（全库无 read>input），YAGNI 不做语义分支；
+  // 若日后 Anthropic 流量出现（read>input），再加 protocol 列分支。
+  // reasoning 已含于 output，不重复计。
   private static totalOf(
-    inputTokens: number, outputTokens: number, cacheCreationTokens: number,
+    inputTokens: number, outputTokens: number, _cacheCreationTokens = 0,
   ): number {
-    return inputTokens + cacheCreationTokens + outputTokens
+    return inputTokens + outputTokens
   }
 
-  // 命中率口径对齐 DSH（dsh-token-meter 的 TokenUsage + StatsPills.cacheHitPercent）：
-  //   DSH 的 harness 约定是「互斥计数」——上游 prompt_tokens 已含 cache hit，
-  //   所以 dsh-llm 的 mapUsage 落库时把命中数【减出去】：
-  //     uncachedInputTokens = prompt_tokens - cacheRead
-  //   命中率 = cacheRead / billedInputTokens，
-  //   而 billedInputTokens = uncachedInput + cacheRead + cacheWrite（三个互斥桶相加）。
-  //
-  // 本项目 input_tokens 存上游原值（已含 read，不减），故与其等价的 DSH 分母是：
-  //   (input - read) + read + creation = input + creation
-  // 即【分母要加上 cacheCreation】。旧实现用 read/input，漏掉了缓存写入那一块，
-  // 于是同一个模型经本网关算出来的命中率比 DSH 显示的低。
-  //
-  // 无 cacheCreation 时两式恒等（read/input），与旧行为一致，不需要数据迁移。
-  // 输入侧为 0 返回 null（缺数据不产出 0.0，DSH 同样是 null）。
+  // 命中率 = 缓存读取 / 总输入（用户口径：命中了多少输入）。
+  // OpenAI 系 input（prompt_tokens）已含 cached → 总输入 = input 本身。
+  // 无输入返回 null（缺数据不产出 0.0，前端显示 —）。
   private hitRate(
-    inputTokens: number, cacheReadTokens: number, cacheCreationTokens = 0,
+    inputTokens: number, cacheReadTokens: number, _cacheCreationTokens = 0,
   ): number | null {
-    const denom = inputTokens + cacheCreationTokens
-    return denom > 0 ? cacheReadTokens / denom : null
+    return inputTokens > 0 ? cacheReadTokens / inputTokens : null
   }
 
   // 仪表盘聚合：区间合计 + 每日序列 + 按模型归因（byModel 按总 token 降序）。
   // accountID 非空时全部分组只统计该账号（ACCOUNT-HEALTH：详情页复用 breakdown）。
   async breakdown(since: Date, until?: Date, accountId = ''): Promise<Breakdown> {
     const sum = await this.summarize(since, until, accountId)
-    // 合计：按 DSH 口径汇总——分子是所有 provider 的 cacheRead，分母是全部
-    // billed input（uncached + read + write）。零命中的源【必须计入分母】：
+    // 合计命中率 = 总缓存读取 / 总输入。零命中源计入分母（不稀释不行）：
     // 旧实现 `if (g.cacheReadTokens === 0) continue` 把零命中源的输入整个丢掉，
-    // 分母虚小而命中率虚高（测出来的偏差比公式本身还大）。
+    // 分母虚小而命中率虚高。
     const perProv = this.db.prepare(`SELECT
       provider_id AS providerId,
       COALESCE(SUM(input_tokens),0) AS inputTokens,
-      COALESCE(SUM(cache_read_tokens),0) AS cacheReadTokens,
-      COALESCE(SUM(cache_creation_tokens),0) AS cacheCreationTokens
+      COALESCE(SUM(cache_read_tokens),0) AS cacheReadTokens
       FROM usage_logs WHERE ts >= @since${Store.range(until)}${accountId ? ' AND account_id = @accountId' : ''}
       GROUP BY provider_id`).all(this.params(since, until, accountId)) as unknown as
-      { providerId: string; inputTokens: number; cacheReadTokens: number; cacheCreationTokens: number }[]
+      { providerId: string; inputTokens: number; cacheReadTokens: number }[]
     let hitNum = 0
     let inputDenom = 0
     for (const g of perProv) {
-      // DSH 的 billedInputTokens = uncached(input-read) + read + write = input + write
       hitNum += g.cacheReadTokens
-      inputDenom += g.inputTokens + g.cacheCreationTokens
+      inputDenom += g.inputTokens
     }
     const cacheHitRate = inputDenom > 0 ? hitNum / inputDenom : 0
     const acct = accountId ? ' AND account_id = @accountId' : ''
@@ -324,7 +302,7 @@ export class Store {
       FROM usage_logs WHERE ts >= @since${Store.range(until)}${acct}
       GROUP BY day, provider_id ORDER BY day ASC`)
       .all(p) as unknown as (DailyPoint & { providerId: string })[]
-    // daily 按 (day, provider) 分开算总量再合（口径与 provider 语义无关，合起来即对）。
+    // daily 按 (day, provider) 分开算总量再合（总量 = input + output，合起来即对）。
     const dailyMerged = new Map<string, DailyPoint>()
     for (const r of daily) {
       const total = Store.totalOf(r.inputTokens, r.outputTokens, r.cacheCreationTokens)
@@ -365,12 +343,12 @@ export class Store {
       GROUP BY provider_id, source_id, model_id`)
       .all(p) as unknown as ModelPoint[]
 
-    // 每行补总量与命中率（与 totals 同源、同为 DSH 口径）
+    // 每行补总量与命中率（与 totals 同源：总量 = input + output，命中率 = read / input）
     for (const m of byModel) {
       m.totalTokens = Store.totalOf(m.inputTokens, m.outputTokens, m.cacheCreationTokens)
       m.cacheHitRate = this.hitRate(m.inputTokens, m.cacheReadTokens, m.cacheCreationTokens)
     }
-    // byModel 按总量降序：SQL 侧不再 ORDER（总量是 TS 侧按 DSH 口径重算的，SQL 排不准），
+    // byModel 按总量降序：SQL 侧不再 ORDER（总量是 TS 侧重算的，SQL 排不准），
     // 统一由 TS 侧重排。
     byModel.sort((a, b) => b.totalTokens - a.totalTokens)
 
@@ -380,7 +358,7 @@ export class Store {
   // 账号维度聚合（ACCOUNT-HEALTH §3.4）：
   // GROUP BY account_id；ByKind 按 (account_id, error_kind) 二级分组拼装（加新 kind 不改 SQL）；
   // 模型拆分子查询；空 account_id 单独成组（Provider 级凭据，诚实表达不隐藏）。
-  // 总量同样语义感知：按 (account_id, provider_id) / (account_id, provider_id, model_id)
+  // 总量 = input + output，按 (account_id, provider_id) / (account_id, provider_id, model_id)
   // 分组重算再汇总，避免账号页与仪表盘口径分裂。
   async accountBreakdown(since: Date, until?: Date): Promise<AccountUsage[]> {
     const p = this.params(since, until)

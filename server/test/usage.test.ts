@@ -16,8 +16,8 @@ const log = (over: Partial<UsageLog>): UsageLog => ({
   latencyMs: 5, status: 'ok', stream: false, ...over,
 })
 
-describe('usage store（schema/总量口径对齐 DSH TokenUsage）', () => {
-  test('写入：单行 total 由求和覆盖（DSH 口径 = input + cacheCreation + output）', async () => {
+describe('usage store（schema/总量口径 = 上游 wire 总量）', () => {
+  test('写入：单行 total 由求和覆盖（total = input + output）', async () => {
     const store = await Store.open(join(dir, 'usage.db'))
     await store.insertLog(log({
       inputTokens: 10, outputTokens: 20, cacheReadTokens: 5,
@@ -30,8 +30,9 @@ describe('usage store（schema/总量口径对齐 DSH TokenUsage）', () => {
     expect(sum.cacheReadTokens).toBe(5)
     expect(sum.cacheCreationTokens).toBe(3)
     expect(sum.reasoningTokens).toBe(8)
-    // DSH 口径：billedInput(10+3) + output(20) = 33；reasoning 已含于 output，不重复计
-    expect(sum.totalTokens).toBe(33)
+    // 上游 wire 总量：input(10) + output(20) = 30；reasoning 已含于 output，不重复计；
+    // cacheCreation（miss）是 input 的子集，不另加
+    expect(sum.totalTokens).toBe(30)
     expect(sum.errors).toBe(0)
     await store.close()
   })
@@ -65,9 +66,8 @@ describe('usage store（schema/总量口径对齐 DSH TokenUsage）', () => {
     await store.insertLog(log({ providerId: 'small', sourceId: 's', inputTokens: 10 }))
     const bd = await store.breakdown(new Date(0))
     expect(bd.totals.requests).toBe(2)
-    // 命中率口径对齐 DSH（2026-09-15）：分母是全部 billed input（三互斥桶之和）。
-    // big: input=100 含 read=50 → uncached=50, denom=50+50=100；small: 无缓存，
-    // denom=10。合计 = 50/110。旧实现把零命中源整个排除出分母（虚高），已修正。
+    // 命中率 = 缓存读取 / 总输入：read=50，总输入=100+10=110 → 50/110。
+    // 旧实现把零命中源整个排除出分母（虚高），已修正。
     expect(bd.totals.cacheHitRate).toBeCloseTo(50 / 110)
     expect(bd.byModel[0]!.providerId).toBe('big')
     expect(bd.byModel[0]!.requests).toBe(1)
@@ -121,24 +121,21 @@ describe('usage store（schema/总量口径对齐 DSH TokenUsage）', () => {
     await store.close()
   })
 
-  // 命中率口径（2026-09-15 修正为 DSH 口径）：
-  //   DSH TokenUsage 契约（dsh-llm types.d.ts）：三桶【互斥】——inputTokens 只含
-  //   未缓存输入，缓存读/写单独计；billed input = 三桶之和。上游把命中折进 prompt
-  //   总数的（DeepSeek 系），适配器要【减出去】。
-  //   DSH 显示命中率 = cacheRead / billedInput（StatsPills.cacheHitPercent）。
-  // 本项目存上游原值（input 含 read），等价分母 = (input-read)+read+write = input+write。
-  // 旧实现的 bug：分母漏掉 cache_creation，且把零命中源整个排除出分母（虚高）。
-  test('命中率：分母含 cache_creation（分母 = input + write）', async () => {
+  // 命中率 = 缓存读取 / 总输入（用户口径：命中了多少输入）。
+  // OpenAI 系 input（prompt_tokens）已含 cached → 总输入 = input 本身。
+  // 旧实现的 bug：分母用 input + cacheCreation，把 miss 又加一遍（虚低）；
+  // 且把零命中源整个排除出分母（虚高）。
+  test('命中率：分母就是总输入（creation 不另加）', async () => {
     const store = await Store.open(join(dir, 'usage7.db'))
-    // 上游 prompt_tokens=1000 含 read=900，write=100 → DSH: uncached=100, denom=100+900+100=1100
+    // 实抓形态：prompt=425 含 read=320，miss=105 → 命中率 = 320/425
     await store.insertLog(log({ requestId: 'a', providerId: 'wb', modelId: 'm',
-      inputTokens: 1000, cacheReadTokens: 900, cacheCreationTokens: 100 }))
+      inputTokens: 425, cacheReadTokens: 320, cacheCreationTokens: 105 }))
     const bd = await store.breakdown(new Date(0))
-    expect(bd.totals.cacheHitRate).toBeCloseTo(900 / 1100)
+    expect(bd.totals.cacheHitRate).toBeCloseTo(320 / 425)
     await store.close()
   })
 
-  test('命中率：无 cache_creation 时等价于 read/input（不改变历史行为）', async () => {
+  test('命中率：无 cache_creation 时等价于 read/input', async () => {
     const store = await Store.open(join(dir, 'usage8.db'))
     await store.insertLog(log({ requestId: 'a', providerId: 'wb', modelId: 'm',
       inputTokens: 1000, cacheReadTokens: 900 }))
@@ -147,7 +144,7 @@ describe('usage store（schema/总量口径对齐 DSH TokenUsage）', () => {
     await store.close()
   })
 
-  test('命中率：多源汇总按 DSH 口径（分子分母各自累加，零命中源计入分母）', async () => {
+  test('命中率：多源汇总分子分母各自累加，零命中源计入分母', async () => {
     const store = await Store.open(join(dir, 'usage9.db'))
     // 全命中源：input 含 read=1000
     await store.insertLog(log({ requestId: 'o', providerId: 'wb', modelId: 'm1',
@@ -156,12 +153,11 @@ describe('usage store（schema/总量口径对齐 DSH TokenUsage）', () => {
     await store.insertLog(log({ requestId: 'a', providerId: 'zc', modelId: 'm2',
       inputTokens: 900 }))
     const bd = await store.breakdown(new Date(0))
-    // DSH: read=1000, billedInput = (1000-1000)+1000 + 900 = 1900
     expect(bd.totals.cacheHitRate).toBeCloseTo(1000 / 1900)
     await store.close()
   })
 
-  test('byModel 每行命中率同口径（分母 = input + write）', async () => {
+  test('byModel 每行命中率同口径（分母 = 总输入）', async () => {
     const store = await Store.open(join(dir, 'usage10.db'))
     await store.insertLog(log({ requestId: 'o', providerId: 'wb', modelId: 'm1',
       inputTokens: 1000, cacheReadTokens: 900 }))
@@ -170,49 +166,44 @@ describe('usage store（schema/总量口径对齐 DSH TokenUsage）', () => {
     const bd = await store.breakdown(new Date(0))
     const byKey = new Map(bd.byModel.map((m) => [`${m.providerId}/${m.modelId}`, m]))
     expect(byKey.get('wb/m1')!.cacheHitRate).toBeCloseTo(0.9)          // 900/1000
-    expect(byKey.get('zc/m2')!.cacheHitRate).toBeCloseTo(30 / 170)     // 30/(100+70)
+    expect(byKey.get('zc/m2')!.cacheHitRate).toBeCloseTo(30 / 100)     // 30/100
     await store.close()
   })
 })
 
-describe('总量口径：对齐 DSH 计费口径（billedInput + output）', () => {
-  // DSH 定义（dsh-client-ui-chat UsagePill, client.js:4016）：
-  //   total = billedInputTokens + outputTokens
-  //   billedInput = uncountedInput + cacheRead + cacheWrite（三互斥桶之和）
-  // 本项目 input_tokens 存上游原值（含 read），换算后 billedInput = input + creation，
-  // 故 total = input + cacheCreation + output —— 与 provider 语义无关。
-  // 旧实现 separate 语义下用 input+output+read+creation，read 被重复计一遍。
-  test('summarize：total = input + cacheCreation + output（read 不重复计）', async () => {
+describe('总量口径 = 上游 wire 总量（input + output）', () => {
+  // OpenAI 系 wire total = prompt + completion（cached/miss 都是 prompt 的子集）。
+  // 实抓：prompt=425/cached=320/miss=105 时 wire total=435。
+  // 旧实现总量用 input+creation+output=540，把 miss 重复计一遍。
+  test('summarize：total = input + output（creation 不重复计）', async () => {
     const store = await Store.open(join(dir, 'usage-total-subset.db'))
     await store.insertLog(log({ requestId: 'a', providerId: 'wb', modelId: 'm',
       inputTokens: 1000, outputTokens: 100, cacheReadTokens: 900 }))
     const sum = await store.summarize(new Date(0))
     expect(sum.inputTokens).toBe(1000)
     expect(sum.cacheReadTokens).toBe(900)
-    // DSH: uncached=100, read=900, write=0 → billedInput=1000, total=1000+100=1100
     expect(sum.totalTokens).toBe(1100)
     await store.close()
   })
 
-  test('summarize：anthropic 风味行（read > input）同样按 DSH 口径，不重复计 read', async () => {
+  test('summarize：带 creation 的行同样不重复计', async () => {
     const store = await Store.open(join(dir, 'usage-total-separate.db'))
     await store.insertLog(log({ requestId: 'a', providerId: 'zc', modelId: 'm',
       inputTokens: 100, outputTokens: 10, cacheReadTokens: 300, cacheCreationTokens: 20 }))
     const sum = await store.summarize(new Date(0))
-    // DSH: billedInput = input + write = 120, total = 120 + 10 = 130
-    // （旧实现给 430：把 read=300 又加了一遍，与 input 内的 read 重复）
-    expect(sum.totalTokens).toBe(130)
+    // wire 口径：100 + 10 = 110（旧实现给 130：把 creation=20 又加了一遍）
+    expect(sum.totalTokens).toBe(110)
     await store.close()
   })
 
-  test('summarize：多源汇总为各行之和（口径与语义无关，可直接相加）', async () => {
+  test('summarize：多源汇总为各行之和（可直接相加）', async () => {
     const store = await Store.open(join(dir, 'usage-total-mixed.db'))
     await store.insertLog(log({ requestId: 'o', providerId: 'wb', modelId: 'm1',
       inputTokens: 1000, outputTokens: 100, cacheReadTokens: 900 }))
     await store.insertLog(log({ requestId: 'a', providerId: 'zc', modelId: 'm2',
       inputTokens: 100, outputTokens: 10, cacheReadTokens: 300, cacheCreationTokens: 20 }))
     const sum = await store.summarize(new Date(0))
-    expect(sum.totalTokens).toBe(1100 + 130)
+    expect(sum.totalTokens).toBe(1100 + 110)
     await store.close()
   })
 
@@ -225,26 +216,23 @@ describe('总量口径：对齐 DSH 计费口径（billedInput + output）', () 
     const bd = await store.breakdown(new Date(0))
     const byKey = new Map(bd.byModel.map((m) => [`${m.providerId}/${m.modelId}`, m]))
     expect(byKey.get('wb/m1')!.totalTokens).toBe(1100)
-    expect(byKey.get('zc/m2')!.totalTokens).toBe(130)
-    expect(bd.totals.totalTokens).toBe(1230)
+    expect(byKey.get('zc/m2')!.totalTokens).toBe(110)
+    expect(bd.totals.totalTokens).toBe(1210)
     expect(bd.byModel[0]!.providerId).toBe('wb')
-    // byModel 各行加合 == totals（DSH 口径下依然可核对）
+    // byModel 各行加合 == totals
     expect(bd.byModel.reduce((a, m) => a + m.totalTokens, 0)).toBe(bd.totals.totalTokens)
     expect(bd.daily).toHaveLength(1)
-    expect(bd.daily[0]!.totalTokens).toBe(1230)
+    expect(bd.daily[0]!.totalTokens).toBe(1210)
     await store.close()
   })
 
-  test('总量可按 DSH 四互斥桶核对：uncached + read + write + output', async () => {
+  test('总量可按输入输出核对：total = input + output', async () => {
     const store = await Store.open(join(dir, 'usage-total-buckets.db'))
     await store.insertLog(log({ requestId: 'a', providerId: 'p1', modelId: 'm1',
       inputTokens: 1000, outputTokens: 77, cacheReadTokens: 800, cacheCreationTokens: 50 }))
     const bd = await store.breakdown(new Date(0))
     const t = bd.totals
-    const uncached = t.inputTokens - t.cacheReadTokens
-    const billedInput = uncached + t.cacheReadTokens + t.cacheCreationTokens
-    expect(billedInput).toBe(t.inputTokens + t.cacheCreationTokens)
-    expect(t.totalTokens).toBe(billedInput + t.outputTokens)
+    expect(t.totalTokens).toBe(t.inputTokens + t.outputTokens)
     await store.close()
   })
 
@@ -259,11 +247,11 @@ describe('总量口径：对齐 DSH 计费口径（billedInput + output）', () 
       inputTokens: 100, outputTokens: 10, cacheReadTokens: 300, cacheCreationTokens: 20 }))
     const rows = await store.accountBreakdown(new Date(0))
     const acc1 = rows.find((r) => r.accountId === 'acc1')!
-    expect(acc1.totalTokens).toBe(1230)
+    expect(acc1.totalTokens).toBe(1210)
     const m1 = acc1.models.find((m) => m.modelId === 'm1')!
     const m2 = acc1.models.find((m) => m.modelId === 'm2')!
     expect(m1.totalTokens).toBe(1100)
-    expect(m2.totalTokens).toBe(130)
+    expect(m2.totalTokens).toBe(110)
     await store.close()
   })
 })
