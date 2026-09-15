@@ -65,9 +65,19 @@ Thumbs.db
 .superpowers/
 /web/node_modules/
 
-# 远端只留 README：docs/ 整体下架（与 .local-docs/、/skills/ 同口径）。
-# 含 FEATURES.md、架构图（html/png/svg 体积大且是生成物）、交棒笔记等，本地保留、永不入库。
-/docs/
+# docs/ 分两类：对外文档入库，私人/生成物不入库。
+# 原标题是「远端只留 README：docs/ 整体下架」，但那样会把 README 里引用的架构图
+# 一起挡掉（README 有 ![架构图](docs/architecture.png)，公开后是死链）。
+# 改为按文件粒度控制：下面白名单放行对外资源，其余仍被 /docs/ 挡住。
+/docs/*
+!/docs/FEATURES.md
+!/docs/architecture.png
+!/docs/architecture.svg
+!/docs/polycode-hub.architecture.json
+# 仍然不入库（含本机绝对路径 /Users/... 与私人工作安排）：
+#   docs/HANDOFF-NEXT.md             交棒笔记
+#   docs/architecture.html           718K 可交互版，体积大
+#   docs/architecture.visual-check.json  构建工具校验产物
 
 # Agent 本地规划状态（非项目交付物）
 .zcode/

@@ -35,7 +35,7 @@
 
 ![polycode-hub 架构图](docs/architecture.png)
 
-[可交互版本](docs/architecture.html)（搜索 / 缩放 / 三条导览：主请求链路、调度与账号、管理与用量，由 [archify](https://github.com/tt-a1i/archify) 生成，源文件 [`docs/polycode-hub.architecture.json`](docs/polycode-hub.architecture.json)）。
+矢量版 [`docs/architecture.svg`](docs/architecture.svg)，图源文件 [`docs/polycode-hub.architecture.json`](docs/polycode-hub.architecture.json)（由 [archify](https://github.com/tt-a1i/archify) 生成；另有可搜索/缩放的可交互版本，体积较大，故未入库）。
 
 ---
 

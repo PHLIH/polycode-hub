@@ -1,0 +1,239 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="640" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,PingFang SC,Hiragino Sans GB,Microsoft YaHei,sans-serif" viewBox="0 0 1120 640" role="img" lang="zh-CN" aria-labelledby="archify-diagram-title archify-diagram-description" data-preset="classic" data-quality-profile="showcase">
+        <title id="archify-diagram-title">polycode-hub 架构图</title>
+        <desc id="archify-diagram-description">由 Archify 生成的架构图。</desc>
+        <!-- Definitions -->
+        <defs>
+          <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" class="m-default" />
+          </marker>
+          <marker id="arrowhead-emphasis" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" class="m-emphasis" />
+          </marker>
+          <marker id="arrowhead-security" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" class="m-security" />
+          </marker>
+          <marker id="arrowhead-dashed" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" class="m-dashed" />
+          </marker>
+          <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+            <path d="M 40 0 L 0 0 0 40" class="c-grid" stroke-width="0.5"/>
+          </pattern>
+        </defs>
+
+        <!-- Background Grid -->
+        <rect width="100%" height="100%" fill="url(#grid)" />
+
+        <!-- Boundaries (behind everything) -->
+        <rect data-graph-role="structural-frame" data-composition-frame-kind="region" data-composition-frame-id="0" data-composition-frame-label="网关进程：一个服务·一个端口" x="10" y="80" width="920" height="440" rx="12" class="c-region" stroke-width="1"/>
+
+        <rect data-graph-role="structural-frame" data-composition-frame-kind="security-group" data-composition-frame-id="1" data-composition-frame-label="凭据只存引用" x="470" y="80" width="460" height="440" rx="8" class="c-security-group" stroke-width="1"/>
+
+        <!-- Connection paths (before components for correct z-order) -->
+        <path data-edge-from="clients" data-edge-to="gateway" data-edge-label="三种协议 SSE/JSON" data-edge-key="0" data-edge-id="clients-to-gateway" data-composition-points="200,315;260,315" d="M 200 315 L 260 315" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="gateway" data-edge-to="codec" data-edge-label="入站解析" data-edge-key="1" data-edge-id="gateway-to-codec" data-composition-points="430,315;490,315" d="M 430 315 L 490 315" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="codec" data-edge-to="ir" data-edge-label="IR 中转" data-edge-key="2" data-edge-id="codec-to-ir" data-composition-points="670,315;730,315" d="M 670 315 L 730 315" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="ir" data-edge-to="upstreams" data-edge-label="出站直调" data-edge-key="3" data-edge-id="ir-to-upstreams" data-composition-points="900,315;950,315" d="M 900 315 L 950 315" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="gateway" data-edge-to="scheduler" data-edge-label="候选排序" data-edge-key="4" data-edge-id="gateway-to-scheduler" data-composition-points="352,280;352,230;585,230;585,180" d="M 352 280 L 352 238 Q 352 230 360 230 L 577 230 Q 585 230 585 222 L 585 180" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="scheduler" data-edge-to="pool" data-edge-label="轮询取号" data-edge-key="5" data-edge-id="scheduler-to-pool" data-composition-points="670,145;740,145" d="M 670 145 L 740 145" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+        <path data-edge-from="pool" data-edge-to="ir" data-edge-label="凭据随行" data-edge-key="6" data-edge-id="pool-to-ir" data-composition-points="820,180;820,204;836,204;836,256;815,256;815,280" d="M 820 180 L 820 196 Q 820 204 828 204 L 828 204 Q 836 204 836 212 L 836 248 Q 836 256 828 256 L 823 256 Q 815 256 815 264 L 815 280" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
+        <path data-edge-from="gateway" data-edge-to="usage" data-edge-label="记账" data-edge-key="7" data-edge-id="gateway-to-usage" data-composition-points="345,350;345,374;366,374;366,406;350,406;350,430" d="M 345 350 L 345 366 Q 345 374 353 374 L 358 374 Q 366 374 366 382 L 366 398 Q 366 406 358 406 L 358 406 Q 350 406 350 414 L 350 430" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
+        <path data-edge-from="config" data-edge-to="codec" data-edge-label="严格解析·凭据引用" data-edge-key="8" data-edge-id="config-to-codec" data-composition-points="585,430;585,406;601,406;601,374;580,374;580,350" d="M 585 430 L 585 414 Q 585 406 593 406 L 593 406 Q 601 406 601 398 L 601 382 Q 601 374 593 374 L 588 374 Q 580 374 580 366 L 580 350" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
+        <path data-edge-from="adminui" data-edge-to="gateway" data-edge-label="CRUD·测试·扫描" data-edge-key="9" data-edge-id="adminui-to-gateway" data-composition-points="115,180;115,230;338,230;338,280" d="M 115 180 L 115 222 Q 115 230 123 230 L 330 230 Q 338 230 338 238 L 338 280" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
+
+        <!-- Components -->
+        <g id="node-clients" data-node-id="clients" data-node-label="Coding 客户端" tabindex="0" role="button" aria-label="聚焦Coding 客户端，Claude Code / Cline, 架构组件" aria-pressed="false" data-node-kind="external" data-node-sublabel="Claude Code / Cline" data-node-context="架构组件">
+          <title>Coding 客户端 · Claude Code / Cline · 架构组件</title>
+          <rect x="30" y="280" width="170" height="70" rx="6" class="c-mask"/>
+          <rect x="30" y="280" width="170" height="70" rx="6" class="c-external" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="external" class="semantic-sigil s-external" color="#64748b" transform="translate(36 286) scale(0.6875)">
+            <rect x="2.5" y="5" width="8.5" height="8" rx="1.5"/>
+            <path d="M8 2.5h5.5V8M13.5 2.5 7.5 8.5"/>
+          </g>
+          <text data-node-label="" data-detail-anchor="" x="115" y="313" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Coding 客户端</text>
+        <text data-detail="context" x="115" y="329" class="t-muted" font-size="9" text-anchor="middle">Claude Code / Cline</text>
+        </g>
+
+        <g id="node-gateway" data-node-id="gateway" data-node-label="网关入口" tabindex="0" role="button" aria-label="聚焦网关入口，cli.ts + Hono 路由, 网关进程：一个服务·一个端口" aria-pressed="false" data-node-kind="backend" data-node-sublabel="cli.ts + Hono 路由" data-node-tag="一个服务·一个端口" data-node-context="网关进程：一个服务·一个端口">
+          <title>网关入口 · cli.ts + Hono 路由 · 网关进程：一个服务·一个端口 · 一个服务·一个端口</title>
+          <rect x="260" y="280" width="170" height="70" rx="6" class="c-mask"/>
+          <rect x="260" y="280" width="170" height="70" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" color="#059669" transform="translate(266 286) scale(0.6875)">
+            <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
+          </g>
+          <text data-node-label="" data-detail-anchor="" x="345" y="313" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">网关入口</text>
+        <text data-detail="context" x="345" y="329" class="t-muted" font-size="9" text-anchor="middle">cli.ts + Hono 路由</text>
+        <text data-detail="fine" x="345" y="342" class="t-backend" font-size="7" text-anchor="middle">一个服务·一个端口</text>
+        </g>
+
+        <g id="node-codec" data-node-id="codec" data-node-label="三协议编解码" tabindex="0" role="button" aria-label="聚焦三协议编解码，3 解析 + 3 序列化, 网关进程：一个服务·一个端口" aria-pressed="false" data-node-kind="backend" data-node-sublabel="3 解析 + 3 序列化" data-node-context="网关进程：一个服务·一个端口">
+          <title>三协议编解码 · 3 解析 + 3 序列化 · 网关进程：一个服务·一个端口</title>
+          <rect x="490" y="280" width="180" height="70" rx="6" class="c-mask"/>
+          <rect x="490" y="280" width="180" height="70" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" color="#059669" transform="translate(496 286) scale(0.6875)">
+            <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
+          </g>
+          <text data-node-label="" data-detail-anchor="" x="580" y="313" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">三协议编解码</text>
+        <text data-detail="context" x="580" y="329" class="t-muted" font-size="9" text-anchor="middle">3 解析 + 3 序列化</text>
+        </g>
+
+        <g id="node-ir" data-node-id="ir" data-node-label="IR 中间表示" tabindex="0" role="button" aria-label="聚焦IR 中间表示，协议转换公共边界, 网关进程：一个服务·一个端口" aria-pressed="false" data-node-kind="backend" data-node-sublabel="协议转换公共边界" data-node-context="网关进程：一个服务·一个端口">
+          <title>IR 中间表示 · 协议转换公共边界 · 网关进程：一个服务·一个端口</title>
+          <rect x="730" y="280" width="170" height="70" rx="6" class="c-mask"/>
+          <rect x="730" y="280" width="170" height="70" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" color="#059669" transform="translate(736 286) scale(0.6875)">
+            <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
+          </g>
+          <text data-node-label="" data-detail-anchor="" x="815" y="313" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">IR 中间表示</text>
+        <text data-detail="context" x="815" y="329" class="t-muted" font-size="9" text-anchor="middle">协议转换公共边界</text>
+        </g>
+
+        <g id="node-upstreams" data-node-id="upstreams" data-node-label="上游额度" tabindex="0" role="button" aria-label="聚焦上游额度，ZCode / Zen / WorkBuddy, 架构组件" aria-pressed="false" data-node-kind="external" data-node-sublabel="ZCode / Zen / WorkBuddy" data-node-context="架构组件">
+          <title>上游额度 · ZCode / Zen / WorkBuddy · 架构组件</title>
+          <rect x="950" y="280" width="170" height="70" rx="6" class="c-mask"/>
+          <rect x="950" y="280" width="170" height="70" rx="6" class="c-external" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="external" class="semantic-sigil s-external" color="#64748b" transform="translate(956 286) scale(0.6875)">
+            <rect x="2.5" y="5" width="8.5" height="8" rx="1.5"/>
+            <path d="M8 2.5h5.5V8M13.5 2.5 7.5 8.5"/>
+          </g>
+          <text data-node-label="" data-detail-anchor="" x="1035" y="313" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">上游额度</text>
+        <text data-detail="context" x="1035" y="329" class="t-muted" font-size="9" text-anchor="middle">ZCode / Zen / WorkBuddy</text>
+        </g>
+
+        <g id="node-adminui" data-node-id="adminui" data-node-label="管理台" tabindex="0" role="button" aria-label="聚焦管理台，Vue 3 + ECharts, 网关进程：一个服务·一个端口" aria-pressed="false" data-node-kind="frontend" data-node-sublabel="Vue 3 + ECharts" data-node-context="网关进程：一个服务·一个端口">
+          <title>管理台 · Vue 3 + ECharts · 网关进程：一个服务·一个端口</title>
+          <rect x="40" y="110" width="150" height="70" rx="6" class="c-mask"/>
+          <rect x="40" y="110" width="150" height="70" rx="6" class="c-frontend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="frontend" class="semantic-sigil s-frontend" color="#0891b2" transform="translate(46 116) scale(0.6875)">
+            <rect x="2" y="3" width="12" height="10" rx="2"/>
+            <path d="M2 6.5h12"/>
+            <circle cx="4.1" cy="4.8" r=".7" fill="currentColor" stroke="none"/>
+            <circle cx="6.3" cy="4.8" r=".7" fill="currentColor" stroke="none"/>
+          </g>
+          <text data-node-label="" data-detail-anchor="" x="115" y="143" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">管理台</text>
+        <text data-detail="context" x="115" y="159" class="t-muted" font-size="9" text-anchor="middle">Vue 3 + ECharts</text>
+        </g>
+
+        <g id="node-scheduler" data-node-id="scheduler" data-node-label="调度·换源闸门" tabindex="0" role="button" aria-label="聚焦调度·换源闸门，优先级·首字节前换源, 网关进程：一个服务·一个端口" aria-pressed="false" data-node-kind="backend" data-node-sublabel="优先级·首字节前换源" data-node-context="网关进程：一个服务·一个端口">
+          <title>调度·换源闸门 · 优先级·首字节前换源 · 网关进程：一个服务·一个端口</title>
+          <rect x="500" y="110" width="170" height="70" rx="6" class="c-mask"/>
+          <rect x="500" y="110" width="170" height="70" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" color="#059669" transform="translate(506 116) scale(0.6875)">
+            <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
+          </g>
+          <text data-node-label="" data-detail-anchor="" x="585" y="143" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">调度·换源闸门</text>
+        <text data-detail="context" x="585" y="159" class="t-muted" font-size="9" text-anchor="middle">优先级·首字节前换源</text>
+        </g>
+
+        <g id="node-pool" data-node-id="pool" data-node-label="账号池" tabindex="0" role="button" aria-label="聚焦账号池，轮询 + 按失败冷却, 网关进程：一个服务·一个端口 › 凭据只存引用" aria-pressed="false" data-node-kind="backend" data-node-sublabel="轮询 + 按失败冷却" data-node-context="网关进程：一个服务·一个端口 › 凭据只存引用">
+          <title>账号池 · 轮询 + 按失败冷却 · 网关进程：一个服务·一个端口 › 凭据只存引用</title>
+          <rect x="740" y="110" width="160" height="70" rx="6" class="c-mask"/>
+          <rect x="740" y="110" width="160" height="70" rx="6" class="c-backend" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" color="#059669" transform="translate(746 116) scale(0.6875)">
+            <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
+          </g>
+          <text data-node-label="" data-detail-anchor="" x="820" y="143" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">账号池</text>
+        <text data-detail="context" x="820" y="159" class="t-muted" font-size="9" text-anchor="middle">轮询 + 按失败冷却</text>
+        </g>
+
+        <g id="node-usage" data-node-id="usage" data-node-label="用量·状态" tabindex="0" role="button" aria-label="聚焦用量·状态，SQLite 落盘, 网关进程：一个服务·一个端口" aria-pressed="false" data-node-kind="database" data-node-sublabel="SQLite 落盘" data-node-context="网关进程：一个服务·一个端口">
+          <title>用量·状态 · SQLite 落盘 · 网关进程：一个服务·一个端口</title>
+          <rect x="270" y="430" width="160" height="70" rx="6" class="c-mask"/>
+          <rect x="270" y="430" width="160" height="70" rx="6" class="c-database" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="database" class="semantic-sigil s-database" color="#7c3aed" transform="translate(276 436) scale(0.6875)">
+            <ellipse cx="8" cy="4" rx="5" ry="2"/>
+            <path d="M3 4v8c0 1.1 2.2 2 5 2s5-.9 5-2V4M3 8c0 1.1 2.2 2 5 2s5-.9 5-2"/>
+          </g>
+          <text data-node-label="" data-detail-anchor="" x="350" y="463" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">用量·状态</text>
+        <text data-detail="context" x="350" y="479" class="t-muted" font-size="9" text-anchor="middle">SQLite 落盘</text>
+        </g>
+
+        <g id="node-config" data-node-id="config" data-node-label="配置与凭据" tabindex="0" role="button" aria-label="聚焦配置与凭据，YAML 严格·只存引用, 凭据只存引用" aria-pressed="false" data-node-kind="security" data-node-sublabel="YAML 严格·只存引用" data-node-context="凭据只存引用">
+          <title>配置与凭据 · YAML 严格·只存引用 · 凭据只存引用</title>
+          <rect x="500" y="430" width="170" height="70" rx="6" class="c-mask"/>
+          <rect x="500" y="430" width="170" height="70" rx="6" class="c-security" stroke-width="1.5"/>
+          <g aria-hidden="true" data-semantic-sigil="security" class="semantic-sigil s-security" color="#e11d48" transform="translate(506 436) scale(0.6875)">
+            <path d="M8 2.2 13 4v3.5c0 3.1-1.8 5.4-5 6.5-3.2-1.1-5-3.4-5-6.5V4Z"/>
+            <path d="m5.8 8 1.5 1.5 3-3"/>
+          </g>
+          <text data-node-label="" data-detail-anchor="" x="585" y="463" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">配置与凭据</text>
+        <text data-detail="context" x="585" y="479" class="t-muted" font-size="9" text-anchor="middle">YAML 严格·只存引用</text>
+        </g>
+
+        <!-- Connection labels -->
+        <g data-detail="context" data-edge-from="clients" data-edge-to="gateway" data-edge-label="三种协议 SSE/JSON" data-edge-key="0" data-edge-id="clients-to-gateway">
+          <rect x="184.2" y="251" width="91.6" height="14" rx="3" class="c-mask"/>
+          <text x="230" y="261" class="t-backend" font-size="8" text-anchor="middle">三种协议 SSE/JSON</text>
+        </g>
+        <g data-detail="context" data-edge-from="gateway" data-edge-to="codec" data-edge-label="入站解析" data-edge-key="1" data-edge-id="gateway-to-codec">
+          <rect x="435.8" y="295" width="48.4" height="14" rx="3" class="c-mask"/>
+          <text x="460" y="305" class="t-muted" font-size="8" text-anchor="middle">入站解析</text>
+        </g>
+        <g data-detail="context" data-edge-from="codec" data-edge-to="ir" data-edge-label="IR 中转" data-edge-key="2" data-edge-id="codec-to-ir">
+          <rect x="678.2" y="295" width="43.6" height="14" rx="3" class="c-mask"/>
+          <text x="700" y="305" class="t-muted" font-size="8" text-anchor="middle">IR 中转</text>
+        </g>
+        <g data-detail="context" data-edge-from="ir" data-edge-to="upstreams" data-edge-label="出站直调" data-edge-key="3" data-edge-id="ir-to-upstreams">
+          <rect x="900.8" y="295" width="48.4" height="14" rx="3" class="c-mask"/>
+          <text x="925" y="305" class="t-backend" font-size="8" text-anchor="middle">出站直调</text>
+        </g>
+        <g data-detail="context" data-edge-from="gateway" data-edge-to="scheduler" data-edge-label="候选排序" data-edge-key="4" data-edge-id="gateway-to-scheduler">
+          <rect x="444.3" y="210" width="48.4" height="14" rx="3" class="c-mask"/>
+          <text x="468.5" y="220" class="t-muted" font-size="8" text-anchor="middle">候选排序</text>
+        </g>
+        <g data-detail="context" data-edge-from="scheduler" data-edge-to="pool" data-edge-label="轮询取号" data-edge-key="5" data-edge-id="scheduler-to-pool">
+          <rect x="680.8" y="125" width="48.4" height="14" rx="3" class="c-mask"/>
+          <text x="705" y="135" class="t-muted" font-size="8" text-anchor="middle">轮询取号</text>
+        </g>
+        <g data-detail="context" data-edge-from="pool" data-edge-to="ir" data-edge-label="凭据随行" data-edge-key="6" data-edge-id="pool-to-ir">
+          <rect x="803.8" y="248" width="48.4" height="14" rx="3" class="c-mask"/>
+          <text x="828" y="258" class="t-messagebus" font-size="8" text-anchor="middle">凭据随行</text>
+        </g>
+        <g data-detail="context" data-edge-from="gateway" data-edge-to="usage" data-edge-label="记账" data-edge-key="7" data-edge-id="gateway-to-usage">
+          <rect x="340.5" y="378" width="30" height="14" rx="3" class="c-mask"/>
+          <text x="355.5" y="388" class="t-messagebus" font-size="8" text-anchor="middle">记账</text>
+        </g>
+        <g data-detail="context" data-edge-from="config" data-edge-to="codec" data-edge-label="严格解析·凭据引用" data-edge-key="8" data-edge-id="config-to-codec">
+          <rect x="547.2" y="386" width="91.6" height="14" rx="3" class="c-mask"/>
+          <text x="593" y="396" class="t-messagebus" font-size="8" text-anchor="middle">严格解析·凭据引用</text>
+        </g>
+        <g data-detail="context" data-edge-from="adminui" data-edge-to="gateway" data-edge-label="CRUD·测试·扫描" data-edge-key="9" data-edge-id="adminui-to-gateway">
+          <rect x="187.9" y="210" width="77.2" height="14" rx="3" class="c-mask"/>
+          <text x="226.5" y="220" class="t-muted" font-size="8" text-anchor="middle">CRUD·测试·扫描</text>
+        </g>
+
+        <!-- Boundary labels (foreground masks keep routes out of titles) -->
+        <g data-graph-role="structural-frame-label" data-composition-frame-id="0" data-composition-frame-kind="region" data-composition-frame-label="网关进程：一个服务·一个端口">
+          <rect data-graph-role="structural-frame-label-mask" x="14" y="90" width="155.79999999999998" height="16" rx="3" class="c-mask"/>
+          <text data-boundary-label="" x="18" y="103" class="t-cloud" font-size="9" font-weight="600">网关进程：一个服务·一个端口</text>
+        </g>
+
+        <g data-graph-role="structural-frame-label" data-composition-frame-id="1" data-composition-frame-kind="security-group" data-composition-frame-label="凭据只存引用">
+          <rect data-graph-role="structural-frame-label-mask" x="474" y="90" width="74.8" height="16" rx="3" class="c-mask"/>
+          <text data-boundary-label="" x="478" y="103" class="t-security" font-size="9" font-weight="600">凭据只存引用</text>
+        </g>
+
+        <!-- Legend -->
+        <g data-legend="" data-legend-bridge="">
+          <text x="40" y="604" class="t-primary" font-size="12" font-weight="650">图例</text>
+          <g data-legend-semantic-kind="frontend" data-legend-kind="frontend" data-legend-label="前端" data-legend-x="40" data-legend-baseline="624" data-legend-width="63">
+            <rect x="40" y="615" width="16" height="10" rx="2.5" class="c-frontend" stroke-width="1"/>
+            <text x="62" y="624" class="t-muted" font-size="10" font-weight="500">前端</text>
+          </g>
+          <g data-legend-semantic-kind="backend" data-legend-kind="backend" data-legend-label="后端" data-legend-x="125" data-legend-baseline="624" data-legend-width="63">
+            <rect x="125" y="615" width="16" height="10" rx="2.5" class="c-backend" stroke-width="1"/>
+            <text x="147" y="624" class="t-muted" font-size="10" font-weight="500">后端</text>
+          </g>
+          <g data-legend-semantic-kind="database" data-legend-kind="database" data-legend-label="数据库" data-legend-x="210" data-legend-baseline="624" data-legend-width="73">
+            <rect x="210" y="615" width="16" height="10" rx="2.5" class="c-database" stroke-width="1"/>
+            <text x="232" y="624" class="t-muted" font-size="10" font-weight="500">数据库</text>
+          </g>
+          <g data-legend-semantic-kind="security" data-legend-kind="security" data-legend-label="安全" data-legend-x="305" data-legend-baseline="624" data-legend-width="63">
+            <rect x="305" y="615" width="16" height="10" rx="2.5" class="c-security" stroke-width="1"/>
+            <text x="327" y="624" class="t-muted" font-size="10" font-weight="500">安全</text>
+          </g>
+          <g data-legend-semantic-kind="external" data-legend-kind="external" data-legend-label="外部系统" data-legend-x="390" data-legend-baseline="624" data-legend-width="83">
+            <rect x="390" y="615" width="16" height="10" rx="2.5" class="c-external" stroke-width="1"/>
+            <text x="412" y="624" class="t-muted" font-size="10" font-weight="500">外部系统</text>
+          </g>
+        </g>
+      </svg>
