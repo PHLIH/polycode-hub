@@ -353,9 +353,10 @@ function winDrives(): string[] {
   return out
 }
 
-// README 扫描防护：3 层封顶 / 最多 50 个 / 超 3s 截断（根目录也不炸）。
+// README 扫描防护：3 层封顶 / 最多 5 个 / 超 3s 截断（根目录也不炸）。
+// 5 个是刻意的低上限：这个列表是给人勾的，几十个候选比没候选更劝退。
 const README_MAX_DEPTH = 3
-const README_MAX_COUNT = 50
+const README_MAX_COUNT = 5
 const README_TIME_BUDGET_MS = 3000
 // 噪音目录直接跳过（依赖/构建产物/版本控制）。
 const README_SKIP = new Set([
@@ -365,22 +366,33 @@ const README_SKIP = new Set([
 
 export interface ReadmeHit { path: string; size: number }
 
-// findReadmes：递归找 readme*（大小写不敏感），返回相对路径 + 大小。
+// findReadmes：BFS 逐层找 readme*（大小写不敏感），返回相对路径 + 大小。
+// BFS 而非 DFS 是这里的关键：先扫完第 0 层再进第 1 层，因此凑满 5 个时
+// 命中的一定是最靠近根的那批（根 README 必进），而不是 DFS 顺着第一个
+// 子目录一路扎到底、把根目录的兄弟节点全漏掉。
 export function findReadmes(root: string): ReadmeHit[] {
   const out: ReadmeHit[] = []
   const t0 = Date.now()
   const stopped = (): boolean =>
     out.length >= README_MAX_COUNT || Date.now() - t0 > README_TIME_BUDGET_MS
-  const walk = (dir: string, depth: number): void => {
-    if (depth > README_MAX_DEPTH) return // 该分支截断，不影响兄弟节点
+  // 队列元素是目录；head 游标代替 shift()，避免 O(n²) 搬数组。
+  const queue: { dir: string; depth: number }[] = [{ dir: root, depth: 0 }]
+  for (let head = 0; head < queue.length; head++) {
+    if (stopped()) break
+    const { dir, depth } = queue[head]!
+    // 到达封顶深度的目录仍要扫它自己这一层的 README（a/b/c/README.md 属于
+    // 第 3 层、必须收），只是不再把它的子目录入队。
+    const canDescend = depth < README_MAX_DEPTH
     let names: string[]
     try {
       names = readdirSync(dir)
     } catch {
-      return
+      continue
     }
+    // 同一层内按名字排序，保证结果稳定（readdir 顺序依文件系统而变）。
+    names.sort()
     for (const name of names) {
-      if (stopped()) return // 数量/超时截断：全局停
+      if (stopped()) break
       if (README_SKIP.has(name)) continue
       if (name.startsWith('.')) continue // 隐藏目录整棵跳过（.worktrees/.github 里的 README 是噪音）
       const p = join(dir, name)
@@ -391,7 +403,7 @@ export function findReadmes(root: string): ReadmeHit[] {
         continue
       }
       if (isDir) {
-        walk(p, depth + 1)
+        if (canDescend) queue.push({ dir: p, depth: depth + 1 })
         continue
       }
       if (!/^readme(\..*)?$/i.test(name)) continue
@@ -402,8 +414,7 @@ export function findReadmes(root: string): ReadmeHit[] {
       out.push({ path: relative(root, p), size })
     }
   }
-  walk(root, 0)
-  // 根 README 优先，其次按路径短优先（越靠近根越可能是总览）
+  // 同层按路径短优先（越靠近根越可能是总览），BFS 已保证跨层有序。
   out.sort((a, b) => a.path.length - b.path.length)
   return out
 }

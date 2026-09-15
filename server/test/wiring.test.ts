@@ -223,7 +223,7 @@ describe('projects 适配器（对齐 Go adminapi/projects_api.go）', () => {
     expect(fileRes.status).toBe(200)
   })
 
-  test('readmes：递归找README（3层封顶/跳过噪音/相对路径返回）', async () => {
+  test('readmes：BFS 逐层找README（3层封顶/跳过噪音/最多5个/相对路径返回）', async () => {
     const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs')
     const { tmpdir } = await import('node:os')
     const { join } = await import('node:path')
@@ -255,6 +255,37 @@ describe('projects 适配器（对齐 Go adminapi/projects_api.go）', () => {
       expect((await app.request('/admin/api/projects/readmes?dir=' + encodeURIComponent(join(dir, 'nope')))).status).toBe(400)
       // 缺 dir → 400
       expect((await app.request('/admin/api/projects/readmes')).status).toBe(400)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('readmes：候选最多 5 个，且优先给最靠近根的那批（BFS 截断）', async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const dir = mkdtempSync(join(tmpdir(), 'polycode-readme-cap-'))
+    try {
+      // 根目录放 1 个；a/ 下塞 1 层候选；a/pX/deep/ 里再塞一堆第 2 层的。
+      // DFS 会顺着 a/ 一路扎到底把名额吃光；BFS 必须先收干净第 0/1 层。
+      writeFileSync(join(dir, 'README.md'), '# root')
+      mkdirSync(join(dir, 'a'), { recursive: true })
+      writeFileSync(join(dir, 'a', 'README.md'), '# a') // 第 1 层
+      for (let i = 0; i < 8; i++) {
+        mkdirSync(join(dir, 'a', `p${i}`, 'deep'), { recursive: true })
+        writeFileSync(join(dir, 'a', `p${i}`, 'deep', 'README.md'), `# deep-${i}`)
+      }
+      const { app } = projectsHarness()
+      const body = await (await app.request(
+        '/admin/api/projects/readmes?dir=' + encodeURIComponent(dir))).json() as { readmes: { path: string }[] }
+      expect(body.readmes.length).toBe(5) // 硬上限
+      const got = body.readmes.map((r) => r.path)
+      expect(got).toContain('README.md') // 根 README 必进
+      expect(got).toContain('a/README.md')
+      // BFS 序：先收满浅层再下探。第 0/1 层只有 2 个候选，剩下 3 个名额才轮到
+      // 第 2 层，且必须是 a/p0..p2（按名排序）而不是 DFS 那样顺着某个分支扎穿。
+      expect(got.slice(0, 2)).toEqual(['README.md', 'a/README.md'])
+      expect(got.slice(2).sort()).toEqual(['a/p0/deep/README.md', 'a/p1/deep/README.md', 'a/p2/deep/README.md'])
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
