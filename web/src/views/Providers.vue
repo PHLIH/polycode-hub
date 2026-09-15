@@ -808,7 +808,7 @@ async function adoptModels() {
         <button class="linklike" @click="openModels(row)">模型</button>
         <button class="linklike" @click="openBind(row)">指定账号</button>
         <button class="linklike" @click="openEdit(row)">编辑</button>
-        <button v-if="!isBuiltin(row)" class="linklike danger" @click="remove(row)">删除</button>
+        <button class="linklike danger" @click="remove(row)">删除</button>
       </template>
     </el-table-column>
   </el-table>
