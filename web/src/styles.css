@@ -16,6 +16,11 @@
   --bad: #e0604f;
   --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  /* 圆角三级：容器最软、控件次之、贴边条再小一点。
+     一处改全站跟着变——直角看着突兀是整站的问题，不是某一页的。 */
+  --r-box: 10px;
+  --r-ctl: 7px;
+  --r-chip: 999px;
 }
 
 html, body, #app { height: 100%; margin: 0; }
@@ -31,6 +36,8 @@ body {
 .btn:focus-visible, .nav-item:focus-visible, .linklike:focus-visible {
   outline: 2px solid var(--accent); outline-offset: 2px;
 }
+/* 自绘按钮/输入框统一圆角：UA 默认直角在圆角容器里格外扎眼 */
+.btn, input, textarea { border-radius: var(--r-ctl); }
 
 /* 文字按钮（复制/编辑/删除这类低频操作）：统一在全局定义。
    原先散在 Accounts/Providers 两处，Dashboard/Discover 用了没定义，
@@ -99,7 +106,8 @@ html.dark {
 .el-form-item__label { color: var(--dim); }
 .el-button--primary { --el-button-bg-color: var(--accent); --el-button-border-color: var(--accent); }
 .el-input__wrapper, .el-select__wrapper, .el-textarea__inner {
-  background-color: var(--panel-2); box-shadow: 0 0 0 1px var(--line) inset; }
+  background-color: var(--panel-2); box-shadow: 0 0 0 1px var(--line) inset;
+  border-radius: var(--r-ctl); }
 .el-input__inner { color: var(--text); }
 .el-select__placeholder, .el-input__inner::placeholder { color: var(--dim); }
 

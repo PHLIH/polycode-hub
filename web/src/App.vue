@@ -86,7 +86,7 @@ const pages = {
 .brand-sub { font-size: 11px; color: var(--dim); }
 .nav { display: flex; flex-direction: column; gap: 2px; }
 .nav-item {
-  text-align: left; padding: 8px 12px; border: 0; border-radius: 6px;
+  text-align: left; padding: 8px 12px; border: 0; border-radius: var(--r-ctl);
   background: transparent; color: var(--dim); font-size: 14px; cursor: pointer;
 }
 .nav-item:hover { color: var(--text); background: var(--panel-2); }
