@@ -2,23 +2,26 @@
 
 [![Version: 0.1.0](https://img.shields.io/badge/version-0.1.0-orange)](package.json) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![Node.js >= 22.13](https://img.shields.io/badge/Node.js-%3E%3D22.13-339933?logo=node.js&logoColor=white)](package.json) [![Tests](https://img.shields.io/badge/tests-463%20passed-brightgreen)](#开发) [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue?logo=typescript&logoColor=white)](tsconfig.json)
 
-> 你手上有五六个编程 Agent，每个都给你一点免费额度。它们互不相识，也不会在你额度耗尽时互相帮忙。于是你成了那个手动换号的人。
+> 免费额度通常绑着自家客户端一起发：想用这份额度，就得用它的 harness。于是你的工具选择权，被 token 拿走了。
 
-多源 Coding Agent 免费额度**统一反代网关**：把 ZCode / OpenCode Zen / WorkBuddy 的免费额度汇聚到一个入口，按剩余额度自动调度。
+多源 Coding Agent **反代网关**：**你想用哪个 harness 就用哪个，不必因为额度去迁就客户端。** 网关把 ZCode / OpenCode Zen / WorkBuddy 等上游汇聚到一个入口，用标准协议对外提供服务。
 
-**额度耗尽自动换源。** 这是它存在的全部理由。
+**额度耗尽自动换源**是它的支撑能力：上游改协议、调限额、额度用完，网关自动切到下一个可用源，你的客户端不用改任何配置。
 
 ## 设计取向
 
 **接受免费 token ≠ 我同意。**
 
-上游发的是额度，网关接的是协议。用哪个 harness 由你决定，不必跟着额度走；上游改协议、调限额，网关自动切换下一个可用源。同一个上游接进来只是多一条可用路径，不代表独占，也不影响你继续直连它。
+上游发的是额度，网关接的是协议——两侧解耦。客户端说什么协议（Anthropic / OpenAI Chat / OpenAI Responses），网关负责翻译给上游；上游是谁、换了几次，客户端不需要知道。
+
+所以：**换 harness 不用换额度，换上游不用改客户端。** 同一个上游接进来只是多一条可用路径，不代表独占，也不影响你继续直连它。
 
 ---
 
 ## 功能
 
-- **一个入口，多源调度**：上游谁有额度就用谁，额度耗尽时在首字节之前自动切换到下一个源（首字节一旦发出即不换源，避免拼接出错误内容）
+- **客户端不限**：任何能改 Base URL 的 harness 都能接——Claude Code、Cline 等说 Anthropic 协议的填 `ANTHROPIC_BASE_URL` 即可，OpenAI 兼容工具直接指向网关；换 harness 不影响上游配置
+- **上游不限**：任意 `anthropic-messages` / `openai-completions` / `openai-responses` 兼容源都能加，`base_url` 自由填；额度耗尽时在首字节之前自动切换到下一个源（首字节一旦发出即不换源，避免拼接出错误内容）
 - **三种协议均支持**：`POST /v1/messages`（Anthropic）、`POST /v1/chat/completions`（OpenAI Chat）、`POST /v1/responses`（OpenAI Responses），流式与非流式均可，经 IR 中间表示中转
 - **协议自动识别**：`api` 留空即自动探测，首次成功后记住；管理台「扫描可用性」可批量实测并写回
 - **账号池**：同源轮询，按失败原因冷却（限流 60s / 额度用尽 600s / 鉴权 1800s）；额度用尽只认人工重置或一次成功的测试
