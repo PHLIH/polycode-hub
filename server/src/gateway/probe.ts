@@ -67,7 +67,8 @@ export function freeAmong(ids: string[]): string[] {
   return ids.filter((id) => looksFree(id))
 }
 
-// 从客户端本地痕迹发现模型（按 source 分派）——workbuddy 在 P6 接线。
+// 从客户端本地痕迹发现模型（按 source 分派）：当前为桩实现（恒返回空，
+// 调用方回落本地配置）；workbuddy 痕迹发现由 cli 层经 discoverLocal 参数注入（见 cli.ts runServe）。
 export function discoverLocalModels(sourceID: string): string[] {
   void sourceID
   return []
@@ -83,6 +84,8 @@ interface ProbeOutcome {
 }
 
 export class Probe {
+  // 管理面探针：Provider 测试 / 账号测试 / 批量扫描 / 模型目录。
+  // 测试即真实上游请求（有成本）；成功会 rememberProtocol，失败按 kind 记 errorKind。
   private sched: Scheduler
   private up: Upstream
   private usage: UsageWriter | null
@@ -213,8 +216,9 @@ export class Probe {
   }
 
   // 对指定模型打一次最小真实流式请求。不抛错，失败如实返回。
+  // 注意与 Stream 的协议解析不完全一致：此处只看模型级/ Provider 级声明，
+  // 不读 autoProtocol 进程内缓存（探测即重探，避免缓存掩盖真相）。
   private async probeOne(pv: Provider, bare: string): Promise<ProbeOutcome> {
-    // 与 Stream 的协议解析保持一致：模型级协议优先，否则用 Provider 默认。
     const m = pv.models.find((x) => x.id === bare)
     const proto = m?.api || pv.api
     const t0 = Date.now()
@@ -281,7 +285,8 @@ export class Probe {
     return { ok: true, text, latencyMs: firstMs, error: '', ul, firstMs }
   }
 
-  // 拉取指定 Provider 的模型目录：先问上游实时列表；无接口则回落本地配置/客户端痕迹。
+  // 拉取指定 Provider 的模型目录：先问上游实时列表；失败（无接口/网络/鉴权等）
+  // 则回落本地配置/客户端痕迹。
   async listProviderModels(id: string): Promise<ModelList> {
     const p = this.sched.providers().find((x) => x.id === id)
     if (!p) throw new UpstreamError(0, 'bad_request', `provider ${id} 不存在`)

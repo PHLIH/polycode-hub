@@ -14,6 +14,8 @@ export class ErrNoAccount extends Error {
 }
 
 export class AccountPool {
+  // 同源账号的轮询与冷却：pick/pickFrom 只给可用者，markResult 按 kind 惩罚，
+  // 冷却到期自动复位。惩罚经 Persister 落盘（cli 注入写回 admin_accounts）。
   private accounts: Account[]
   private rr = new Map<string, number>() // sourceID → 上次选中的下标（轮询计数）
   // 惩罚状态回写存储（fails/cooldownUntil）。未注入则不落盘（测试/只读场景照旧）。
@@ -59,8 +61,8 @@ export class AccountPool {
     return { ...best }
   }
 
-  // 回传账号使用结果：失败则 fails++ 并按原因惩罚；成功则连败清零、惩罚全清
-  // （账号能跑通即证明恢复）。两者都落盘。
+  // 回传账号使用结果：失败则 fails++ 并按原因惩罚（落盘）；成功则连败清零、惩罚全清
+  // （账号能跑通即证明恢复）。成功仅在真有惩罚时落盘（无惩罚只更新 lastUsed，避免白写盘）。
   //
   // 惩罚分两档，区别在「会不会自己好」：
   //   exhausted（额度用尽）：上游明说没额度了，等下去也不会好 → 不设 cooldownUntil，
@@ -140,7 +142,8 @@ export class AccountPool {
   }
 
   // 按 id 取账号（指定账号头用）：返回副本，不存在返回 undefined。
-  // 与 pick 同语义：冷却到期自动复位（写回池内状态）。
+  // 注意与 pick 的区别：此处只做冷却到期自动复位，不跳过 disabled/exhausted——
+  // 调用方（servePinned）需自行按 accountEffectiveStatus 判定可用性。
   get(id: string, now: Date = new Date()): Account | undefined {
     const a = this.eligibleOne(id, now)
     return a ? { ...a } : undefined

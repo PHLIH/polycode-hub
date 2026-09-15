@@ -17,7 +17,7 @@ function err(c: Context, status: 400 | 404 | 500, msg: string): Response {
 // isLoopbackHost：自定义引擎地址只允许指向本机。
 function isLoopbackHost(host: string): boolean {
   if (host === 'localhost') return true
-  // ponytail: 仅识别 IPv4/IPv6 回环字面量（Go net.ParseIP + IsLoopback 的常见子集）
+  // 仅识别 IPv4/IPv6 回环字面量（127./::1，Go net.ParseIP + IsLoopback 的常见子集）
   return /^(127\.|::1$)/.test(host)
 }
 

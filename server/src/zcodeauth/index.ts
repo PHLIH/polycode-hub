@@ -101,7 +101,7 @@ export class Client {
     this.fetchImpl = fetchImpl
   }
 
-  // 初始化登录流（provider 固定 "zai"）。
+  // 初始化登录流（调用方当前固定传 "zai"，见 cli.ts runZCode）。
   async startFlow(provider: string): Promise<Flow> {
     const token = randomBytes(32).toString('hex')
     let res: Response

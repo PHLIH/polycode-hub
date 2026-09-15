@@ -30,6 +30,7 @@ const HTTP_STATUS: Record<string, number> = {
 }
 
 export function irError(type: string, message: string): IrError {
+  // 未知 type 回落 500（HTTP_STATUS 无该项时 ?? 500）。
   return { type, message, httpStatus: HTTP_STATUS[type] ?? 500 }
 }
 
@@ -53,6 +54,10 @@ export class UpstreamError extends Error {
   }
 }
 
+// 状态码 → 上游失败分类：401/403 鉴权、402 额度用尽、429 限流、
+// 400/404/413/422 请求侧、5xx 服务端，其余 unknown。
+// 注意 403 只是初判（RegionError 等会由 classifyUpstreamError 细分为 bad_request），
+// 402 恒为 quota（与 429 + QUOTA_HINT 互补，见 upstream.ts）。
 export function kindForStatus(status: number): string {
   if (status === 401 || status === 403) return UPSTREAM.AUTH
   if (status === 402) return UPSTREAM.QUOTA

@@ -126,7 +126,7 @@ export const api = {
   putEgress: (id, kind, addr) =>
     req('PUT', `/admin/api/egresses/${encodeURIComponent(id)}`, { kind, addr }),
   deleteEgress: (id) => req('DELETE', `/admin/api/egresses/${encodeURIComponent(id)}`),
-  // 顶层出口定义（config/apps.yaml egresses，只读；模型级/Provider 级绑定的下拉数据源）
+  // 顶层出口定义（config/apps.yaml egresses 落库后的真相源；模型级/Provider 级绑定的下拉数据源）
   egresses: async () => {
     const data = await req('GET', '/admin/api/egresses')
     return (data && data.egresses) || []

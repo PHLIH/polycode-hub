@@ -98,6 +98,9 @@ interface LockedUpstream {
 }
 
 export class Proxy {
+  // 转发门面：入站编解码 → 调度换源 → 上游流 → 出站解析 → SSE 回写。
+  // 单例常驻（构造时注入 cfg/sched/up/usage；账号池经 setAccountPool 后挂）。
+  // 失败语义：首字节前可换源（serve 内 attempt 循环），首字节后只透传（forward 内）。
   private cfg: Config
   private sched: Scheduler
   private up: Upstream
@@ -195,7 +198,8 @@ export class Proxy {
     let lastAcctId = '' // 最后尝试的账号（兜底失败账也要归因到账号，ACCOUNT-HEALTH）
     let locked: LockedUpstream | undefined
 
-    // 用指定账号（null = Provider 级凭据）尝试一个候选；成功则锁定，首字节已出。
+    // 用指定账号（null = Provider 级凭据）尝试一个候选；成功则锁定（上游 2xx 头已到，
+    // 首字节闸门尚未过：forward() 会先等首个真实事件再承诺 200，此后才禁止换源）。
     const attempt = async (pv: Provider, acct: Account | null): Promise<boolean> => {
       const pvv: Provider = acct ? { ...pv, credential: acct.credential } : { ...pv } // 账号 JWT 覆盖 Provider 凭据
       const [m] = this.sched.modelOf(pv.id, irReq.model)
@@ -244,7 +248,8 @@ export class Proxy {
 
     if (locked) return this.forward(inb, p, locked, irReq, start)
 
-    // 全部候选失败：记一笔失败账（tokens 为 0）——这是流式失败唯一的落账点。
+    // 全部候选失败：记一笔失败账（tokens 为 0）——轮询路径流式失败的兜底落账点
+    // （指定账号路径见 servePinned，转发中失败见 forward 的各 logUsage）。
     if (cands.length > 0) {
       const last = cands[cands.length - 1]!
       this.logUsage({

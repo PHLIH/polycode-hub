@@ -232,7 +232,7 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
         changed()
         warnings.push(`ZEN_KEY 未设置，已把公共 key 写入 ${cred}`)
       } catch {
-        // 写不了就保持环境变量引用（Go 忽略该错误）
+        // 写不了就保持环境变量引用
       }
     }
 

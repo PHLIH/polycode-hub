@@ -16,7 +16,8 @@ export interface InboundCodec {
 }
 
 // OutboundCodec 负责「IR ↔ 上游协议」。硬规则：SerializeRequest 在 Stream=true
-// 且协议为 OpenAI 系时必须自动补 stream_options.include_usage（否则 usage 恒 0 且不报错）。
+// 且协议为 openai-completions 时必须自动补 stream_options.include_usage（否则 usage 恒 0 且不报错）。
+// 注意 openai-responses 不需要该字段（见 openairesponses.ts serializeRequest），勿混用。
 export interface OutboundCodec {
   readonly protocol: Protocol
   serializeRequest(req: IrRequest): Uint8Array

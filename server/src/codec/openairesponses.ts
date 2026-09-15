@@ -112,6 +112,8 @@ function stopReason(status: string, incompleteReason: string, sawCall: boolean):
 // responses usage → IR Usage。cached_tokens 进独立 cacheReadTokens（绝不混入
 // inputTokens）；reasoning_tokens → ReasoningTokens。全零且无明细视为未提供，返回
 // undefined（对齐 Go outUsageOf）。
+// 明细输出规则：任一明细 >0 才输出 details（含 reasoning_tokens 顺带显式 0，
+// 见 response.basic 夹具形态）；三者全零则整个 details 省略。
 // 缓存写入同 openai-completions：标准未定义，部分上游在顶层给
 // cache_creation_input_tokens / prompt_cache_write_tokens / prompt_cache_miss_tokens。
 function usageOf(w: Record<string, unknown>): Usage | undefined {

@@ -180,10 +180,12 @@ onMounted(loadSidecar)
 
 // 导入共存登录态进账号池：token 由服务端读取落盘（不经过前端）。
 const importing = ref('')
+// 注意：credFileOf 恒为空（历史残留），实际恒走 `config/credentials/${id}-jwt` 分支。
 const credFileOf = {} // 建议 id → 凭据文件路径（与展示顺序一致）
 
 async function importAccount(f, a) {
-  // id 取池子里下一个空闲编号：发现页编号与既有 wb-N 对齐，但不与已有账号冲突
+  // id 取池子里下一个空闲编号（恒为 wb-N 形态；非 workbuddy 源的后端惯例是 ${key}-N，
+  // 见 discover_api.ts shortAccountPrefix，前后端此处口径不一致，改动时注意）。
   const id = nextAccountId()
   const credFile = credFileOf[a.tokenPath] || `config/credentials/${id}-jwt`
   importing.value = a.tokenPath

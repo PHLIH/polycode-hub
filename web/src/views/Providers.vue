@@ -20,7 +20,8 @@ const modelsDlg = ref(false)
 const fetching = ref(false)
 const fetchErr = ref('')
 const fetched = ref([])
-// 出口选项：顶层 egresses 定义（config/apps.yaml，服务端只读回传）+ 现有 Provider 在用的引用兜底
+// 出口选项：顶层 egresses 定义（管理面可写，见 api.putEgress；config/apps.yaml 只作启动播种）
+// + 现有 Provider 在用的引用兜底
 const declaredEgresses = ref([])
 const egressOptions = computed(() => {
   const seen = new Map()

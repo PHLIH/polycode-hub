@@ -20,7 +20,8 @@ async function probe(key) {
     return true
   } catch (e) {
     if (e instanceof AuthError) { clearKey(); return false }
-    // 网络失败等非鉴权错误也放行进入，页面内再报错
+    // 非鉴权错误（断网/后端未起）也放行进入：首屏不挡死，页面内各表再各自报错。
+    // 代价是口令错误且同时断网时会被误放行一次，下一次成功请求会重新鉴权。
     authed.value = true
     return true
   }

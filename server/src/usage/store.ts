@@ -96,6 +96,8 @@ export interface AccountUsage {
 }
 
 export class Store {
+  // 用量落盘与聚合：insertLog 按 DSH 口径（input + creation + output）求 total；
+  // summarize/breakdown 读时重算总量（不读存量列，历史脏行不污染口径）。
   private db: InstanceType<typeof DatabaseSync>
 
   private constructor(db: InstanceType<typeof DatabaseSync>) { this.db = db }
@@ -369,7 +371,8 @@ export class Store {
       m.totalTokens = Store.totalOf(m.inputTokens, m.outputTokens, m.cacheCreationTokens)
       m.cacheHitRate = this.hitRate(m.inputTokens, m.cacheReadTokens, m.cacheCreationTokens)
     }
-    // byModel 少了 ORDER BY totalTokens（之前 SELECT 里直接排第 8 列）——TS 侧重排，口径不变
+    // byModel 按总量降序：SQL 侧不再 ORDER（总量是 TS 侧按 DSH 口径重算的，SQL 排不准），
+    // 统一由 TS 侧重排。
     byModel.sort((a, b) => b.totalTokens - a.totalTokens)
 
     return { totals: { ...sum, cacheHitRate }, daily: dailyPoints, byModel }
@@ -414,7 +417,8 @@ export class Store {
       FROM usage_logs WHERE ts >= @since${range} AND status != 'ok' AND error_kind != ''
       GROUP BY account_id, error_kind`).all(p) as unknown as KindRow[]
 
-    // SQLite 特性：bare column（error_kind）取 MAX(ts) 所在行的值 —— 最近一次失败的原因。
+    // 注意：SQLite 对 GROUP BY 裸列（非聚合列）取哪一行是未定义的，不保证是 MAX(ts) 行。
+    // 此处 errorKind 仅作近似展示；要严格的“最近失败原因”须子查询/ORDER BY+LIMIT。
     interface LastErrRow { accountId: string; errorKind: string; lastErrorAt: number }
     const lastErrs = this.db.prepare(`SELECT
       account_id AS accountId, error_kind AS errorKind, MAX(ts) AS lastErrorAt

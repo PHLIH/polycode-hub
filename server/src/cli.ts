@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// next/ 入口（对齐 Go cmd/polycode-hub/main.go）：
-// 子命令 serve（默认）| scan | adopt | zcode login | zcode sidecar …。
+// 服务入口：子命令 serve（默认）| scan | adopt | zcode …（一级命令见文件底部 argv 分发；
+// zcode 下再分 login / sidecar，sidecar 动作见 runZCode）。
 import { existsSync } from 'node:fs'
 import { serve } from '@hono/node-server'
 import { Hono } from 'hono'
@@ -183,8 +183,8 @@ export async function runServe(args: string[]): Promise<void> {
   app.route('/', createAdminUI(distDir))
 
   const server = serve({ fetch: app.fetch, port: cfg.gateway.port, hostname: cfg.gateway.host })
-  console.log(`polycode-hub(next) 已启动 http://${cfg.gateway.host}:${cfg.gateway.port}/admin/`)
-  // 前端产物不入库（Java target/ 口径），clone 后没构建过就会落到这里：
+  console.log(`polycode-hub 已启动 http://${cfg.gateway.host}:${cfg.gateway.port}/admin/`)
+  // 前端产物不入库（web/dist 由构建生成，见 .gitignore），clone 后没构建过就会落到这里：
   // 服务照常起、API 照常通，但 /admin 全 404——不报错的话极难排查（同 update.sh
   // 记录过的「报成功但跑旧代码」一类）。所以显式告警，并给出修复命令。
   if (!existsSync(join(distDir, 'index.html'))) {

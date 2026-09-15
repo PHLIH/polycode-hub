@@ -89,6 +89,7 @@ export function usageTotal(u: Usage, sem: CacheSemantics = 'separate'): number {
 
 const ACCURACY_RANK: Record<Accuracy, number> = { exact: 0, estimated: 1, unknown: 2 }
 
+// 取两者中较差（rank 更大）的 accuracy：流式多事件合并用量时，任一估算即整体估算。
 export function accuracyWorst(a: Accuracy, b: Accuracy): Accuracy {
   return ACCURACY_RANK[a] >= ACCURACY_RANK[b] ? a : b
 }

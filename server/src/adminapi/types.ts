@@ -75,9 +75,8 @@ export interface AccountProber {
 // ChangeNotifier 存储变更通知（调度热重载用）。
 export type ChangeNotifier = () => void
 
-// ---- 本机 harness 发现（JSON 形状对齐 Go internal/discover）----
-// 注：next/server/src/discover/ 由并行工作实现扫描引擎；此处只定义管理面消费的
-// 数据形状（与 Go discover.Finding 的 json tag 一致），main 接线时做适配器。
+// ---- 本机 harness 发现（JSON 形状与 server/src/discover 的 Finding 一致）----
+// 此处只定义管理面消费的数据形状，main 接线时经 DiscoverSourceAdapter 适配。
 
 export type DiscoverStatus = 'ready' | 'expired' | 'missing' | 'unknown' | 'unreachable'
 

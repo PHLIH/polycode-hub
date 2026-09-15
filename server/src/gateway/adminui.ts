@@ -3,7 +3,7 @@ import { createReadStream, existsSync, statSync } from 'node:fs'
 import { Readable } from 'node:stream'
 import { extname, join, normalize, resolve, sep } from 'node:path'
 
-// MIME 表只需覆盖 Vite 构建产物会出现的类型（ponytail：不引 mime 库）。
+// MIME 表只需覆盖 Vite 构建产物会出现的类型（不为此引入 mime 库）。
 const MIME: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',

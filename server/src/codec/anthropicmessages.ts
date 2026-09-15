@@ -479,6 +479,8 @@ function imageSourceFromWire(s: Obj): ImageSource {
   return { kind: 'base64', mediaType: nonEmpty(str(s.media_type)), data: str(s.data) }
 }
 
+// tool_use.input 三态归一：null/undefined/{} 一律视为“无输入”（IR 侧省略），
+// 其余对象原样保留。wire 侧恒为对象（缺省补 {}），IR 侧用 undefined 表省略。
 function objectOrNil(v: unknown): unknown {
   if (v === null || v === undefined) return undefined
   if (isObj(v) && Object.keys(v).length === 0) return undefined

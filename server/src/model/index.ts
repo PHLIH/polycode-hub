@@ -31,6 +31,9 @@ export interface CredentialRef {
   apiKeyFile?: string
 }
 
+// 解析凭据引用：apiKeyFile 优先于 apiKeyEnv（文件热轮换覆盖环境）。
+// 返回 [值, 是否成功]：读文件失败 → ['', false]；无凭据声明（公开端点）→ ['', true]。
+
 export function credentialResolve(
   c: CredentialRef,
   lookup: (name: string) => [string, boolean],

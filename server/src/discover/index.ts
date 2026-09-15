@@ -147,7 +147,8 @@ function wbSuggestedProvider(): Provider {
   }
 }
 
-// 逐个试候选路径，首个有效文件即返回（ok=false 表示无可用登录态）。
+// 逐个试候选路径，首个有效文件即返回（ok=true 表示找到登录态文件，
+// 可用性看 status：ready 才可用，expired/unknown 仅表示文件存在）。
 export function checkWorkBuddy(paths: string[]): Checked {
   const base: Finding = {
     key: 'workbuddy', harness: 'WorkBuddy / CodeBuddy',
@@ -218,7 +219,8 @@ export function checkWorkBuddyWithAccounts(paths: string[], authDirs: string[]):
 
 // ---- ZCode（仅装机提示，JWT 不落本地可读存储） ----
 
-// 登录态无法本地判定，一律 unknown + OAuth 指引。
+// 装机即 unknown + OAuth 指引；未发现安装目录则 missing。
+// 登录态无法本地判定（JWT 不落可读存储）。
 export function checkZCode(dirs: string[]): Finding {
   const f: Finding = { key: 'zcode', harness: 'ZCode' }
   for (const d of dirs) {

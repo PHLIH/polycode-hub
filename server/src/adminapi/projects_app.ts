@@ -222,7 +222,7 @@ export function createProjectsApp(
   })
 
   // GET /default-model → 网关 default_model（AI 下拉的默认值；空串=没配，前端回落首个）。
-  // ponytail: 不新增 /admin/api/config 大端点，只为这一个值开口子。
+  // 说明：不为这一个值新增 /admin/api/config 大端点，只开这一个小口子。
   app.get('/default-model', (c) => c.json({ model: io.defaultModel ?? '' }))
 
   // GET /readmes?dir= → 递归找 README（3 层封顶/跳过噪音/相对路径返回）。
@@ -475,7 +475,7 @@ async function handleLogs(c: Context, m: Manager, isDelete: boolean): Promise<Re
   } catch {
     return c.json({ log: '' }) // 不存在 → 空日志
   }
-  // ponytail: 全量读后取尾；日志有轮转上限时可改成环形读
+  // TODO: 日志量大时把“全量读后取尾”换成环形读；当前实现够用（日志有轮转上限前不改）。
   const tail = Number(c.req.query('tail')) > 0 ? Number(c.req.query('tail')) : 200
   let lines = content.replace(/\n$/, '').split('\n')
   if (lines.length === 1 && lines[0] === '') lines = []

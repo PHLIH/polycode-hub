@@ -15,7 +15,7 @@ import { autoProtocol, forgetProtocol, rememberProtocol,
   type Capabilities, type DynamicHeadersSpec, type Provider } from '../model/index.ts'
 
 // egress 定义 → 代理 URI（EGRESS-SPIKE §4 方案 A）。
-// v1 仅支持 http 代理：undici ProxyAgent 不支持 socks5；Clash 等混合端口直接用 http://。
+// v1 支持 http/https 代理（undici ProxyAgent 语义；socks5 不支持，Clash 等混合端口直接用 http://）。
 export function egressProxyURI(e: { id: string; kind: string; addr: string }): string {
   if (e.kind === 'http') return `http://${e.addr}`
   if (e.kind === 'https') return `https://${e.addr}`
@@ -42,6 +42,8 @@ const defaultLookup: Lookup = (name) =>
   process.env[name] === undefined ? ['', false] : [process.env[name]!, true]
 
 export class Upstream {
+  // 上游调用器：协议解析/自动探测、动态头铸币、出口代理分流、模型目录拉取。
+  // 无状态（除 dispatcher 缓存与 autoProtocol 进程内记忆）；失败一律抛 UpstreamError。
   private credLookup: Lookup
   private noAutoProtocol: boolean
   private egresses: Record<string, string>
@@ -329,7 +331,8 @@ export function probeOrder(first: Protocol): Protocol[] {
   return [first, ...all.filter((p) => p !== first)]
 }
 
-// 是否值得换协议重试：5xx/网络抖/协议不匹配可试；401/403/404 是凭据或路径硬错误。
+// 是否值得换协议重试：5xx/网络抖/协议路径不匹配（400/404 归入 BAD_REQUEST）可试；
+// 401/403 凭据硬错误换协议无意义。
 export function shouldTryOtherProtocol(err: unknown): boolean {
   if (!(err instanceof UpstreamError)) return false
   return err.kind === UPSTREAM.SERVER || err.kind === UPSTREAM.NETWORK || err.kind === UPSTREAM.BAD_REQUEST

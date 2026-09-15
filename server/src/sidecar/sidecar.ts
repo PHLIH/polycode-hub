@@ -218,7 +218,7 @@ defaultModel: glm-5.3-flash
   }
 
   // start 后台启动 sidecar（分离进程，日志落 sidecarDir/logs）。
-  // 查找顺序：sidecarDir/zcode-proxy（项目内）→ binDir（install 默认位置）。
+  // 查找顺序见 findBinary：workDir（项目内）→ sidecarDir 参数 → binDir（install 默认位置）。
   async start(sidecarDir: string): Promise<void> {
     if (await this.running()) return // 幂等
     const bin = this.findBinary(sidecarDir)
@@ -234,10 +234,10 @@ defaultModel: glm-5.3-flash
     })
     try { closeSync(fd) } catch { /* 子进程已持副本 */ }
     reap(child)
-    await this.waitHealthy(45_000)
+    await this.waitHealthy(45_000, sidecarDir)
   }
 
-  // findBinary 按 sidecarDir → binDir 顺序查找 sidecar 二进制。
+  // findBinary 按 workDir → sidecarDir 参数 → binDir 顺序查找 sidecar 二进制。
   findBinary(sidecarDir: string): string {
     const cands = [
       join(this.workDir, 'zcode-proxy'),
@@ -300,14 +300,14 @@ defaultModel: glm-5.3-flash
     }
   }
 
-  // waitHealthy 等到 /health 200 或超时。
-  private async waitHealthy(timeoutMs: number): Promise<void> {
+  // waitHealthy 等到 /health 200 或超时（日志在 sidecarDir/logs 下看）。
+  private async waitHealthy(timeoutMs: number, sidecarDir: string): Promise<void> {
     const deadline = Date.now() + timeoutMs
     while (Date.now() < deadline) {
       if (await this.running()) return
       await sleep(500)
     }
-    throw new Error(`sidecar: 启动超时（查看 ${join(this.dataDir, 'logs')}）`)
+    throw new Error(`sidecar: 启动超时（查看 ${join(sidecarDir, 'logs')}）`)
   }
 
   // login 交互提示：sidecar 的 OAuth 登录需要浏览器，直接把用户引到官方登录命令。

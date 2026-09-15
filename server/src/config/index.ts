@@ -31,7 +31,7 @@ export interface GatewayConfig {  host: string
 }
 
 // 出口代理定义（EGRESS-SPIKE 方案 A）：Provider 引用 id，未引用 = 直连。
-// v1 仅支持 http 代理（Clash 类混合端口用 http:// 即可）；socks5 需专用 agent，暂不支持。
+// kind 支持 http/https（socks5 需专用 agent，暂不支持；Clash 类混合端口用 http:// 即可）。
 export interface Egress {
   id: string
   kind: 'http'
@@ -183,6 +183,8 @@ function strictMap(raw: Record<string, unknown>, spec: Record<string, [string, F
   return out
 }
 
+// YAML 值 → TS 值的宽松转换：string 接受 number/boolean（转字符串）；
+// number 走 Number(v)（非法得 NaN，由 validate 兜底报错）；boolean 走 Boolean(v)。
 function convert(v: unknown, fs: FieldSpec, path: string): unknown {
   if (fs.kind === 'map') {
     if (v === null || typeof v !== 'object' || Array.isArray(v)) {

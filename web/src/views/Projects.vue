@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, onUnmounted, reactive } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api.js'
-// AI 回填的纯逻辑放 aiFill.js（可单测；此处只管 DOM 与状态）
+// AI 回填的纯逻辑放 aiFill.ts（可单测；此处只管 DOM 与状态）
 import { pickServices, applyAiService } from '../aiFill.ts'
 
 const list = ref([])
@@ -187,8 +187,7 @@ function stackLabel(id) {
   const s = STACKS.find(x => x.id === id)
   return s ? s.label : '自定义'
 }
-// 换预设：填命令/端口/端口变量，但不覆盖用户已经手改过的非空值之外的东西——
-// 预设是起点，用户改完再换预设应当以新预设为准（明确动作，不做魔法合并）。
+// 换预设：以新预设为准填命令/端口/端口变量（无条件覆盖，明确动作，不做魔法合并）。
 function applyStack(s, id) {
   const t = STACKS.find(x => x.id === id)
   if (!t || id === 'custom') return
@@ -1044,7 +1043,7 @@ h2 { margin: 0; font-size: 18px; }
 /* 目录行：输入框 + 按钮（浏览/AI）同一行。
    规则直接挂在 .dir-line 上，不挂父选择器 —— 曾挂在 .dir-row 下，而项目目录与
    服务目录两处都没用 .dir-row，导致 flex 失效、按钮被挤到下一行。
-   ponytail: 三处（项目目录/服务目录/AI 面板）共用这一条，别再各写一遍。 */
+   三处（项目目录/服务目录/AI 面板）共用这一条，别再各写一遍。 */
 .dir-line { display: flex; gap: 8px; margin-top: 4px; }
 /* flex:1 要盖过 .fld input/.dialog input 的 width:100%（同特异性，靠 flex-basis 取胜） */
 .dir-line input { flex: 1 1 auto; min-width: 0; width: auto; }

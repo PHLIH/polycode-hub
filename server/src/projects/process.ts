@@ -164,7 +164,7 @@ export async function portOwner(port: number): Promise<string> {
   }
   const out = await execFileText('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN'])
   if (out === '') return ''
-  // 首行是表头，第二行起是进程；返回 "名字 pid"（对齐 Go：f[1] + " " + f[0]）
+  // 首行是表头，第二行起是进程；返回 "pid 名字"（lsof：f[1] 是 PID，f[0] 是 COMMAND）
   for (const line of out.trim().split('\n').slice(1)) {
     const f = line.trim().split(/\s+/)
     if (f.length >= 2 && f[0] !== undefined && f[1] !== undefined) {

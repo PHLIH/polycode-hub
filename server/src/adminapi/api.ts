@@ -60,7 +60,7 @@ function errRes(c: C, status: 400 | 401 | 403 | 404 | 409 | 500 | 501 | 502, typ
   return c.json({ error: { type: typ, message: msg } }, status)
 }
 
-// 恒时比较（对齐 Go subtle.ConstantTimeCompare 的判定语义）。
+// 恒时比较（防时序攻击；对齐 Go subtle.ConstantTimeCompare 的判定语义）。
 function safeEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a, 'utf8')
   const bb = Buffer.from(b, 'utf8')
@@ -208,7 +208,7 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
       }
     }
     if ('models' in patch) {
-      // 模型采用：只增不减。已有 ID 不动（元数据保留），缺的按可用追加。
+      // 模型采用：只增不减。已有 ID 不删（元数据保留），但补协议与能力（上游新声明的以本次为准）。
       const ids = parsePatchModels(patch.models)
       if (!ids) return errRes(c, 400, ERR.INVALID_REQUEST, 'models 须为 ["id"] 或 [{"id"}]')
       const have = new Set(p.models.map((m) => m.id))

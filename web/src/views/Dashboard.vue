@@ -351,8 +351,8 @@ const byModel = computed(() => {
       acc._denom = (acc._denom ?? denomOf(acc)) + denomOf(m)
     }
   }
-  // 命中率由后端按各 provider 的上游语义算好（cacheHitRate）：
-  // OpenAI 系 read 含在 input 内 → read/input；Anthropic 系 read 独立 → read/(input+read)。
+  // 命中率由后端按 DSH 口径算好（cacheHitRate = cacheRead / (input + cacheCreation)，
+  // 见 usage/store.ts hitRate，与上游语义无关）：
   // 前端不再自行用单一公式重算（那正是之前的错误来源）。
   // 只有发生跨 source 合并（_denom 被写入）的行才需要按反推的分母重算。
   for (const m of merged.values()) {
@@ -404,7 +404,7 @@ function setSort(k) {
   page.value = 1
 }
 watch(q, () => { page.value = 1 })
-// 浮层外点关闭（ponytail：window 监听即可）
+// 浮层外点关闭（window 级 click 监听即可，无需每个浮层单独处理）
 onMounted(() => document.addEventListener('click', closePill))
 onUnmounted(() => document.removeEventListener('click', closePill))
 function closePill() { pillOpen.value = false }
@@ -573,7 +573,7 @@ function ttftText(m) {
           <!-- TPS/TTFT 成对展示（DSH 口径）；sampled=0 显示 —，缺数据不产出 0.0 -->
           <td class="n num" :class="{ dim: m.sampled === 0 }">{{ tpsText(m) }}</td>
           <td class="n num">{{ fmt(m.cacheReadTokens) }}</td>
-          <!-- 命中率：与顶部卡片同口径（cacheRead/(cacheRead+input)）；无输入显示 — -->
+          <!-- 命中率：后端下发的 cacheHitRate（DSH 口径，见 usage/store.ts hitRate）；无输入显示 — -->
           <td class="n num" :class="{ dim: m.cacheHitRate == null }">
             {{ m.cacheHitRate == null ? '—' : pct(m.cacheHitRate) }}
           </td>
