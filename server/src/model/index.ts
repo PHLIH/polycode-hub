@@ -144,8 +144,6 @@ export interface Provider {
   // 指定账号白名单：空/缺省 = 不限（全部同源账号轮询，向后兼容）。
   // 非空时调度只在该列表内轮询；x-polycode-account 显式指定不在名单内也拒绝。
   accountIds?: string[]
-  // 管理面按配置文件标注（输出专用，不入库）：内置三源不可删、重启补回。
-  builtin?: boolean
 }
 
 export function providerValidate(p: Provider): string | undefined {

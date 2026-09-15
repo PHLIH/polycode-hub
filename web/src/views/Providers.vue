@@ -255,8 +255,7 @@ function apiLabel(v) {
   return v ? v : '自动识别（推荐）'
 }
 
-// 内置三源（后端按配置文件标注）：不可删、重启补回；别家 API 删了就是删了。
-function isBuiltin(p) { return !!p.builtin }
+// 内置标记已移除：Provider 一律由发现/导入或手填生成，都可在界面上删除。
 
 async function test(p) {
   testTarget.value = p
@@ -777,7 +776,6 @@ async function adoptModels() {
       <template #default="{ row }">
         <div class="name-cell">
           <span class="p-name">{{ row.displayName || row.id }}</span>
-          <el-tag v-if="isBuiltin(row)" size="small" effect="plain" class="builtin-tag">内置</el-tag>
         </div>
         <div class="p-id">ID: {{ row.id }}</div>
       </template>
@@ -1078,7 +1076,6 @@ async function adoptModels() {
 }
 .hand-caret.open { transform: rotate(90deg); }
 .hand-actions { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
-.builtin-tag { margin-left: 8px; }
 .name-cell { display: flex; align-items: center; }
 .p-name { font-weight: 600; }
 .ph-src { font-weight: 600; }

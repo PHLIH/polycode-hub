@@ -122,3 +122,38 @@ describe('SQLite 存储（admin.db 两表 + 内存实现）', () => {
     ps.close(); as.close()
   })
 })
+
+// 删账号只是把 admin_accounts 里的那一行去掉，绝不级联删 usage_logs：
+// 首页 Dashboard 的 token/请求/热力图/按模型归因读的全是 usage_logs（按 provider_id
+// 聚合，不 JOIN 账号表），account_id 只是日志行里的一个字符串。若哪天把删除实现成
+// 级联清理，「删个号历史用量就没了」是用户数据的静默丢失。
+describe('删账号不得动用量历史（首页预览数据）', () => {
+  test('删除账号后 breakdown 合计与归因完全不变', async () => {
+    const { Store } = await import('../src/usage/store.ts')
+    const base = join(dir, 'del-no-cascade')
+    const us = await Store.open(join(base, 'usage.db'))
+    const as = await SQLiteAccountStore.open(join(base, 'admin.db'))
+
+    as.put({ id: 'wb-1', sourceId: 'workbuddy', status: 'available', fails: 0, credential: {} })
+    const log = (ts: Date) => ({
+      id: 0, ts, requestId: 'r', sourceId: 'workbuddy', providerId: 'wb-auto',
+      accountId: 'wb-1', modelId: 'hy3-preview', stream: true,
+      inputTokens: 100, outputTokens: 200, cacheReadTokens: 0, cacheCreationTokens: 0,
+      reasoningTokens: 0, totalTokens: 300, accuracy: 'exact' as const,
+      latencyMs: 100, status: 'ok' as const,
+    })
+    const since = new Date(Date.now() - 86400_000)
+    await us.insertLog(log(new Date()))
+    await us.insertLog(log(new Date()))
+    const before = await us.breakdown(since)
+    expect(before.totals.totalTokens).toBe(600)
+
+    expect(await as.delete('wb-1')).toBe(true)
+    expect(as.list()).toHaveLength(0) // 账号确实没了
+
+    const after = await us.breakdown(since)
+    expect(after.totals).toEqual(before.totals) // 首页合计纹丝不动
+    expect(after.byModel).toEqual(before.byModel) // 归因也完整保留
+    us.close(); as.close()
+  })
+})

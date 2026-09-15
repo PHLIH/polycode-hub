@@ -34,7 +34,6 @@ export interface AdminApiDeps {
   prober?: ProviderProber
   lister?: ProviderModelLister
   modelProber?: ProviderModelProber
-  builtinIDs?: string[]
   notify?: ChangeNotifier
   sidecar?: Hono
   projects?: Hono
@@ -119,10 +118,7 @@ function parsePatchModels(v: unknown): PatchModel[] | undefined {
 export function createAdminApi(deps: AdminApiDeps): Hono {
   const providers = deps.providers ?? new MemoryProviderStore()
   const accounts = deps.accounts ?? new MemoryAccountStore()
-  const builtin = new Set(deps.builtinIDs ?? [])
   const changed: ChangeNotifier = () => deps.notify?.()
-
-  const markBuiltin = (p: Provider): Provider => ({ ...p, builtin: builtin.has(p.id) })
 
   const app = new Hono()
 
@@ -170,7 +166,7 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
   })
 
   app.get('/admin/api/providers', (c) => {
-    return ok(c, 200, { providers: providers.list().map(markBuiltin) })
+    return ok(c, 200, { providers: providers.list() })
   })
 
   app.post('/admin/api/providers', async (c) => {
@@ -301,14 +297,11 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     }
     providers.put(p)
     changed()
-    return ok(c, 200, markBuiltin(p))
+    return ok(c, 200, p)
   })
 
   app.delete('/admin/api/providers/:id', (c) => {
     const id = c.req.param('id')
-    if (builtin.has(id)) {
-      return errRes(c, 403, ERR.INVALID_REQUEST, '内置 Provider 不可删（按配置文件固定），停用请用开关')
-    }
     if (!providers.delete(id)) {
       return errRes(c, 404, ERR.NOT_FOUND, 'provider 不存在')
     }

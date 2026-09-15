@@ -105,7 +105,6 @@ interface BuildOpts {
   prober?: ProviderProber
   lister?: ProviderModelLister
   modelProber?: ProviderModelProber
-  builtinIDs?: string[]
   notify?: () => void
   sidecar?: Hono
   projects?: Hono
@@ -125,7 +124,6 @@ function build(o: BuildOpts = {}): Hono {
     prober: o.prober,
     lister: o.lister,
     modelProber: o.modelProber,
-    builtinIDs: o.builtinIDs,
     notify: o.notify,
     sidecar: o.sidecar,
     projects: o.projects,
@@ -375,33 +373,18 @@ describe('providers CRUD（对齐 Go TestProviderCRUD/PatchReadonly/Validation�
   })
 })
 
-describe('内置 Provider 标注与保护（对齐 Go builtin_test.go）', () => {
-  function builtinAPI(): { app: Hono; call: ReturnType<typeof caller> } {
+// 内置 Provider 概念已移除：Provider 一律由发现/导入或手填生成，都可删。
+// （原「内置三源不可删、重启补回」的保护与前端「内置」标签一并删掉。）
+describe('Provider 可删（内置概念已移除）', () => {
+  test('配置文件种进来的 Provider 也照常可删 204', async () => {
     const wb = mkProvider({ id: 'wb-direct', sourceId: 'workbuddy' })
     const acme = mkProvider({ id: 'acme', sourceId: 'acme' })
-    const app = build({ providers: [wb, acme], builtinIDs: ['wb-direct'] })
-    return { app, call: caller(app) }
-  }
-
-  test('内置不可删 403，数据还在', async () => {
-    const { call } = builtinAPI()
-    expect((await call('DELETE', '/admin/api/providers/wb-direct', { key: 'secret' })).status).toBe(403)
-    const list = await call('GET', '/admin/api/providers', { key: 'secret' })
-      .then((r) => r.json() as Promise<{ providers: Provider[] }>)
-    expect(list.providers.find((p) => p.id === 'wb-direct')).toBeDefined()
-  })
-
-  test('别家 API 照常可删 204', async () => {
-    const { call } = builtinAPI()
+    const call = caller(build({ providers: [wb, acme] }))
+    expect((await call('DELETE', '/admin/api/providers/wb-direct', { key: 'secret' })).status).toBe(204)
     expect((await call('DELETE', '/admin/api/providers/acme', { key: 'secret' })).status).toBe(204)
-  })
-
-  test('列表标注 builtin', async () => {
-    const { call } = builtinAPI()
     const list = await call('GET', '/admin/api/providers', { key: 'secret' })
       .then((r) => r.json() as Promise<{ providers: Provider[] }>)
-    expect(list.providers.find((p) => p.id === 'wb-direct')!.builtin).toBe(true)
-    expect(list.providers.find((p) => p.id === 'acme')!.builtin).toBe(false)
+    expect(list.providers).toHaveLength(0)
   })
 })
 

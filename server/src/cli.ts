@@ -86,7 +86,7 @@ export async function runServe(args: string[]): Promise<void> {
 
   const sched = new Scheduler(cfg.providers, cfg.gateway.riskMax)
   // egress 出口代理（EGRESS-SPIKE 方案 A，模型级粒度）：DB 是真相源，
-  // config/apps.yaml 的定义启动时种进去（删了重启补回，与内置 Provider 同规）。
+  // config/apps.yaml 的定义只在首启（库空）种一次，之后由管理面主导。
   const egresses = await SQLiteEgressStore.open(join(cwd, cfg.dataDir, 'admin.db'))
   for (const e of cfg.egresses) {
     if (!egresses.get(e.id)) egresses.put(e)
@@ -121,13 +121,6 @@ export async function runServe(args: string[]): Promise<void> {
 
   seedProvidersIfEmpty(providers, cfg.providers)
   seedAccountsIfEmpty(accounts, cfg.accounts)
-  // 内置三源固定：配置文件里的 Provider，库里缺谁补谁（删了重启回来）。
-  for (const p of cfg.providers) {
-    if (!providers.get(p.id)) {
-      console.log(`补回配置文件中的 Provider ${p.id}`)
-      providers.put(p)
-    }
-  }
 
   const probe = new Probe(sched, up, usageStore, acctPool,
     (sourceID) => sourceID === 'workbuddy'
@@ -169,7 +162,6 @@ export async function runServe(args: string[]): Promise<void> {
     prober: { probeProvider: (id) => probe.probeProvider(id) },
     lister: { listProviderModels: (id) => probe.listProviderModels(id) },
     modelProber: { probeModels: (id, models) => probe.probeModels(id, models) },
-    builtinIDs: cfg.providers.map((p) => p.id),
     notify: syncStores,
     sidecar: createSidecarApp(sidecarSvc, providers, syncStores),
     projects: createProjectsApp(projectsMgr, { defaultModel: cfg.gateway.defaultModel }),

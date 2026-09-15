@@ -27,7 +27,7 @@ const p = (over: Partial<Provider>): Provider => ({
   id: 'demo', sourceId: 'src', displayName: 'Demo', accessKind: 'official',
   risk: 'low', riskNote: '', stability: 'stable', api: '', baseUrl: 'https://x.example',
   credential: {}, headers: {}, enabled: true, priority: 0,
-  streamOnly: false, models: [], probeModel: '', builtin: false, ...over,
+  streamOnly: false, models: [], probeModel: '', ...over,
 })
 
 describe('Provider 校验（对齐 Go provider.go Validate）', () => {
