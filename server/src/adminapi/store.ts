@@ -11,9 +11,13 @@ import type { Account, Provider } from '../model/index.ts'
 
 export interface ProviderStore {
   list(): Provider[]
-  get(id: string): Provider | undefined
+  // 按内部 id 定位（改名不影响）。
+  get(providerId: number): Provider | undefined
+  // 按对外名查（路由解析前缀、判重）。
+  getByName(name: string): Provider | undefined
+  // providerId 为 0 = 新建（存储层分配并回填）。
   put(p: Provider): void
-  delete(id: string): boolean
+  delete(providerId: number): boolean
 }
 
 export interface AccountStore {
@@ -30,27 +34,44 @@ function cloneProvider(p: Provider): Provider {
 // ---- 内存实现（并发安全：JS 单线程，方法内无 await 即原子）----
 
 export class MemoryProviderStore implements ProviderStore {
-  private m = new Map<string, Provider>()
+  private m = new Map<number, Provider>()
+  private seq = 0
 
   constructor(seed?: Provider[]) {
-    for (const p of seed ?? []) this.m.set(p.id, cloneProvider(p))
+    for (const p of seed ?? []) {
+      const q = cloneProvider(p)
+      if (!(q.providerId > 0)) q.providerId = ++this.seq
+      else this.seq = Math.max(this.seq, q.providerId)
+      this.m.set(q.providerId, q)
+    }
   }
 
   list(): Provider[] {
     return [...this.m.values()].map(cloneProvider)
   }
 
-  get(id: string): Provider | undefined {
-    const p = this.m.get(id)
+  getByName(name: string): Provider | undefined {
+    const hits = [...this.m.values()].filter((p) => p.name === name)
+    if (hits.length === 0) return undefined
+    hits.sort((a, b) => (a.state === 'deleted' ? 1 : 0) - (b.state === 'deleted' ? 1 : 0)
+      || b.providerId - a.providerId)
+    return cloneProvider(hits[0]!)
+  }
+
+  get(providerId: number): Provider | undefined {
+    const p = this.m.get(providerId)
     return p ? cloneProvider(p) : undefined
   }
 
   put(p: Provider): void {
-    this.m.set(p.id, cloneProvider(p))
+    const q = cloneProvider(p)
+    if (!(q.providerId > 0)) q.providerId = ++this.seq
+    this.m.set(q.providerId, q)
+    p.providerId = q.providerId
   }
 
-  delete(id: string): boolean {
-    return this.m.delete(id)
+  delete(providerId: number): boolean {
+    return this.m.delete(providerId)
   }
 }
 
@@ -83,7 +104,15 @@ export class MemoryAccountStore implements AccountStore {
 
 type DB = InstanceType<typeof DatabaseSync>
 
-// 打开（不存在则创建并建表）。schema 与 Go store_sqlite.go 完全一致。
+// 打开（不存在则创建并建表），并做前向迁移。
+//
+// admin_providers 的形状（2026-09-16 起）：
+//   provider_id INTEGER PRIMARY KEY AUTOINCREMENT —— 内部唯一标识，永不变
+//   name        TEXT NOT NULL                    —— 对外名（模型 ID 前缀），可改
+//   state       TEXT NOT NULL                    —— active / paused / deleted（见 model 层）
+//   data        TEXT NOT NULL                    —— 其余字段的 JSON
+// 为什么把 name 从主键降级成普通列：主键一旦承载业务名，「改名」就等于换身份，
+// 账号归属、用量归因、客户端里配的模型 ID 全部断裂。id 与名字必须分开。
 async function openAdminDB(path: string): Promise<DB> {
   const dir = dirname(path)
   if (dir && dir !== '.') mkdirSync(dir, { recursive: true })
@@ -92,13 +121,88 @@ async function openAdminDB(path: string): Promise<DB> {
   db.exec('PRAGMA journal_mode=WAL')
   db.exec('PRAGMA busy_timeout=5000')
   for (const ddl of [
-    `CREATE TABLE IF NOT EXISTS admin_providers (id TEXT PRIMARY KEY, data TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS admin_accounts (id TEXT PRIMARY KEY, data TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS admin_egresses (id TEXT PRIMARY KEY, data TEXT NOT NULL)`,
   ]) {
     db.exec(ddl)
   }
+  migrateProviders(db)
+  migrateAccounts(db)
   return db
+}
+
+// 账号的 providerId：早期存「Provider 名」（字符串），现在存内部数字 id。
+// 名字→id 的权威来源是同一张库里的 admin_providers；查不到的（Provider 早已
+// 物理删除）标 -1，账号仍能列出，只是不再参与轮询（pool 按 id 匹配不到）。
+export function migrateAccounts(db: DB): void {
+  const cols = db.prepare('PRAGMA table_info(admin_accounts)').all() as { name: string }[]
+  if (cols.length === 0) return
+  const rows = db.prepare('SELECT id, data FROM admin_accounts').all() as unknown as
+    { id: string; data: string }[]
+  const idByName = new Map<string, number>()
+  for (const r of db.prepare('SELECT provider_id, name FROM admin_providers').all() as unknown as
+    { provider_id: number; name: string }[]) {
+    idByName.set(r.name, r.provider_id)
+  }
+  const upd = db.prepare('UPDATE admin_accounts SET data = ? WHERE id = ?')
+  for (const r of rows) {
+    const a = parseRow<{ providerId?: unknown; sourceId?: unknown }>(r.data)
+    if (!a) continue
+    if (typeof a.providerId === 'number') continue // 已是新形状（幂等）
+    // 归属字段的历史沿革：sourceId（最老，抽象的「源」名）→ providerId 字符串
+    // （= Provider 名）→ providerId 数字。两种旧形态都存的是「名字」，都要查表换 id。
+    // 只认新字段名会让最老的数据静默变成 -1（账号从此不参与轮询），必须两个都读。
+    const name = typeof a.providerId === 'string' ? a.providerId
+      : typeof a.sourceId === 'string' ? a.sourceId : ''
+    delete a.sourceId
+    a.providerId = name === '' ? -1 : (idByName.get(name) ?? -1)
+    upd.run(JSON.stringify(a), r.id)
+  }
+}
+
+// 老库（admin_providers(id TEXT PRIMARY KEY, data)）→ 新形状。幂等：已是新形状则跳过。
+//
+// 搬迁规则：
+//   provider_id 由 AUTOINCREMENT 分配（按老 id 排序，保证稳定）
+//   name        = 老 id
+//   state       = 老 data.enabled ? 'active' : 'paused'
+//   data        = 老 JSON 去掉 id/enabled（其余字段原样保留）
+export function migrateProviders(db: DB): void {
+  const cols = db.prepare('PRAGMA table_info(admin_providers)').all() as { name: string }[]
+  if (cols.length === 0) {
+    db.exec(`CREATE TABLE admin_providers (
+      provider_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name        TEXT NOT NULL,
+      state       TEXT NOT NULL,
+      data        TEXT NOT NULL)`)
+    return
+  }
+  if (cols.some((c) => c.name === 'provider_id')) return // 已是新形状
+  const rows = db.prepare('SELECT id, data FROM admin_providers ORDER BY id')
+    .all() as unknown as { id: string; data: string }[]
+  db.exec('BEGIN')
+  try {
+    db.exec(`CREATE TABLE admin_providers_new (
+      provider_id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name        TEXT NOT NULL,
+      state       TEXT NOT NULL,
+      data        TEXT NOT NULL)`)
+    const ins = db.prepare(
+      'INSERT INTO admin_providers_new (name, state, data) VALUES (?, ?, ?)')
+    for (const r of rows) {
+      const raw = parseRow<Record<string, unknown>>(r.data) ?? {}
+      const state = raw.enabled === false ? 'paused' : 'active'
+      delete raw.id
+      delete raw.enabled
+      ins.run(r.id, state, JSON.stringify(raw))
+    }
+    db.exec('DROP TABLE admin_providers')
+    db.exec('ALTER TABLE admin_providers_new RENAME TO admin_providers')
+    db.exec('COMMIT')
+  } catch (e) {
+    db.exec('ROLLBACK')
+    throw e
+  }
 }
 
 function parseRow<T>(raw: string): T | undefined {
@@ -121,31 +225,66 @@ export class SQLiteProviderStore implements ProviderStore {
     this.db.close()
   }
 
+  private rowToProvider(r: { provider_id: number; name: string; state: string; data: string }): Provider | undefined {
+    const body = parseRow<Omit<Provider, 'providerId' | 'name' | 'state'>>(r.data)
+    if (!body) return undefined
+    return { ...body, providerId: r.provider_id, name: r.name, state: r.state as Provider['state'] }
+  }
+
   list(): Provider[] {
-    const rows = this.db.prepare(`SELECT data FROM admin_providers ORDER BY id`)
-      .all() as unknown as { data: string }[]
+    const rows = this.db.prepare(
+      `SELECT provider_id, name, state, data FROM admin_providers ORDER BY provider_id`)
+      .all() as unknown as { provider_id: number; name: string; state: string; data: string }[]
     const out: Provider[] = []
     for (const r of rows) {
-      const p = parseRow<Provider>(r.data)
+      const p = this.rowToProvider(r)
       if (p) out.push(p)
     }
     return out
   }
 
-  get(id: string): Provider | undefined {
-    const row = this.db.prepare(`SELECT data FROM admin_providers WHERE id = ?`)
-      .get(id) as unknown as { data: string } | undefined
-    if (!row) return undefined
-    return parseRow<Provider>(row.data)
+  get(providerId: number): Provider | undefined {
+    const row = this.db.prepare(
+      `SELECT provider_id, name, state, data FROM admin_providers WHERE provider_id = ?`)
+      .get(providerId) as unknown as
+      { provider_id: number; name: string; state: string; data: string } | undefined
+    return row ? this.rowToProvider(row) : undefined
   }
 
+  // 按名字查——路由解析模型 ID 前缀、发现页判重都走它。
+  // 同名可能有历史的 deleted 行，取「非 deleted 优先，其次 provider_id 最大」。
+  getByName(name: string): Provider | undefined {
+    const row = this.db.prepare(
+      `SELECT provider_id, name, state, data FROM admin_providers WHERE name = ?
+       ORDER BY (state = 'deleted') ASC, provider_id DESC LIMIT 1`)
+      .get(name) as unknown as
+      { provider_id: number; name: string; state: string; data: string } | undefined
+    return row ? this.rowToProvider(row) : undefined
+  }
+
+  // 写回：providerId 为 0 表示新建（由 AUTOINCREMENT 分配并回填）。
   put(p: Provider): void {
-    this.db.prepare(`INSERT INTO admin_providers (id, data) VALUES (?, ?)
-      ON CONFLICT (id) DO UPDATE SET data = excluded.data`).run(p.id, JSON.stringify(p))
+    const { providerId, name, state, ...body } = p
+    const json = JSON.stringify(body)
+    if (providerId > 0) {
+      // upsert：带 id 写入时，行不存在也要落库。
+      // 只用 UPDATE 的话，调用方（配置播种/夹具预置固定 id）会静默丢失写入——
+      // 老实现以 id 作主键时是 UPSERT 语义，这个差别曾让一批"预置 Provider"变成 no-op。
+      this.db.prepare(
+        `INSERT INTO admin_providers (provider_id, name, state, data) VALUES (?, ?, ?, ?)
+         ON CONFLICT(provider_id) DO UPDATE SET name = excluded.name,
+           state = excluded.state, data = excluded.data`)
+        .run(providerId, name, state, json)
+      return
+    }
+    const res = this.db.prepare(
+      `INSERT INTO admin_providers (name, state, data) VALUES (?, ?, ?)`)
+      .run(name, state, json)
+    p.providerId = Number(res.lastInsertRowid)
   }
 
-  delete(id: string): boolean {
-    const res = this.db.prepare(`DELETE FROM admin_providers WHERE id = ?`).run(id)
+  delete(providerId: number): boolean {
+    const res = this.db.prepare(`DELETE FROM admin_providers WHERE provider_id = ?`).run(providerId)
     return res.changes > 0
   }
 }

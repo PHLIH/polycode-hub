@@ -54,13 +54,6 @@ export function credentialResolve(
   return lookup(c.apiKeyEnv)
 }
 
-export interface Source {
-  id: string
-  displayName: string
-  enabled: boolean
-  priority: number
-}
-
 export interface DynamicHeadersSpec {
   command: string
   args?: string[]
@@ -76,7 +69,6 @@ export function dynamicHeadersTimeout(d?: DynamicHeadersSpec): number {
 
 export interface Model {
   id: string
-  providerId: string
   displayName?: string
   contextWindow?: number // 0 = 未知（放行 + warn）
   maxOutputTokens?: number
@@ -125,9 +117,22 @@ export function capabilitiesFrom(
   }
 }
 
+// Provider 状态三态（一列承担「开关」与「删除」两件事）：
+//   active  = 生效，参与路由
+//   paused  = 开关关掉，仍占名（随时可能恢复），不参与路由
+//   deleted = 已删除，名字释放（可被新建复用），仅用于历史用量归因回溯
+export type ProviderState = 'active' | 'paused' | 'deleted'
+
+export const PROVIDER_STATES: ProviderState[] = ['active', 'paused', 'deleted']
+
 export interface Provider {
-  id: string
-  sourceId: string
+  // providerId 是内部唯一标识（自增，永不变）：账号归属、用量归因都指向它。
+  // 改名只动 name，引用不会断。
+  providerId: number
+  // name 是对外名：模型 ID 前缀（name/modelId）、账号归属的展示、发现页判重都用它。
+  // 可以改；改名后旧名立即失效，但接口会给出明确报错（见 unknownProviderMessage）。
+  name: string
+  state: ProviderState
   displayName: string
   accessKind: AccessKind
   risk: Risk
@@ -138,7 +143,6 @@ export interface Provider {
   credential: CredentialRef
   headers?: Record<string, string>
   dynamicHeaders?: DynamicHeadersSpec
-  enabled: boolean
   priority: number
   streamOnly?: boolean // 上游只支持流式（如 WorkBuddy 对非流式报 11101/404）
   // 出口代理引用（顶层 egresses 定义的 id）；缺省 = 直连（EGRESS-SPIKE 方案 A）。
@@ -149,30 +153,33 @@ export interface Provider {
 }
 
 export function providerValidate(p: Provider): string | undefined {
-  if (!p.id) return 'provider.id 不能为空'
-  if (!validID(p.id)) {
-    return `provider.id "${p.id}" 只允许小写字母/数字/连字符（ID 永久不可改，取名一次到位）`
+  if (!p.name) return 'provider.name 不能为空'
+  if (!validID(p.name)) {
+    return `provider.name "${p.name}" 只允许小写字母/数字/连字符`
+  }
+  if (!PROVIDER_STATES.includes(p.state)) {
+    return `provider ${p.name}: state "${p.state}" 非法（active | paused | deleted）`
   }
   if (!ACCESS_KINDS.includes(p.accessKind)) {
-    return `provider ${p.id}: access_kind "${p.accessKind}" 非法`
+    return `provider ${p.name}: access_kind "${p.accessKind}" 非法`
   }
-  if (!validRisk(p.risk)) return `provider ${p.id}: risk "${p.risk}" 非法`
+  if (!validRisk(p.risk)) return `provider ${p.name}: risk "${p.risk}" 非法`
   if (!p.riskNote && (p.risk === 'medium' || p.risk === 'high')) {
-    return `provider ${p.id}: risk=${p.risk} 必须填写 risk_note（UI 必须显示风险说明）`
+    return `provider ${p.name}: risk=${p.risk} 必须填写 risk_note（UI 必须显示风险说明）`
   }
   if (!STABILITIES.includes(p.stability)) {
-    return `provider ${p.id}: stability "${p.stability}" 非法`
+    return `provider ${p.name}: stability "${p.stability}" 非法`
   }
   if (p.api && !validProtocol(p.api)) {
-    return `provider ${p.id}: api "${p.api}" 非法（空 = 自动探测；可选 anthropic-messages / openai-completions / openai-responses）`
+    return `provider ${p.name}: api "${p.api}" 非法（空 = 自动探测；可选 anthropic-messages / openai-completions / openai-responses）`
   }
-  if (!p.baseUrl) return `provider ${p.id}: base_url 不能为空`
+  if (!p.baseUrl) return `provider ${p.name}: base_url 不能为空`
   if (p.dynamicHeaders) {
     if (!p.dynamicHeaders.command) {
-      return `provider ${p.id}: dynamic_headers.command 不能为空`
+      return `provider ${p.name}: dynamic_headers.command 不能为空`
     }
     if (!p.dynamicHeaders.command.startsWith('/')) {
-      return `provider ${p.id}: dynamic_headers.command 必须用绝对路径（不走 shell）`
+      return `provider ${p.name}: dynamic_headers.command 必须用绝对路径（不走 shell）`
     }
   }
   return undefined
@@ -189,14 +196,17 @@ export type AccountStatus = 'available' | 'cooldown' | 'exhausted' | 'disabled'
 
 export interface Account {
   id: string
-  sourceId: string
+  // 归属的 Provider（值是 Provider.providerId，数字，永不变）。
+  // 同一个 Provider 下挂多个账号 = 该上游多份凭据轮换（如 WorkBuddy 三个号）。
+  // 指向数字 id 而非名字：Provider 改名后账号归属自动跟着走，不用迁移。
+  providerId: number
   displayName?: string
   credential: CredentialRef
   status: AccountStatus
   fails: number
   cooldownUntil?: Date
   lastUsed?: Date
-  // 流量权重（同源账号间按权重分配）：缺省/<=0 按 1 处理。
+  // 流量权重（同 Provider 账号间按权重分配）：缺省/<=0 按 1 处理。
   // 关（disabled）/失效（exhausted/cooldown）时权重自动失效——eligible 只收可用者，
   // 分母是可用者的权重和，不用手动重算。
   weight?: number
@@ -232,8 +242,10 @@ export interface UsageLog {
   id: number
   ts: Date
   requestId: string
-  sourceId: string
-  providerId: string
+  // 归因指向 Provider.providerId（数字）。展示时用 providerName 快照回显——
+  // 名字是用户的心智单位，删除重建同名不该在归因表里裂成两行。
+  providerId: number
+  providerName: string
   accountId?: string
   modelId: string
   inputTokens: number
