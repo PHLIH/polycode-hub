@@ -69,7 +69,7 @@ async function loadHealth() {
     const rows = await api.usageAccounts(rangeQuery.value)
     const map = {}
     for (const r of rows || []) {
-      if (!r.accountId) continue // Provider 级凭据单独成组，不属于任何具体账号
+      if (!r.accountId) continue // Provider 级 API Key 单独成组，不属于任何具体账号
       map[r.accountId] = r
     }
     health.value = map
@@ -138,12 +138,12 @@ function healthOf(a) {
     }
   }
   if ((a.health || 'ok') === 'warn') {
-    return { cls: 'warn', label: '不稳定', title: `连续失败 ${a.fails || 0} 次，已达告警阈值，点「测试」验证凭据是否还有效` }
+    return { cls: 'warn', label: '不稳定', title: `连续失败 ${a.fails || 0} 次，已达告警阈值，点「测试」验证 API Key 是否还有效` }
   }
   return { cls: 'ok', label: '健康', title: '可用，参与轮询' }
 }
 
-// ---- 账号测试：用该账号的凭据打一次真实请求，结果计入状态 ----
+// ---- 账号测试：用该账号的 API Key 打一次真实请求，结果计入状态 ----
 const testing = ref('')
 const testModel = ref({}) // accountId → 选中的模型（缺省取该源第一个启用的）
 
@@ -288,7 +288,7 @@ async function setWeight(a, v) {
     <div class="head-row">
       <div>
         <h2>账号池</h2>
-        <p class="sub">同一上游源的多账号轮换；耗尽/限流自动冷却并换号。凭据只存环境变量引用，明文不落盘、不回显。</p>
+        <p class="sub">同一上游源的多账号轮换；耗尽/限流自动冷却并换号。API Key 只存环境变量引用，明文不落盘、不回显。</p>
       </div>
       <!-- 时间胶囊：只管健康数据区间（与概览归因区同款） -->
       <div class="range-pill-wrap">
@@ -335,7 +335,7 @@ async function setWeight(a, v) {
       <button class="btn" @click="openCreate(g.id)">＋ 添加账号</button>
     </header>
 
-    <p v-if="!g.accounts.length" class="src-empty">这个源下面还没有账号，点「添加账号」把凭据挂进来。</p>
+    <p v-if="!g.accounts.length" class="src-empty">这个源下面还没有账号，点「添加账号」把 API Key 挂进来。</p>
 
     <div v-for="a in g.accounts" :key="a.id" class="acct" :class="{ open: expanded === a.id }">
       <div class="acct-row" @click="toggleExpand(a.id)">
@@ -343,7 +343,7 @@ async function setWeight(a, v) {
         <span class="dot" :class="healthOf(a).cls" :title="healthOf(a).title"></span>
         <span class="acct-id num">{{ a.id }}</span>
         <span class="acct-name">{{ a.displayName || '—' }}</span>
-        <span class="acct-cred num dim" :title="a.credential && a.credential.apiKeyEnv ? '凭据环境变量' : ''">
+        <span class="acct-cred num dim" :title="a.credential && a.credential.apiKeyEnv ? 'API Key 环境变量' : ''">
           {{ (a.credential && a.credential.apiKeyEnv) || '—' }}
         </span>
         <span class="acct-health" :class="healthOf(a).cls" :title="healthOf(a).title">{{ healthOf(a).label }}</span>
@@ -378,7 +378,7 @@ async function setWeight(a, v) {
           <button class="btn sm ghost" :disabled="testing === a.id" @click="reset(a)"
             title="只清连败与冷却，不发请求">重置</button>
           <span class="dim test-note">
-            用该账号的凭据打一次真实请求；测通即解除冷却、连败归零，测挂则计一次失败
+            用该账号的 API Key 打一次真实请求；测通即解除冷却、连败归零，测挂则计一次失败
           </span>
         </div>
 
@@ -424,8 +424,9 @@ async function setWeight(a, v) {
         </el-select>
       </el-form-item>
       <el-form-item label="显示名"><el-input v-model="form.displayName" /></el-form-item>
-      <el-form-item label="凭据 env">
-        <el-input v-model="form.credentialEnv" :disabled="!!editing" placeholder="环境变量名（如 ZCODE_JWT）" />
+      <el-form-item label="API Key env">
+        <el-input v-model="form.credentialEnv" :disabled="!!editing" class="mono"
+          placeholder="环境变量名，如 ZCODE_JWT" />
       </el-form-item>
     </el-form>
     <template #footer>

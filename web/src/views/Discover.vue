@@ -80,7 +80,7 @@ async function scUninstall() {
   // 双确认：第一步确认卸载，第二步确认是否连配置/日志一起清
   try {
     await ElMessageBox.confirm(
-      '卸载会删除引擎二进制与网关侧鉴权 key。登录凭据（OAuth 身份）不受影响。',
+      '卸载会删除引擎二进制与网关侧鉴权 key。登录态（OAuth 身份）不受影响。',
       '卸载 ZCode 本地引擎', { type: 'warning', confirmButtonText: '继续' })
   } catch { return }
   let q = '?confirm=true'
@@ -181,7 +181,7 @@ onMounted(loadSidecar)
 // 导入共存登录态进账号池：token 由服务端读取落盘（不经过前端）。
 const importing = ref('')
 // 注意：credFileOf 恒为空（历史残留），实际恒走 `config/credentials/${id}-jwt` 分支。
-const credFileOf = {} // 建议 id → 凭据文件路径（与展示顺序一致）
+const credFileOf = {} // 建议 id → API Key 文件路径（与展示顺序一致）
 
 async function importAccount(f, a) {
   // id 取池子里下一个空闲编号（恒为 wb-N 形态；非 workbuddy 源的后端惯例是 ${key}-N，

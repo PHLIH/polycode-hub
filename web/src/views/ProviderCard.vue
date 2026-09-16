@@ -31,12 +31,19 @@ const exposedCount = computed(() => exposedModels.value.length)
 const totalCount = computed(() => (props.p.models || []).length)
 
 // 数据核对用：这些字段在创建表单里都填了，原表格一行也放不下，收进「接入信息」。
+// API Key 只显示「引用来源」（环境变量名或文件路径），永不显示 Key 本身——明文不落盘、不回显。
 const metaOpen = ref(false)
+function apiKeyRef(p) {
+  const c = (p && p.credential) || {}
+  if (c.apiKeyFile) return `文件 ${c.apiKeyFile}`
+  if (c.apiKeyEnv) return `env ${c.apiKeyEnv}`
+  return '无（复用登录态或无需鉴权）'
+}
 const META = computed(() => [
   ['接入方式', KIND_LABELS[props.p.accessKind] || props.p.accessKind],
   ['风险', RISK_LABELS[props.p.risk] || props.p.risk],
   ['稳定性', props.p.stability],
-  ['凭据', (props.p.credential && props.p.credential.apiKeyEnv) || '无（复用登录态或无需鉴权）'],
+  ['API Key', apiKeyRef(props.p)],
   ['出口', props.p.egress || '直连'],
   ['只走流式', props.p.streamOnly ? '是' : '否']
 ])

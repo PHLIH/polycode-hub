@@ -67,9 +67,34 @@ const STAB = [
 const form = reactive({
   id: '', sourceId: '', displayName: '', api: 'anthropic-messages',
   baseURL: '', accessKind: 'official', risk: 'low', riskNote: '',
-  stability: 'stable', credentialEnv: '', enabled: true, modelsText: '', streamOnly: false,
-  egress: ''
+  stability: 'stable', credentialEnv: '', enabled: true,
+  modelsText: '', streamOnly: false, egress: ''
 })
+
+// 高级选项默认折叠：稳定性/只走流式/手填模型都是配一次就不再动的。
+const advOpen = ref(false)
+
+// advSummary：折叠时用一行说明当前值，否则"收起来了"等于"看不见了"。
+// 只列非默认值——全默认时说"默认"，比列一排 stable/official/low 更有信息量。
+const advSummary = computed(() => {
+  const parts = []
+  if (form.accessKind !== 'official') parts.push(`接入 ${form.accessKind}`)
+  if (form.risk !== 'low') parts.push(`风险 ${form.risk}`)
+  if (form.stability !== 'stable') parts.push(form.stability)
+  if (form.streamOnly) parts.push('只走流式')
+  if (form.egress) parts.push(`出口 ${form.egress}`)
+  const n = form.modelsText.split('\n').map(s => s.trim()).filter(Boolean).length
+  if (n) parts.push(`手填模型 ${n}`)
+  return parts.length ? parts.join(' · ') : '默认'
+})
+
+// buildCredential：只写环境变量引用（API Key 明文不落盘）。
+// 注意：不返回 {} 去覆盖已有引用——文件型引用（一键导入生成的）由后端保留，
+// 前端一旦用空对象覆盖，那些 Provider 的 Key 会当场丢失。
+function buildCredential() {
+  const env = form.credentialEnv.trim()
+  return env ? { apiKeyEnv: env } : null
+}
 
 async function load() {
   try {
@@ -154,24 +179,34 @@ function openCreate() {
   Object.assign(form, {
     id: '', sourceId: 'default', displayName: '', api: '',
     baseURL: '', accessKind: 'official', risk: 'low', riskNote: '',
-    stability: 'stable', credentialEnv: '', enabled: true, modelsText: '', streamOnly: false,
-    egress: ''
+    stability: 'stable', credentialEnv: '', enabled: true,
+    modelsText: '', streamOnly: false, egress: ''
   })
+  advOpen.value = false
   editing.value = null
   dialog.value = true
 }
 
+// openEdit：API Key 一栏只回显环境变量引用。
+// 文件型引用（一键导入/发现生成的）显示为一条只读说明，不提供编辑入口——
+// 用户不关心 Key 存在哪个文件，但也不能让它在保存时被悄悄清掉。
 function openEdit(p) {
+  const c = (p && p.credential) || {}
   Object.assign(form, {
     id: p.id, sourceId: p.sourceId, displayName: p.displayName || '', api: p.api,
     baseURL: p.baseUrl, accessKind: p.accessKind, risk: p.risk, riskNote: p.riskNote || '',
-    stability: p.stability, credentialEnv: (p.credential && p.credential.apiKeyEnv) || '',
+    stability: p.stability, credentialEnv: c.apiKeyEnv || '',
     enabled: !!p.enabled, modelsText: '', streamOnly: !!p.streamOnly,
     egress: p.egress || ''
   })
   editing.value = p
+  advOpen.value = false
   dialog.value = true
 }
+
+// usesKeyFile：该 Provider 的 Key 来自文件（一键导入生成的都是这种）。
+const usesKeyFile = computed(() =>
+  !!(editing.value && editing.value.credential && editing.value.credential.apiKeyFile))
 
 function parseModelsText() {
   return form.modelsText.split('\n').map(s => s.trim()).filter(Boolean)
@@ -181,25 +216,33 @@ async function save() {
   if (!form.id) { ElMessage.warning('Provider ID 必填（小写字母/数字/连字符，保存后不可改）'); return }
   if (!form.baseURL) { ElMessage.warning('baseURL 必填'); return }
   if ((form.risk === 'medium' || form.risk === 'high') && !form.riskNote) {
+    // 风险栏在折叠区里：只弹 toast 的话，用户看不到该改哪个框。
+    // 自动展开高级选项，让出错的字段当场可见。
+    advOpen.value = true
     ElMessage.warning('中/高风险必须填写风险说明（riskNote），使用者要在界面上看到')
     return
   }
   busy.value = true
   try {
+    const cred = buildCredential()
     if (editing.value) {
       const patch = {
         displayName: form.displayName, enabled: form.enabled,
-        riskNote: form.riskNote, streamOnly: form.streamOnly
+        riskNote: form.riskNote, streamOnly: form.streamOnly,
+        stability: form.stability, accessKind: form.accessKind, risk: form.risk
       }
       const extra = parseModelsText()
       if (extra.length) patch.models = extra
+      // 只有用户确实填了 env 才写回 credential。留空 = 不动原有引用：
+      // 文件型引用（一键导入生成的）不能被空表单覆盖掉。
+      if (cred) patch.credential = cred
       await api.updateProvider(form.id, patch)
     } else {
       await api.createProvider({
         id: form.id, sourceId: form.sourceId, displayName: form.displayName,
         api: form.api, baseUrl: form.baseURL, accessKind: form.accessKind,
         risk: form.risk, riskNote: form.riskNote, stability: form.stability,
-        credential: form.credentialEnv ? { apiKeyEnv: form.credentialEnv } : {},
+        credential: cred || {},
         egress: form.egress || '',
         enabled: form.enabled,
         models: parseModelsText().map(id => ({ id, enabled: true }))
@@ -250,13 +293,19 @@ const clashPort = ref('7897')
 const clashBusy = ref(false)
 const hasClash = computed(() => declaredEgresses.value.some(e => e.id === 'clash'))
 
-// clashAddr：状态条常驻显示当前生效的出口地址——配置结果不该只在弹框里可见。
+// clashAddr：顶部入口按钮旁的 chip 常驻显示当前生效的出口地址——配置结果不该只在弹框里可见。
 const clashAddr = computed(() => {
   const e = declaredEgresses.value.find(x => x.id === 'clash')
   return e ? e.addr : ''
 })
 
-// modelsUsingClash：有多少个模型真的把流量切到了 clash（状态条据此说人话）。
+// clashPortOf：状态 chip 只展示端口（地址太长，头部放不下整串）。
+function clashPortOf(addr) {
+  return (addr || '').split(':').pop() || ''
+}
+
+// modelsUsingClash：有多少个模型真的把流量切到了 clash。
+// 底部状态条已删（与顶部入口重复），这个数字改在弹框引导里说——配置完知道有没有生效。
 const modelsUsingClash = computed(() => {
   let n = 0
   for (const p of list.value) {
@@ -459,13 +508,20 @@ async function adoptModels() {
 </script>
 
 <template>
+  <!-- 出口代理：全页只有顶部这一个入口。配置结果直接写在按钮上，
+       底部不再重复一条状态条——同一件事画两遍会被读成两条通道。 -->
   <header class="page-head">
     <div class="head-left">
       <h2>Provider</h2>
       <p class="sub">每一路是一条上游通道。点左侧箭头展开，看它对外暴露了哪些模型。</p>
     </div>
     <div class="head-right">
-      <button class="btn ghost" @click="openClash">出口代理</button>
+      <span v-if="hasClash" class="eg-chip" :title="`clash 出口：http://${clashAddr}`">
+        <span class="dot ok" />
+        <span class="mono">clash</span>
+        <span class="mono dim">:{{ clashPortOf(clashAddr) }}</span>
+      </span>
+      <button class="btn ghost" @click="openClash">{{ hasClash ? '出口代理' : '配置 Clash 出口' }}</button>
       <button class="btn" @click="openCreate">添加外部 API</button>
     </div>
   </header>
@@ -545,24 +601,6 @@ async function adoptModels() {
     :testing="testing === p.id" :test-res="testRes[p.id]"
     @test="test" @reload="load" @models="openModels" @edit="openEdit" @remove="remove" />
 
-  <!-- 出口代理：配置结果常驻显示，不该只在弹框里可见 -->
-  <section class="egress-bar" :class="{ on: hasClash }">
-    <span class="eg-label">出口代理</span>
-    <template v-if="hasClash">
-      <span class="mono eg-name">clash</span>
-      <span class="mono eg-addr dim">http://{{ clashAddr }}</span>
-      <span class="status-chip ok"><span class="dot ok" />已启用</span>
-      <span class="dim eg-note">
-        {{ modelsUsingClash ? `${modelsUsingClash} 个模型走此代理，其余直连` : '尚无模型绑定它——到「模型」里给被地域锁的模型切出口' }}
-      </span>
-    </template>
-    <template v-else>
-      <span class="status-chip"><span class="dot" />未配置</span>
-      <span class="dim eg-note">全部直连。只给被地域锁的模型挂代理时再来配。</span>
-    </template>
-    <button class="btn ghost eg-btn" @click="openClash">{{ hasClash ? '修改' : '配置 Clash 出口' }}</button>
-  </section>
-
   <el-dialog v-model="clashDlg" title="Clash 出口" width="480px">
     <el-form label-width="90px">
       <el-form-item label="混合端口">
@@ -573,6 +611,11 @@ async function adoptModels() {
     <div class="clash-guide">
       <p>保存后定义一个名为 <span class="mono">clash</span> 的出口（http://127.0.0.1:端口），立即生效。</p>
       <p>然后到该 Provider 的「模型」里，把被地域锁的模型（如 muse-spark）的出口切到 <span class="mono">clash</span> —— 只有它走代理，同 Provider 其它模型保持直连。别把整个 Provider 都绑上去。</p>
+      <p v-if="hasClash">
+        当前 <span class="mono">{{ clashAddr }}</span>：
+        <template v-if="modelsUsingClash">已有 {{ modelsUsingClash }} 个模型走此代理，其余直连。</template>
+        <template v-else>尚无模型绑定它，全部直连。</template>
+      </p>
     </div>
     <template #footer>
       <button v-if="hasClash" class="btn ghost danger" @click="removeClash">删除出口</button>
@@ -596,45 +639,65 @@ async function adoptModels() {
         </el-select>
         <div class="field-hint">{{ apiHint(form.api) }}</div>
       </el-form-item>
-      <el-form-item label="baseURL">
-        <el-input v-model="form.baseURL" class="mono" placeholder="停在操作路径之前" />
+      <el-form-item label="Base URL">
+        <el-input v-model="form.baseURL" class="mono" placeholder="上游 API 根地址，停在操作路径之前" />
+        <div class="field-hint">如 https://api.acme.com/v1 —— 不带 /chat/completions、/messages 这类操作路径。</div>
       </el-form-item>
-      <el-form-item label="接入方式">
-        <el-select v-model="form.accessKind" style="width:100%">
-          <el-option v-for="k in KINDS" :key="k.v" :value="k.v" :label="k.v" />
-        </el-select>
-        <div class="field-hint">{{ apiHint(form.accessKind) }}</div>
+      <el-form-item label="API Key">
+        <el-input v-model="form.credentialEnv" class="mono" placeholder="环境变量名，如 ACME_API_KEY（推荐）" />
+        <div class="field-hint">
+          只存引用、不存明文：网关每次请求现读这个环境变量。留空 = 该上游无需鉴权。
+        </div>
+        <div v-if="usesKeyFile" class="keyfile-note">
+          当前 Key 由一键导入生成的密钥文件提供（<span class="mono">{{ editing.credential.apiKeyFile }}</span>）。
+          留空即保持不变；填了环境变量名则以它为准。
+        </div>
       </el-form-item>
-      <el-form-item label="风险">
-        <el-select v-model="form.risk" style="width:120px">
-          <el-option v-for="r in RISKS" :key="r.v" :value="r.v" :label="r.v" />
-        </el-select>
-        <el-input v-model="form.riskNote" placeholder="风险说明（中/高风险必填，界面上可见）" style="flex:1" />
-        <div class="field-hint">{{ apiHint(form.risk) }}</div>
-      </el-form-item>
-      <el-form-item label="凭据">
-        <el-input v-model="form.credentialEnv" placeholder="环境变量名（如 ACME_KEY），明文不落盘" />
-      </el-form-item>
-      <el-form-item label="稳定性">
-        <el-select v-model="form.stability" style="width:160px">
-          <el-option v-for="s in STAB" :key="s.v" :value="s.v" :label="s.v" />
-        </el-select>
-        <div class="field-hint">{{ apiHint(form.stability) }}</div>
-      </el-form-item>
-      <el-form-item label="出口代理">
-        <el-select v-model="form.egress" clearable placeholder="直连（默认）" style="width:100%">
-          <el-option v-for="e in egressOptions" :key="e.id" :label="`${e.id}（${e.kind}://${e.addr}）`" :value="e.id" />
-        </el-select>
-        <div class="dim field-hint">被地域锁的模型走代理出口；其余 Provider 保持直连（顶层 egresses 在 config/apps.yaml 定义）。</div>
-      </el-form-item>
-      <el-form-item label="只走流式">
-        <el-switch v-model="form.streamOnly" />
-        <div class="field-hint">上游不支持非流式时勾上（如 WorkBuddy 报 11101/404），调度会跳过非流式请求，不再白撞一次。</div>
-      </el-form-item>
-      <el-form-item label="模型">
-        <el-input v-model="form.modelsText" type="textarea" :rows="3"
-          :placeholder="editing ? '追加模型 ID（每行一个，已有不受影响）' : '模型 ID（每行一个）'" />
-      </el-form-item>
+
+      <!-- 高级选项：配一次基本不再动。默认折叠，新增时不必面对一排「不知道填什么」的框。 -->
+      <div class="adv">
+        <button type="button" class="adv-toggle" @click="advOpen = !advOpen">
+          <span class="caret-tri small" :class="{ open: advOpen }" />高级选项
+          <span class="dim adv-sum">{{ advSummary }}</span>
+        </button>
+        <div v-show="advOpen" class="adv-body">
+          <el-form-item label="接入方式">
+            <el-select v-model="form.accessKind" style="width:100%">
+              <el-option v-for="k in KINDS" :key="k.v" :value="k.v" :label="k.v" />
+            </el-select>
+            <div class="field-hint">{{ apiHint(form.accessKind) }}</div>
+          </el-form-item>
+          <el-form-item label="风险">
+            <el-select v-model="form.risk" style="width:120px">
+              <el-option v-for="r in RISKS" :key="r.v" :value="r.v" :label="r.v" />
+            </el-select>
+            <el-input v-model="form.riskNote" placeholder="风险说明（中/高风险必填，界面上可见）" style="flex:1" />
+            <div class="field-hint">{{ apiHint(form.risk) }}</div>
+          </el-form-item>
+          <el-form-item label="稳定性">
+            <el-select v-model="form.stability" style="width:160px">
+              <el-option v-for="s in STAB" :key="s.v" :value="s.v" :label="s.v" />
+            </el-select>
+            <div class="field-hint">{{ apiHint(form.stability) }}</div>
+          </el-form-item>
+          <el-form-item label="只走流式">
+            <el-switch v-model="form.streamOnly" />
+            <div class="field-hint">上游不支持非流式时勾上（如 WorkBuddy 报 11101/404），调度会跳过非流式请求，不再白撞一次。</div>
+          </el-form-item>
+          <el-form-item label="模型">
+            <el-input v-model="form.modelsText" type="textarea" :rows="3"
+              :placeholder="editing ? '追加模型 ID（每行一个，已有不受影响）' : '模型 ID（每行一个）'" />
+            <div class="field-hint">日常用「模型」按钮从上游目录勾选；这里是手填兜底（上游没有列表接口时）。</div>
+          </el-form-item>
+          <el-form-item label="出口代理">
+            <el-select v-model="form.egress" clearable placeholder="直连（默认）" style="width:100%">
+              <el-option v-for="e in egressOptions" :key="e.id" :label="`${e.id}（${e.kind}://${e.addr}）`" :value="e.id" />
+            </el-select>
+            <div class="dim field-hint">被地域锁的模型走代理出口；其余 Provider 保持直连。细粒度到模型可在展开行的下拉里调。</div>
+          </el-form-item>
+        </div>
+      </div>
+
       <el-form-item label="启用"><el-switch v-model="form.enabled" /></el-form-item>
     </el-form>
     <template #footer>
@@ -766,21 +829,34 @@ async function adoptModels() {
 .status-chip .dot { margin-right: 0; }
 .field-hint { color: var(--dim); font-size: 11px; line-height: 1.5; padding-top: 2px; }
 
+/* ---- 高级选项：默认折叠，按钮本身就是那一行的标题 ---- */
+.adv { margin: 2px 0 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.adv-toggle {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  border: 0; background: none; color: var(--text); cursor: pointer;
+  font-size: 12.5px; font-weight: 600; padding: 2px 0; text-align: left;
+}
+.adv-toggle:hover { color: var(--accent); }
+.adv-sum { font-weight: 400; font-size: 11.5px; margin-left: auto; }
+.adv-body { padding-top: 10px; }
+.adv-body :deep(.el-form-item:last-child) { margin-bottom: 0; }
+.keyfile-note {
+  font-size: 11px; line-height: 1.5; padding-top: 6px; color: var(--accent);
+}
+.keyfile-note .mono { overflow-wrap: anywhere; }
+
 .empty { border: 1px dashed var(--line); border-radius: var(--r-box); padding: 28px 20px; text-align: center; margin-bottom: 16px; }
 .empty-title { margin: 0 0 6px; font-size: 14px; font-weight: 600; }
 .empty-body { margin: 0 0 14px; font-size: 12px; color: var(--dim); }
 
-/* ---- 出口代理状态条 ---- */
-.egress-bar {
-  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-  background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-box);
-  padding: 9px 14px; margin: 16px 0 0; font-size: 12px;
+/* ---- 出口代理状态 chip（挂在顶部入口按钮旁，全页唯一一处） ---- */
+.eg-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 4px 10px; font-size: 12px;
+  border: 1px solid color-mix(in srgb, var(--ok) 35%, var(--line));
+  border-radius: var(--r-chip); background: color-mix(in srgb, var(--ok) 8%, transparent);
 }
-.egress-bar.on { border-color: color-mix(in srgb, var(--ok) 35%, var(--line)); }
-.eg-label { color: var(--dim); flex: none; }
-.eg-name { flex: none; }
-.eg-note { flex: 1; min-width: 200px; }
-.eg-btn { flex: none; padding: 4px 12px; font-size: 12px; }
+.eg-chip .dot { margin-right: 0; }
 
 /* ---- 获取模型弹窗 ---- */
 .md-head { display: flex; align-items: baseline; gap: 10px; }
