@@ -6,12 +6,49 @@
 // stdinLine / PingSidecar，grep 确认无生产使用点）。
 
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 export const releaseAPI = 'https://api.github.com/repos/TriDefender/zcode-api/releases/latest'
+
+// 下载来源白名单。装下来的二进制会被 chmod 0700 并 spawn 执行——
+// 等于以网关自身权限运行任意代码，所以「从哪下」必须收死：
+//   · 强制 https（防明文 MITM 替换）
+//   · host 只认 GitHub 自己的域名（api.github.com 返回的 browser_download_url
+//     实际指向 objects.githubusercontent.com 或 github.com 的 release 路径）
+// 上游若被投毒/账号被盗，白名单挡不住，但能挡住「把 url 指向别处」这一类。
+const DOWNLOAD_HOSTS = new Set([
+  'github.com',
+  'objects.githubusercontent.com',
+  'codeload.github.com',
+  'api.github.com',
+])
+
+// 校验下载地址：非 https、非法 URL、或 host 不在白名单一律拒绝。
+// 返回空串表示通过，否则返回拒绝原因。
+export function checkDownloadURL(raw: string): string {
+  if (raw === '') return '下载地址为空'
+  let u: URL
+  try {
+    u = new URL(raw)
+  } catch {
+    return `下载地址不是合法 URL: ${raw}`
+  }
+  if (u.protocol !== 'https:') {
+    return `下载地址必须用 https（拒绝 ${u.protocol}//）: ${raw}`
+  }
+  if (!DOWNLOAD_HOSTS.has(u.hostname)) {
+    return `下载地址 host 不在白名单（${u.hostname}）: ${raw}`
+  }
+  return ''
+}
+
+// 计算 buffer 的 sha256（十六进制小写）。
+export function sha256Hex(buf: Uint8Array): string {
+  return createHash('sha256').update(buf).digest('hex')
+}
 
 export interface ReleaseAsset {
   name: string
@@ -30,6 +67,13 @@ export interface InstallOptions {
   fetch?: FetchLike
   goos?: string // 默认 process.platform
   arch?: string // 默认 process.arch
+  // expectedSha256 期望的二进制摘要（十六进制，大小写不敏感）。
+  // GitHub release API 不提供 digest，所以只能由调用方/配置文件给出；
+  // 给了就强制比对，不一致直接拒绝安装（不落地、不执行）。
+  expectedSha256?: string
+  // allowUntrusted 显式豁免「未提供摘要」这一条（白名单与 https 仍然强制）。
+  // 默认 false：宁可让用户显式确认，也不静默接受一个未经校验的可执行文件。
+  allowUntrusted?: boolean
 }
 
 export interface EnsureReadyOptions {
@@ -148,13 +192,40 @@ export class Sidecar {
       throw new Error(`sidecar: release ${info.tagName} 无资产 ${name}`)
     }
     mkdirSync(this.binDir, { recursive: true, mode: 0o755 })
+    // 落地前先验来源：这个文件接下来会被 chmod 0700 并 spawn 执行，
+    // 「从哪下」必须先收死（https + host 白名单），否则一个被篡改的
+    // browser_download_url 就等于任意代码执行。
+    const urlErr = checkDownloadURL(asset.url)
+    if (urlErr !== '') throw new Error(`sidecar: 拒绝下载 —— ${urlErr}`)
     const res = await (opts.fetch ?? fetch)(asset.url)
     if (res.status !== 200) {
       throw new Error(`sidecar: 下载失败: http ${res.status}`)
     }
+    const buf = Buffer.from(await res.arrayBuffer())
+
+    // 完整性校验：摘要给了就必须对上（不符直接拒绝，不落地）。
+    // 没给摘要时，GitHub release API 本身也不提供 digest——我们无法凭空验证，
+    // 所以默认放行但**显式告警**；调用方可用 expectedSha256 强制收紧，
+    // 或用 allowUntrusted:false 把「未校验」升级成硬错误。
+    const want = (opts.expectedSha256 ?? '').trim().toLowerCase()
+    if (want !== '') {
+      const got = sha256Hex(buf)
+      if (got !== want) {
+        throw new Error(
+          `sidecar: 摘要不匹配，已拒绝安装（期望 ${want}，实际 ${got}）。` +
+          `可能是下载被篡改或上游重新打包，请核对 release 说明后重试。`)
+      }
+    } else if (opts.allowUntrusted === false) {
+      throw new Error('sidecar: 未提供 expectedSha256，已按 allowUntrusted=false 拒绝安装')
+    } else {
+      console.warn(
+        `sidecar: 警告 —— ${name} 未提供 sha256 校验（上游 API 不返回 digest），` +
+        `仅校验了来源 https + host 白名单；二进制将以本机权限执行。`)
+    }
+
     // 临时文件 + rename，防半写；0700 仅本用户可执行
     const tmp = dest + '.tmp'
-    writeFileSync(tmp, Buffer.from(await res.arrayBuffer()), { mode: 0o700 })
+    writeFileSync(tmp, buf, { mode: 0o700 })
     renameSync(tmp, dest)
     return dest
   }
@@ -392,6 +463,11 @@ defaultModel: glm-5.3-flash
         res.workDirData?.push(this.workDir)
       } catch { /* 本来就不在 */ }
     }
+    // 端口状态必须一并复位：config.yaml 已经删了，下次 ensureReady 会重新生成，
+    // 而 sidecar 找不到端口配置时回落 8080。若这里仍留着旧端口（比如 setPort 到 9090），
+    // 网关侧 providers 表里指向 9090 的 baseUrl 就会永久打不通——
+    // 表现为「重装后引擎起不来」，但日志里没有任何错误。
+    this.port = '8080'
     return res
   }
 }

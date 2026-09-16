@@ -212,9 +212,11 @@ export async function runServe(args: string[]): Promise<void> {
   }
 
   // 项目管理巡检（超时自动关/死进程清账）+ 优雅退出。
-  const sweeper = setInterval(() => { void projectsMgr.sweep() }, 60_000)
-  sweeper.unref?.()
+  // 用 manager 自带的 runSweeper（它 unref 了定时器并返回取消函数），
+  // 不在 cli 里另写一份 setInterval——两处实现漂移过一次。
+  const stopSweeper = projectsMgr.runSweeper(60_000)
   const shutdown = () => {
+    stopSweeper() // 先停巡检，再关服务，避免退出期间还在改状态文件
     console.log('已退出')
     void server.close()
     process.exit(0)

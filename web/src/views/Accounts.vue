@@ -8,6 +8,9 @@ const list = ref([])
 const providers = ref([]) // 测试按钮的模型下拉源（账号只认同源 Provider 的模型）
 const sourceOptions = ref([])
 const err = ref('')
+// Provider 列表单独的错误态：它加载失败时账号页仍能显示已有账号，
+// 但分组名/归属下拉会退化，必须显式告诉用户"是列表没拉到"，而不是伪装成空状态。
+const providersErr = ref('')
 const dialog = ref(false)
 const editing = ref(null)
 
@@ -84,9 +87,11 @@ function healthText(row) {
   if (!h || !h.requests) return '—'
   return `${fmtN(h.requests)} 次`
 }
+/** 失败率列：健康数据加载中时不能显示 "—"——那会被读成"这个号没用量"，
+ *  而实际是"数据还没到"。用 healthLoading 区分这两种语义。 */
 function errRateText(row) {
   const h = hOf(row)
-  if (!h || !h.requests) return ''
+  if (!h || !h.requests) return healthLoading.value ? '…' : ''
   return `失败 ${h.errors || 0} 次 · ${(h.errorRate * 100).toFixed(0)}%`
 }
 function errRateClass(row) {
@@ -189,7 +194,13 @@ const form = reactive({
 
 async function load() {
   try {
-    const [as, ps] = await Promise.all([api.accounts(), api.providers().catch(() => [])])
+    const [as, ps] = await Promise.all([
+      api.accounts(),
+      // providers 失败不能静默成 []：那会让分组名退化成数字 id、
+      // 「＋添加账号」预填空值、归属下拉变空，把**故障**伪装成「还没有可挂账号的上游源」。
+      // 这里保留错误并显式提示，让用户知道是列表没拉到，而不是没配 Provider。
+      api.providers().catch((e) => { providersErr.value = e.message; return [] }),
+    ])
     list.value = as
     providers.value = ps
     // 归属下拉 = Provider id 列表（账号就是挂在某个 Provider 名下的）。
@@ -228,13 +239,9 @@ const groups = computed(() => {
 // 账号与 Provider 同源即互相影响（proxy.ts:203 转发、probe.ts:214 探测都取
 // 「同源第一个可用账号」的凭据覆盖 Provider 凭据），所以这个提示不能省：
 // 用户在 default 源下随手加个测试账号，就能把已配好的 Provider Key 顶掉。
-// Provider 名 → 内部 id：分组键用 id（改名不影响账号归属），显示用名。
-const idByName = computed(() => {
-  const m = new Map()
-  for (const p of providers.value) m.set(p.name, p.providerId)
-  return m
-})
-// 反向：内部 id → 名字（分组头展示）。
+// 名字 → 内部 id 的映射已不再需要：保存时走 api.createAccount({providerName})，
+// 由后端按名字解析成 id（前端不再自己转）。这里曾有一个零引用的 idByName，已删。
+// 反向映射 nameById 仍有用（分组头展示、openEdit 回填归属名）。
 const nameById = computed(() => {
   const m = new Map()
   for (const p of providers.value) m.set(String(p.providerId), p.name)
@@ -375,6 +382,7 @@ async function setWeight(a, v) {
   </header>
 
   <p v-if="err" class="err">加载失败：{{ err }}</p>
+  <p v-if="providersErr" class="err">Provider 列表加载失败（账号归属与分组名无法解析）：{{ providersErr }}</p>
 
   <p v-if="!groups.length" class="empty">
     还没有可挂账号的上游源。先到「Provider」页添加上游源，再回到这里往源下面加账号。
@@ -472,6 +480,14 @@ async function setWeight(a, v) {
             </tbody>
           </table>
         </template>
+
+        <!-- 失败原因分布：后端已下发 byKind（quota/rate_limit/auth/...），
+             以前只算了不渲染 —— 排障时"这个号为什么挂"全靠猜。
+             放在明细表下方，只在真有失败时出现。 -->
+        <div v-if="byKindParts(a).length" class="bykind">
+          <span class="dim">失败原因：</span>
+          <span v-for="p in byKindParts(a)" :key="p" class="bykind-item">{{ p }}</span>
+        </div>
         <span v-else class="dim">{{ rangeLabel }}无用量记录。</span>
       </div>
     </div>
@@ -657,12 +673,6 @@ async function setWeight(a, v) {
 .btn.sm { padding: 3px 10px; font-size: 12px; }
 .test-note { font-size: 11px; }
 
-.hd-row { margin: 3px 0; color: var(--text); }
-.hd-tag {
-  display: inline-block; border: 1px solid var(--line); border-radius: 4px;
-  padding: 0 6px; margin-right: 6px; color: var(--dim); font-size: 11px;
-}
-.hd-model { margin-right: 12px; color: var(--text); }
 /* 明细归因表：与概览用量归因表同构（模型/请求/输入/输出/总量/失败+占比条） */
 .mattr { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 8px; }
 .mattr th { text-align: left; color: var(--dim); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--line); }
@@ -675,4 +685,10 @@ async function setWeight(a, v) {
 .mattr .bar-col { width: 120px; }
 .mattr .bar { height: 6px; background: var(--panel-2, #1a222d); border-radius: 3px; overflow: hidden; }
 .mattr .bar-fill { height: 100%; background: var(--accent); border-radius: 3px; }
+/* 失败原因分布（byKind）：一行小标签，回答"这个号为什么挂" */
+.bykind { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 8px; font-size: 12px; }
+.bykind-item {
+  padding: 1px 7px; border-radius: 4px; border: 1px solid var(--line);
+  color: var(--text); font-variant-numeric: tabular-nums;
+}
 </style>

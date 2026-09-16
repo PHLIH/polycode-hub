@@ -67,6 +67,12 @@ async function serviceAction(p, s, action) {
       await api.projectServiceAction(p.id, s.name, action)
     }
     await load()
+  } catch (e) {
+    // 必须 catch：startWithConflictGuard 里非冲突错误会 `throw e`，
+    // 以前这里只有 finally，异常直接逃逸成 unhandled rejection——
+    // 页面上零提示，用户只看到按钮从"启动中"变回"启动"，不知道失败原因。
+    // projectAction / askKillPort 都有 catch，这里补齐对齐。
+    ElMessage.error(e.message)
   } finally {
     busy.value = ''
   }
@@ -999,6 +1005,9 @@ h2 { margin: 0; font-size: 18px; }
 .ai-check { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 4px 0; cursor: pointer; }
 .ai-check input { accent-color: var(--accent); }
 .ai-note { font-size: 12px; margin: 0 0 10px; }
+/* 注：.ai-prompt 是「提示词全文展示区」的样式，但模板里目前没有这个元素
+   （只有下拉/目录/README 复选/复制按钮）：复制了内容却看不到自己复制了什么，
+   属于功能缺口。补 UI 时用它即可，故保留定义。 */
 .ai-prompt {
   font-family: var(--mono); font-size: 12px; line-height: 1.6; white-space: pre-wrap;
   background: var(--bg); border: 1px solid var(--line); border-radius: 8px;

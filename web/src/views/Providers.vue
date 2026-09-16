@@ -106,7 +106,14 @@ function buildCredential() {
 
 async function load() {
   try {
-    ;[list.value, declaredEgresses.value] = await Promise.all([api.providers(), api.egresses()])
+    // egresses 单独兜底：出口只是 Provider 的一个可选绑定项，它挂了不该拖垮整页。
+    // 以前两者共用一个 Promise.all 且都没 catch，egresses 一次 501/网络错
+    // 就让 err 有值 → 整页显示「加载失败」+ 卡片一条不剩，
+    // 而 providers 请求其实已经成功了（用户看到的是"Provider 全没了"）。
+    ;[list.value, declaredEgresses.value] = await Promise.all([
+      api.providers(),
+      api.egresses().catch(() => []),
+    ])
     err.value = ''
   } catch (e) { err.value = e.message }
 }
@@ -893,7 +900,6 @@ async function adoptModels() {
 @media (max-width: 820px) {
   .page-head { flex-wrap: wrap; }
   .head-right { margin-left: 0; }
-  .ledger { grid-template-columns: repeat(2, 1fr); }
 }
 @media (prefers-reduced-motion: reduce) {
   .caret-tri { transition: none; }

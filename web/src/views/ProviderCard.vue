@@ -90,12 +90,25 @@ const metaLine = computed(() => META.value.filter(([k]) => k !== '风险' && k !
 const riskClass = computed(() => (props.p.risk === 'high' ? 'bad' : props.p.risk === 'medium' ? 'warn' : ''))
 
 const probeOptions = computed(() => exposedModels.value.map(m => m.id))
-const probeModel = ref(props.p.probeModel || '')
+// 用 computed + 本地草稿，而不是 ref(props.p.probeModel)：
+// 后者只在组件挂载时拷贝一次。父组件 refreshTarget 会用 splice 换成**新对象**
+// （Providers.vue openModels → refreshTarget），props 更新了但这个 ref 仍是旧值，
+// 下拉里显示的是过期模型。这里让显示值始终跟随 props，用户输入时走本地草稿。
+const probeDraft = ref(null)
+const probeModel = computed({
+  get: () => (probeDraft.value ?? props.p.probeModel ?? ''),
+  set: (v) => { probeDraft.value = v },
+})
 
 async function saveProbeModel() {
+  const v = (probeModel.value || '').trim()
   try {
-    await api.updateProvider(props.p.providerId, { probeModel: probeModel.value.trim() })
-    props.p.probeModel = probeModel.value.trim()
+    await api.updateProvider(props.p.providerId, { probeModel: v })
+    // 不要 mutate props（`props.p.probeModel = ...`）：那是在写父组件传下来的对象，
+    // 靠副作用"碰巧生效"。父侧一旦换成新对象（refreshTarget / 重新拉列表）写入就丢，
+    // 下拉会回弹成旧值。改为让父组件重新拉一次，由数据流驱动。
+    probeDraft.value = null // 清草稿，回到以服务端数据为准
+    emit('reload')
     emit('test', props.p)
   } catch (e) { ElMessage.error(e.message) }
 }
@@ -460,7 +473,6 @@ async function toggle() {
 .id { color: var(--dim); }
 /* 内部 id：改名不变的身份，展示在名字旁边（用户要能对上归因表里的 #N） */
 .pid { color: var(--dim); opacity: .7; margin-left: 5px; font-size: 11px; }
-.src { color: var(--accent); }
 .url, .proto { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 34ch; }
 /* 1px 竖线代替「·」连接元信息（中点是生成式默认） */
 .sep { display: inline-block; width: 1px; height: 9px; background: var(--line); margin: 0 9px; }

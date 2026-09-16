@@ -470,9 +470,12 @@ function toggleCheck(k) {
   else s.add(k)
   checkedKeys.value = s
 }
-// 行 key：组行不可勾选（避免组套组）；明细展开行也不进勾选
+// 行 key：组行不可勾选（避免组套组）；明细展开行也不进勾选。
+// 用 mergeGroups.rowKey 而不是手写 providerName+'/'+modelId：手动合并组的
+// applyGroups/applyGroupsReport 内部用的就是 rowKey，两边必须同一套口径，
+// 否则"勾中的行"和"被合并的行"会对不上号。
 function checkKeyOf(m) {
-  return m._groupId ? null : (m.providerName + '/' + m.modelId)
+  return m._groupId ? null : rowKey(m)
 }
 const canMerge = computed(() => checkedKeys.value.size >= 2)
 function doMerge() {
@@ -921,8 +924,9 @@ function ttftText(m) {
   background: color-mix(in srgb, var(--ok) 12%, var(--panel-2));
 }
 
-/* 无数据维度（上游不提供该字段）不产出 0：显示 —，悬停给原因 */
-.na { cursor: help; border-bottom: 1px dotted var(--line); }
+/* 注：无数据维度（上游不提供该字段）不产出 0，显示 —，悬停给原因。
+   历史上这里有个 .na 类承担"悬停给原因"的样式，但模板从没引用过它，
+   已删；现在 — 单元格靠 title 提供原因，不再假装有可悬停样式。 */
 
 /* ---- 热力图 ----
    对齐契约（改一个要同步改其余）：

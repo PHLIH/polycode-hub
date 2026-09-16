@@ -436,8 +436,10 @@ export class Manager {
   }
 
   // runSweeper 周期巡检，返回取消函数（对齐 Go RunSweeper(ctx, interval)）。
+  // cli.ts 用它启动巡检并在退出时取消；定时器已 unref，不会拖住进程退出。
   runSweeper(intervalMs: number): () => void {
     const t = setInterval(() => { void this.sweep() }, intervalMs)
+    t.unref?.()
     return () => { clearInterval(t) }
   }
 

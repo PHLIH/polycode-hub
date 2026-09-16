@@ -8,7 +8,9 @@ import { dirname, join } from 'node:path'
 import type { Provider } from '../model/index.ts'
 import type { Finding } from '../adminapi/types.ts'
 
-export type Status = 'ready' | 'expired' | 'missing' | 'unknown' | 'unreachable'
+// 状态枚举的唯一定义是 adminapi/types.ts 的 DiscoverStatus（Finding.status 用的就是它）。
+// 这里曾另有一份等价的 `export type Status`——与下面 Finding 的教训同源：
+// 类型留两处迟早漂移，已删除；需要时请从 adminapi/types.ts 引入。
 
 // Finding 的唯一定义在 adminapi/types.ts（发现层要产出、管理面要消费、前端要渲染）。
 // 这里曾各自定义一份，结果 adoptedProviderId 一边是 string 一边是 number 悄悄漂移，
@@ -27,7 +29,10 @@ export interface DiscoveredAccount {
 
 export type FetchLike = typeof fetch
 
-export interface Checked {
+// 检查结果：finding + 是否有可用登录态。
+// 仅供本模块内部与测试使用——不从包边界导出，导出会让人误以为它是公共契约
+// （实际调用方都按结构解构，从没标注过这个类型）。
+interface Checked {
   finding: Finding
   ok: boolean // false = 无可用登录态
 }

@@ -10,8 +10,10 @@ import { execFileSync } from 'node:child_process'
 import {
   Sidecar,
   assetName,
+  checkDownloadURL,
   killSidecarSpec,
   latestRelease,
+  sha256Hex,
   validatePort,
 } from '../src/sidecar/sidecar.ts'
 import { parseScutilProxy } from '../src/sidecar/httpproxy.ts'
@@ -145,11 +147,14 @@ describe('parseScutilProxy scutil 输出解析', () => {
 // —— Install 下载（注入 fetch 替身，不打真实网络）
 
 describe('Install 下载安装', () => {
+  // 域名必须是真实的 GitHub 下载 host：install 会校验「https + host 白名单」，
+  // 用 example.invalid 这类占位域名会被正当拒绝。这里注入的是 fetch 替身，
+  // 不会真的发网络请求，用真实域名不引入任何外部依赖。
   const releaseBody = {
     tag_name: 'v9.9.9',
     assets: [
-      { name: 'zcode-proxy-darwin-arm64', browser_download_url: 'https://example.invalid/bin', size: 7 },
-      { name: 'zcode-proxy.exe', browser_download_url: 'https://example.invalid/bin.exe', size: 7 },
+      { name: 'zcode-proxy-darwin-arm64', browser_download_url: 'https://objects.githubusercontent.com/bin', size: 7 },
+      { name: 'zcode-proxy.exe', browser_download_url: 'https://objects.githubusercontent.com/bin.exe', size: 7 },
     ],
   }
   const bytes = new TextEncoder().encode('FAKEBIN')
@@ -200,7 +205,77 @@ describe('Install 下载安装', () => {
     const info = await latestRelease(jsonFetch(releaseBody))
     expect(info.tagName).toBe('v9.9.9')
     expect(info.assets[0]?.name).toBe('zcode-proxy-darwin-arm64')
-    expect(info.assets[0]?.url).toBe('https://example.invalid/bin')
+    expect(info.assets[0]?.url).toBe('https://objects.githubusercontent.com/bin')
+  })
+
+  // 回归锚点（安全）：下下来的二进制会被 chmod 0700 并 spawn 执行 =
+  // 以网关自身权限运行任意代码。所以「从哪下」必须收死：
+  // 非 https / 非白名单 host 一律拒绝，不许落地。
+  test('下载来源校验：拒绝非 https 与非白名单 host', () => {
+    // 正常来源放行
+    expect(checkDownloadURL('https://github.com/a/b/releases/download/v1/x')).toBe('')
+    expect(checkDownloadURL('https://objects.githubusercontent.com/x')).toBe('')
+    // 明文 http 拒绝（可被 MITM 替换）
+    expect(checkDownloadURL('http://github.com/x')).toMatch(/https/)
+    // 白名单外 host 拒绝（含伪装成 github 子域的情况）
+    expect(checkDownloadURL('https://evil.example.com/x')).toMatch(/白名单/)
+    expect(checkDownloadURL('https://github.com.evil.com/x')).toMatch(/白名单/)
+    expect(checkDownloadURL('https://raw.githubusercontent.com/x')).toMatch(/白名单/)
+    // 非 URL / 空串
+    expect(checkDownloadURL('not-a-url')).toMatch(/合法 URL/)
+    expect(checkDownloadURL('')).toMatch(/为空/)
+  })
+
+  test('install 拒绝被篡改的下载地址，且不落地文件', async () => {
+    const dir = makeTemp('polycode-surl-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const evil = {
+        tag_name: 'v1',
+        assets: [{ name: 'zcode-proxy-darwin-arm64', browser_download_url: 'https://evil.example.com/bin', size: 7 }],
+      }
+      const f = async (url: string | URL | Request): Promise<Response> =>
+        String(url).includes('api.github.com')
+          ? new Response(JSON.stringify(evil), { status: 200 })
+          : new Response(bytes, { status: 200 })
+      await expect(s.install(false, { fetch: f, goos: 'darwin', arch: 'arm64' }))
+        .rejects.toThrow(/拒绝下载/)
+      // 关键：拒绝后不许留下任何可执行文件
+      expect(existsSync(join(dir, 'bin', 'zcode-proxy'))).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('install 支持 sha256 校验：匹配放行、不匹配拒绝', async () => {
+    const dir = makeTemp('polycode-ssha-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const f = async (url: string | URL | Request): Promise<Response> =>
+        String(url).includes('api.github.com')
+          ? new Response(JSON.stringify(releaseBody), { status: 200 })
+          : new Response(bytes, { status: 200 })
+      const good = sha256Hex(bytes)
+
+      // 摘要正确 → 正常安装
+      const dest = await s.install(true, { fetch: f, goos: 'darwin', arch: 'arm64', expectedSha256: good })
+      expect(readFileSync(dest, 'utf8')).toBe('FAKEBIN')
+      // 大写摘要也应接受（大小写不敏感）
+      await expect(s.install(true, { fetch: f, goos: 'darwin', arch: 'arm64', expectedSha256: good.toUpperCase() }))
+        .resolves.toBe(dest)
+
+      // 摘要不符 → 拒绝，且不覆盖已安装的文件
+      const bad = 'deadbeef'.repeat(8)
+      await expect(s.install(true, { fetch: f, goos: 'darwin', arch: 'arm64', expectedSha256: bad }))
+        .rejects.toThrow(/摘要不匹配/)
+      expect(readFileSync(dest, 'utf8')).toBe('FAKEBIN') // 旧文件未被破坏
+
+      // allowUntrusted:false 且未给摘要 → 硬拒绝
+      await expect(s.install(true, { fetch: f, goos: 'darwin', arch: 'arm64', allowUntrusted: false }))
+        .rejects.toThrow(/未提供 expectedSha256/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
 
