@@ -1,10 +1,48 @@
+// serviceSignatures 从服务定义里提取「命令行特征串」，用于认出外部拉起的同一服务。
+//
+// 取启动命令里够具体的片段（脚本路径 / 入口文件），而不是整个命令：
+// 实际命令行往往被包了一层（`node --require .../preflight.cjs ... server/src/cli.ts serve`），
+// 整串比不可能相等。太短的串（如 `npm`）会撞名，所以少于 4 字符的片段丢弃。
+// sameDir 判两个目录是否同一个，先各自 realpath 消掉符号链接差异。
+// realpath 失败（路径不存在等）退回字面量比较。
+function sameDir(a: string, b: string): boolean {
+  const ra = realpathOr(a)
+  const rb = realpathOr(b)
+  return ra === rb
+}
+
+function realpathOr(p: string): string {
+  try {
+    return realpathSync(p)
+  } catch {
+    return p
+  }
+}
+
+export function serviceSignatures(s: Service): string[] {
+  const out = new Set<string>()
+  const cmd = (s.cmd ?? '').trim()
+  if (cmd !== '') {
+    for (const part of cmd.split(/\s+/)) {
+      // 只收像「文件路径/脚本名」的片段（含 / 或 . 的），跳过 run/start/-p 这类参数
+      if (part.length >= 4 && /[./]/.test(part) && !part.startsWith('-')) out.add(part)
+    }
+  }
+  // 服务名本身也收：`npm start` 这类命令没有可辨识路径，只能靠名称兜底
+  if (s.name.length >= 4) out.add(s.name)
+  return [...out]
+}
+
 // Manager 编排服务启停与巡检。移植自 Go internal/projects/manager.go。
 // store 里的定义由外部（API 层）增删改。
 
-import { statSync } from 'node:fs'
+import { realpathSync, statSync } from 'node:fs'
 
 import { Store, type Project, type Service, type ServiceState } from './store.ts'
-import { killTree, openLog, pidAlive, portBusy, freePort, portOwner, startDetached } from './process.ts'
+import {
+  killTree, openLog, pidAlive, portBusy, freePort, portOwner, portPids, processCmdline,
+  processCwd, startDetached,
+} from './process.ts'
 
 // ConflictError 表示启动因端口被占而中止。remappable=true 时前端应征询
 // 用户是否映射到 suggested 端口（仅 portEnv 已声明的服务）。
@@ -42,6 +80,10 @@ export type ServiceView = Service & {
   // 但我们没有 pid，停止/重启不了。UI 要说清楚，否则用户看到「未启动」
   // 会以为服务挂了。
   portBusyByOther?: boolean
+  // 端口占用者被认出「就是本服务的进程，只是由外部命令（如 update.sh / 手动 npm start）
+  // 拉起的」——此时服务确实在跑，且我们可以接管它（拿到 pid 就能停/重启）。
+  // 与 portBusyByOther 互斥：认出来就不再是"别人的"。
+  adopted?: boolean
 }
 
 // ProjectView = 项目定义 + 各服务实时状态（UI 一张卡片）。
@@ -77,6 +119,48 @@ export class Manager {
 
   private key(projectID: string, service: string): string {
     return `${projectID}/${service}`
+  }
+
+  // claimPortOwner 判断「占着端口的那个进程是不是本服务」。
+  //
+  // 为什么需要它：服务可能不是本管理器拉起的——update.sh 与手动 `npm start` 都用
+  // nohup 直接起进程，不写 state。于是管理台既停不掉它（没有 pid），也起不来
+  // （端口被占），而占着端口的恰恰是它自己：用户看到「端口被自己占用不能停」。
+  //
+  // 判据按可靠性排序，任一成立即认领（宁可不认也不误认——误认会让用户停掉无关进程）：
+  //   1. 端口上恰好只有一个监听进程（多个 = 情况不明，交回给用户判断）
+  //   2. 【主判据】进程 cwd == 服务配置的 dir。这是最可靠的一条：
+  //      服务在哪跑是确定的，而命令行会被 npm/tsx/shell 层层包装改形
+  //      （`npm start` 实际起的是 `node bin/polycode-hub.mjs serve`，命令行毫无共同片段）。
+  //   3. 【兜底】命令行里出现服务特征串（无 dir 可依时用）。
+  //
+  // 返回认领到的 pid；认不出返回 0。
+  private async claimPortOwner(s: Service, port: number): Promise<number> {
+    if (port <= 0) return 0
+    const pids = await portPids(port)
+    if (pids.length !== 1) return 0 // 多个监听者：不猜
+    const pid = pids[0]!
+    // 注意：pid 完全可能是「管理器自己」——polycode-hub 的管理台就跑在网关进程里，
+    // 而那个网关正是它自己项目列表里的一项。这不是异常，恰恰是最需要认出的场景：
+    // 用户从 Projects 页看到"端口被占用、停不掉"，占端口的其实是当前这个进程。
+    // 认领它（就能显示"运行中·外部启动"），但**停止要单独拦**（见 stopService），
+    // 否则点一下「停止」会把正在服务这个请求的进程杀掉。
+
+    const wantDir = (s.dir ?? '').trim()
+    if (wantDir !== '' && wantDir !== '-') {
+      const cwd = await processCwd(pid)
+      // 两边都归一化再比：macOS 的 /tmp、/var 是符号链接，lsof 返回解析后的真实路径
+      // （/private/tmp/...），直接用配置里的字面量比会永远不相等。
+      if (cwd !== '') return sameDir(cwd, wantDir) ? pid : 0 // 有 dir 就按 dir 判
+    }
+
+    // 没有可用 dir：退回命令行特征串（保守，要求命中且是解释器起的）
+    const cmd = await processCmdline(pid)
+    if (cmd === '') return 0
+    const needles = serviceSignatures(s)
+    if (needles.length === 0) return 0
+    if (!/\b(node|npm|npx|tsx|bun|deno|python|python3|uvicorn|go)\b/.test(cmd)) return 0
+    return needles.some((n) => cmd.includes(n)) ? pid : 0
   }
 
   private saveState(): void {
@@ -135,10 +219,24 @@ export class Manager {
     const v: ServiceView = { ...s, running: false, starting: false }
     const st = this.state.get(this.key(projectID, s.name))
     if (!st) {
-      // 没有 pid 记录 = 不是我们启动的。但端口可能被别人占着（用户手起的），
-      // 此时「未启动」是误导——探一下端口，如实标注。
-      // 只在这种情况探：有 pid 时状态已明确，不必为每个服务都跑一次 lsof。
-      v.portBusyByOther = s.port > 0 ? await portBusy(s.port) : false
+      // 没有 pid 记录 = 不是本管理器启动的。两种可能，必须分开报：
+      //   a) 占端口的就是本服务（update.sh / 手动 npm start 拉的）→ 认领它，
+      //      这样服务显示"在跑"且能停能重启。否则用户会看到"未启动"却停不掉
+      //      ——因为启动时报"端口被自己占用"，陷入死结。
+      //   b) 真的是别的进程 → 如实标 portBusyByOther，让用户判断。
+      // 只在无 pid 记录时探（有记录时状态已明确，不必为每个服务跑 lsof）。
+      if (s.port > 0) {
+        const claimed = await this.claimPortOwner(s, s.port)
+        if (claimed > 0) {
+          v.adopted = true
+          v.running = true
+          v.pid = claimed
+          return v
+        }
+        v.portBusyByOther = await portBusy(s.port)
+      } else {
+        v.portBusyByOther = false // 没有端口可探：明确"不适用"，与"探过且没人占"区分开
+      }
       return v
     }
     v.pid = st.pid
@@ -185,6 +283,12 @@ export class Manager {
     let port = s.port
     if (portOverride > 0) port = portOverride
     if (port > 0 && (await portBusy(port))) {
+      // 端口占着，但如果是本服务自己的进程（外部命令拉起的），这不是冲突而是
+      // "已经在跑"——报冲突会让用户以为要改端口，其实只需要接管/停止即可。
+      const claimed = await this.claimPortOwner(s, port)
+      if (claimed > 0) {
+        throw new Error('projects: 服务已在运行（由外部命令启动，可直接停止或重启）')
+      }
       return new ConflictError(
         port,
         await portOwner(port),
@@ -222,9 +326,27 @@ export class Manager {
   async stopService(projectID: string, service: string): Promise<void> {
     const key = this.key(projectID, service)
     const st = this.state.get(key)
-    if (!st || st.pid <= 0) return
+    let pid = st && st.pid > 0 ? st.pid : 0
+    if (pid === 0) {
+      // 没有 state = 不是本管理器起的。但占端口的可能就是本服务（外部命令拉的），
+      // 认出它才能停——否则这里静默 return，用户看到的是"点了停止没反应"，
+      // 而启动又报"端口被自己占用"，彻底卡死。
+      const found = this.find(projectID, service)
+      if (!found) return
+      pid = await this.claimPortOwner(found.svc, found.svc.port)
+      if (pid === 0) return
+    }
+    // 拦「停止自己」：管理台就跑在网关进程里，而网关正是项目列表里的一项。
+    // 杀掉自己会让这个请求拿不到响应（用户看到的是请求挂死，不是"已停止"），
+    // 而且网关没有守护进程，不会再起来——一次误点等于永久宕机。
+    // 想停它请用 ./update.sh（先起新的再切）或在终端操作。
+    if (pid === process.pid) {
+      throw new Error(
+        'projects: 不能从这里停止正在提供管理台的进程本身（会立刻失联且不会自动重启）。'
+        + '请用 ./update.sh 重启，或在终端里操作。')
+    }
     try {
-      await killTree(st.pid)
+      await killTree(pid)
     } catch (e) {
       throw new Error(`projects: 停止失败: ${(e as Error).message}`)
     }

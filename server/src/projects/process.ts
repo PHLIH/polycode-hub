@@ -206,6 +206,33 @@ export async function portPids(port: number): Promise<number[]> {
   return pids
 }
 
+// processCmdline 读某个进程的完整命令行（用于判断"这个端口占用者是不是我们自己"）。
+// 拿不到（权限/进程已退出/平台不支持）返回空串——调用方按"不认识"处理，绝不猜。
+export async function processCmdline(pid: number): Promise<string> {
+  if (pid <= 0) return ''
+  if (process.platform === 'win32') {
+    // wmic 在新版 Windows 已移除，用 PowerShell 的 CIM 查询代替。
+    const out = await execFileText('powershell', [
+      '-NoProfile', '-Command',
+      `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CommandLine`,
+    ])
+    return out.trim()
+  }
+  const out = await execFileText('ps', ['-o', 'command=', '-p', String(pid)])
+  return out.trim()
+}
+
+// processCwd 读进程的工作目录（认领判据的关键输入：服务配了 dir，进程就在那里跑）。
+// 拿不到返回空串。macOS/Linux 用 lsof；Windows 无对应能力，返回空。
+export async function processCwd(pid: number): Promise<string> {
+  if (pid <= 0 || process.platform === 'win32') return ''
+  const out = await execFileText('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'])
+  for (const line of out.split('\n')) {
+    if (line.startsWith('n/')) return line.slice(1).trim()
+  }
+  return ''
+}
+
 export interface PortKillResult {
   killed: number[] // 实际停掉的 pid
   owner: string // 占用者描述（portOwner 口径，供前端提示）

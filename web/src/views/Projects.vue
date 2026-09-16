@@ -14,6 +14,12 @@ let timer = null
 // 状态语义（与网关的「终端信号面板」令牌对齐）：绿=运行，琥珀=启动中/端口未就绪，灰=停止，红=异常退出。
 // 停止是常态不是事件：常态只留 dot，show=false；只有异常态（退出码/已自动关闭）才出文字，用 warn/bad。
 function statusOf(s) {
+  // adopted：端口占用者被认出是本服务的进程（update.sh / 手动 npm start 拉的，
+  // 没写进程记录）。它确实在跑、也能停能重启，但要说清"不是这里起的"——
+  // 否则用户重启网关后发现「我明明没点过启动」，反而更糊涂。
+  if (s.running && s.adopted) {
+    return { cls: 'ok', text: '运行中 · 外部启动', show: true }
+  }
   if (s.running) return { cls: 'ok', text: '运行中', show: true }
   if (s.starting) return { cls: 'warn', text: '启动中', show: true }
   if (s.autoStopped) return { cls: 'warn', text: '已自动关闭', show: true }

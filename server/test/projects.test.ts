@@ -35,6 +35,27 @@ async function listenRandom(): Promise<{ server: ReturnType<typeof createServer>
   return { server, port }
 }
 
+// freePortForTest 拿一个当前空闲的端口号（不保留，只取号）。
+async function freePortForTest(): Promise<number> {
+  const { server, port } = await listenRandom()
+  await new Promise<void>((r) => { server.close(() => r()) })
+  return port
+}
+
+// waitPort 等到端口真的可连（最多 3s）
+async function waitPort(port: number): Promise<void> {
+  const { connect } = await import('node:net')
+  for (let i = 0; i < 60; i++) {
+    const ok = await new Promise<boolean>((resolve) => {
+      const s = connect(port, '127.0.0.1')
+      s.on('connect', () => { s.destroy(); resolve(true) })
+      s.on('error', () => resolve(false))
+    })
+    if (ok) return
+    await new Promise((r) => setTimeout(r, 50))
+  }
+}
+
 // 造一个确定已死的 pid
 async function deadPid(): Promise<number> {
   const c = spawn('true')
@@ -534,6 +555,105 @@ describe('外部占用端口：状态如实反映，不是一句「未启动」'
     const v = await m.view(id, 'nop')
     expect(v?.portBusyByOther).toBe(false)
   })
+
+  // 回归：update.sh / 手动 npm start 用 nohup 起的服务不写 state，于是管理台既停不掉
+  // 它（没有 pid）也起不来（端口被占），而占端口的恰恰是它自己——用户看到
+  // 「端口被自己占用不能停」。现在按「进程 cwd == 服务 dir」认领，恢复可管理。
+  test('外部命令拉起的服务：按 cwd 认领为 running，且能停掉', async () => {
+    const dir = makeTemp('polycode-claim-')
+    const port = await freePortForTest()
+    // 用子进程起一个"服务"：cwd 就是配置里的 dir（这是认领的判据）
+    const child = spawn(process.execPath, [
+      '-e', `require('http').createServer((_,r)=>r.end('ok')).listen(${port})`,
+    ], { cwd: dir, detached: true, stdio: 'ignore' })
+    child.unref()
+    await waitPort(port)
+
+    try {
+      const m = newTestManager()
+      const id = addProject(m, { name: 'adopted', dir, cmd: 'npm start', port })
+      const v = await m.view(id, 'adopted')
+      // 认出是"自己人"：running + adopted，而不是含糊的 portBusyByOther
+      expect(v?.running).toBe(true)
+      expect(v?.adopted).toBe(true)
+      expect(v?.pid).toBe(child.pid)
+      expect(v?.portBusyByOther).toBeUndefined()
+
+      // 关键：能停掉（这正是用户卡住的地方）
+      await m.stopService(id, 'adopted')
+      await new Promise((r) => setTimeout(r, 300))
+      let alive = true
+      try { process.kill(child.pid!, 0) } catch { alive = false }
+      expect(alive).toBe(false)
+      const after = await m.view(id, 'adopted')
+      expect(after?.running).toBe(false)
+    } finally {
+      try { process.kill(child.pid!, 'SIGKILL') } catch { /* 已死 */ }
+    }
+  }, 15_000)
+
+  // 回归：管理台自己就跑在网关进程里，而网关正是项目列表里的一项。
+  // 认领它（用户才能看到"运行中"而不是莫名其妙的"端口被占用"），
+  // 但绝不能允许从这里停掉它——杀自己会让请求挂死，且网关无守护进程、不会自动重启。
+  test('认领「自己」但不允许停止自己（防自杀）', async () => {
+    const dir = makeTemp('polycode-self-')
+    // 用一个真实子进程占端口，但把「管理器自己」替换成它来验证拦截分支：
+    // 直接构造 process.pid 命中的场景不可行（测试进程不监听该端口），
+    // 改为验证 stopService 里的守卫逻辑本身——用假 pid 模拟。
+    const port = await freePortForTest()
+    const child = spawn(process.execPath, [
+      '-e', `require('http').createServer((_,r)=>r.end('ok')).listen(${port})`,
+    ], { cwd: dir, detached: true, stdio: 'ignore' })
+    child.unref()
+    await waitPort(port)
+    try {
+      const m = newTestManager()
+      const id = addProject(m, { name: 'svc', dir, cmd: 'npm start', port })
+      // 正常认领（停止链路由上面「外部命令拉起的服务」用例覆盖，
+      // 这里不重复 killTree——在 vitest worker 里杀进程组可能连带打死 worker）
+      const v = await m.view(id, 'svc')
+      expect(v?.adopted).toBe(true)
+      expect(v?.pid).toBe(child.pid)
+    } finally {
+      try { process.kill(child.pid!, 'SIGKILL') } catch { /* 已死 */ }
+    }
+  }, 15_000)
+
+  test('stopService 拦下「停止自己」并给出可执行指引', async () => {
+    const dir = makeTemp('polycode-self2-')
+    const port = await freePortForTest()
+    // 用一次性 Manager（不进 managers 数组）：这个用例故意造一条 pid = 本进程 的状态，
+    // 而 afterAll 会 killTree 所有 state 里的活 pid —— 混进去会把测试 worker 自己杀掉。
+    const m = new Manager(new Store(makeTemp('polycode-selfmgr-')))
+    const id = addProject(m, { name: 'self', dir, cmd: 'npm start', port })
+    // 等价于"管理台认领了自己"：state 里记着当前进程的 pid
+    m.state.set(`${id}/self`, { pid: process.pid, startedAt: new Date().toISOString() })
+    await expect(m.stopService(id, 'self')).rejects.toThrow(/不能从这里停止/)
+    // 关键：守卫真的拦住了（进程还活着，没有被 killTree）
+    expect(m.state.has(`${id}/self`)).toBe(true)
+  }, 15_000)
+
+  // 反面：dir 不匹配的占用者不该被认领（误认会让用户停掉无关进程）
+  test('端口被无关进程占用：不认领，仍标 portBusyByOther', async () => {
+    const otherDir = makeTemp('polycode-other-')
+    const port = await freePortForTest()
+    const child = spawn(process.execPath, [
+      '-e', `require('http').createServer((_,r)=>r.end('ok')).listen(${port})`,
+    ], { cwd: otherDir, detached: true, stdio: 'ignore' })
+    child.unref()
+    await waitPort(port)
+    try {
+      const m = newTestManager()
+      // 配置的 dir 与进程实际 cwd 不同 → 必须不认
+      const id = addProject(m, { name: 'foreign', dir: makeTemp('polycode-mine-'), cmd: 'npm start', port })
+      const v = await m.view(id, 'foreign')
+      expect(v?.running).toBe(false)
+      expect(v?.adopted).toBeUndefined()
+      expect(v?.portBusyByOther).toBe(true)
+    } finally {
+      try { process.kill(child.pid!, 'SIGKILL') } catch { /* 已死 */ }
+    }
+  }, 15_000)
 })
 
 // —— 定义校验（放宽后：只拦真跑不起来的）——
