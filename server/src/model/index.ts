@@ -8,6 +8,11 @@ export type AccessKind = 'official' | 'session-reuse' | 'simulated-login' | 'rev
 
 const ACCESS_KINDS: AccessKind[] = ['official', 'session-reuse', 'simulated-login', 'reverse']
 
+// 供管理面 PATCH 复用：合法值只在上面这一处定义，避免校验规则两处漂移。
+export function validAccessKind(k: string): k is AccessKind {
+  return (ACCESS_KINDS as string[]).includes(k)
+}
+
 export type Risk = 'low' | 'medium' | 'high'
 
 const RISK_RANK: Record<Risk, number> = { low: 0, medium: 1, high: 2 }

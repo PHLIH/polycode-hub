@@ -413,6 +413,57 @@ describe('accounts CRUD（对齐 Go TestAccountCRUD）', () => {
     })).status).toBe(400)
   })
 
+  // 接入方式与风险等级随认知更新，管理面要能改（UI 把它们收进「高级选项」）。
+  test('PATCH accessKind/risk：合法值写入，非法值 400', async () => {
+    const call = caller(build())
+    await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })
+    const res = await call('PATCH', '/admin/api/providers/p1', {
+      key: 'secret', body: { accessKind: 'reverse', risk: 'medium', riskNote: '第三方反代，可能封号' },
+    })
+    expect(res.status).toBe(200)
+    const got = (await call('GET', '/admin/api/providers', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ providers: Provider[] }>)).providers[0]!
+    expect(got.accessKind).toBe('reverse')
+    expect(got.risk).toBe('medium')
+
+    expect((await call('PATCH', '/admin/api/providers/p1', {
+      key: 'secret', body: { accessKind: 'telepathy' },
+    })).status).toBe(400)
+    expect((await call('PATCH', '/admin/api/providers/p1', {
+      key: 'secret', body: { risk: 'catastrophic' },
+    })).status).toBe(400)
+  })
+
+  // 中/高风险必须带风险说明，否则使用者看不到风险提示（与 providerValidate 同一约束）。
+  test('PATCH risk=high 但无 riskNote：拒绝，且不改动已有风险等级', async () => {
+    const call = caller(build())
+    await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })
+    expect((await call('PATCH', '/admin/api/providers/p1', {
+      key: 'secret', body: { risk: 'high' },
+    })).status).toBe(400)
+    const got = (await call('GET', '/admin/api/providers', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ providers: Provider[] }>)).providers[0]!
+    expect(got.risk).toBe('low')
+  })
+
+  // 跨字段组合绕过：risk 与 riskNote 单看都合法，合起来违反「高风险必须有说明」。
+  // 逐字段 setter 拦不住这种，收尾的 providerValidate 必须兜住。
+  test('PATCH 同时清空 riskNote 并提高风险：拒绝（跨字段约束）', async () => {
+    const call = caller(build())
+    await call('POST', '/admin/api/providers', {
+      key: 'secret',
+      body: { ...providerBody, risk: 'medium', riskNote: '原本有说明' },
+    })
+    const res = await call('PATCH', '/admin/api/providers/p1', {
+      key: 'secret', body: { risk: 'high', riskNote: '' },
+    })
+    expect(res.status).toBe(400)
+    const got = (await call('GET', '/admin/api/providers', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ providers: Provider[] }>)).providers[0]!
+    expect(got.risk).toBe('medium')
+    expect(got.riskNote).toBe('原本有说明')
+  })
+
   test('变更通知：增删改各一次×两类 = 6（对齐 Go TestChangeNotifier）', async () => {
     let n = 0
     const call = caller(build({ notify: () => { n++ } }))
@@ -423,6 +474,41 @@ describe('accounts CRUD（对齐 Go TestAccountCRUD）', () => {
     await call('PATCH', '/admin/api/accounts/a1', { key: 'secret', body: { credential: { apiKeyFile: '/tmp/k' } } })
     await call('DELETE', '/admin/api/accounts/a1', { key: 'secret' })
     expect(n).toBe(6)
+  })
+
+  // 稳定性在管理面可改（UI 把它收进「高级选项」，但收起来也要能存住）。
+  test('PATCH stability：合法值写入，非法值 400', async () => {
+    const call = caller(build())
+    await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })
+    const okRes = await call('PATCH', '/admin/api/providers/p1', {
+      key: 'secret', body: { stability: 'experimental' },
+    })
+    expect(okRes.status).toBe(200)
+    expect((await okRes.json() as { stability: string }).stability).toBe('experimental')
+    // 非法值必须拒绝，且不污染已有值
+    expect((await call('PATCH', '/admin/api/providers/p1', {
+      key: 'secret', body: { stability: 'flaky' },
+    })).status).toBe(400)
+    const got = (await call('GET', '/admin/api/providers', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ providers: Provider[] }>)).providers[0]!
+    expect(got.stability).toBe('experimental')
+  })
+
+  // 前端表单不再暴露 apiKeyFile（用户不关心 Key 存哪个文件），
+  // 但一键导入生成的 Provider 全靠它取 Key：不带 credential 的 PATCH 必须原样保留。
+  test('PATCH 不带 credential：文件型 Key 引用不被清空（前端表单不覆盖）', async () => {
+    const call = caller(build())
+    await call('POST', '/admin/api/providers', {
+      key: 'secret',
+      body: { ...providerBody, credential: { apiKeyFile: 'config/credentials/acme-key' } },
+    })
+    await call('PATCH', '/admin/api/providers/p1', {
+      key: 'secret', body: { displayName: '改名', stability: 'beta', streamOnly: true },
+    })
+    const got = (await call('GET', '/admin/api/providers', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ providers: Provider[] }>)).providers[0]!
+    expect(got.credential.apiKeyFile).toBe('config/credentials/acme-key')
+    expect(got.displayName).toBe('改名')
   })
 })
 

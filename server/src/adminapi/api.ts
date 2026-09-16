@@ -6,7 +6,10 @@
 import { Hono, type Context } from 'hono'
 import { timingSafeEqual } from 'node:crypto'
 import { ERR, validProtocol } from '../ir/index.ts'
-import { providerValidate, accountHealth, type Account, type Model, type Provider } from '../model/index.ts'
+import {
+  providerValidate, accountHealth, validAccessKind, validRisk,
+  type Account, type Model, type Provider,
+} from '../model/index.ts'
 import type { ProbeResult } from '../gateway/probe.ts'
 import { MemoryAccountStore, MemoryProviderStore, type AccountStore, type EgressStore, type ProviderStore } from './store.ts'
 import { isObj, parseAccount, parseCredential, parseProvider } from './parse.ts'
@@ -40,9 +43,10 @@ export interface AdminApiDeps {
 }
 
 // PATCH 白名单（只读字段出现即 400；ID 永久不可改；credential 只收引用）。
+// accessKind/risk/stability 是运维判断，允许改；id/api/baseUrl 是通道身份，改 = 新建 + 删旧。
 const PROVIDER_PATCH_ALLOW = new Set([
-  'enabled', 'priority', 'streamOnly', 'displayName', 'riskNote',
-  'credential', 'models', 'probeModel', 'egress',
+  'enabled', 'priority', 'streamOnly', 'displayName', 'riskNote', 'risk',
+  'credential', 'models', 'probeModel', 'egress', 'stability', 'accessKind',
 ])
 
 const ACCOUNT_PATCH_ALLOW = new Set(['status', 'displayName', 'credential', 'weight'])
@@ -249,6 +253,24 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
         p.riskNote = v
         return true
       },
+      // 稳定性可在管理面改（stable/beta/experimental）：这是运维判断，不是身份字段。
+      stability: (v) => {
+        if (v !== 'stable' && v !== 'beta' && v !== 'experimental') return false
+        p.stability = v
+        return true
+      },
+      // 接入方式与风险等级同理：描述「这是什么通道、有多大风险」，随认知更新。
+      // 「中/高风险必须带 riskNote」的跨字段约束由收尾的 providerValidate 兜底。
+      accessKind: (v) => {
+        if (typeof v !== 'string' || !validAccessKind(v)) return false
+        p.accessKind = v
+        return true
+      },
+      risk: (v) => {
+        if (typeof v !== 'string' || !validRisk(v)) return false
+        p.risk = v
+        return true
+      },
       credential: (v) => {
         if (!isObj(v)) return false
         p.credential = parseCredential(v)
@@ -272,6 +294,15 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
       const set = setters[k]
       if (!set) continue
       if (!set(v)) return errRes(c, 400, ERR.INVALID_REQUEST, `字段 ${k} 类型错误`)
+    }
+    // 逐字段的 setter 只看单值，拦不住跨字段组合：risk 与 riskNote 单看都合法，
+    // 合起来可能违反「中/高风险必须带说明」。只在本次真的碰了 risk/riskNote 时才查，
+    // 避免对「只改 models」的请求做全量校验——库存量数据可能本就不完整（如 baseUrl 为空）。
+    if ('risk' in patch || 'riskNote' in patch) {
+      if ((p.risk === 'medium' || p.risk === 'high') && !(p.riskNote ?? '').trim()) {
+        return errRes(c, 400, ERR.INVALID_REQUEST,
+          `provider ${p.id}: risk=${p.risk} 必须填写 risk_note（UI 必须显示风险说明）`)
+      }
     }
     providers.put(p)
     changed()
