@@ -106,6 +106,17 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     const existing = providers.getByName(p.name)
     if (existing && existing.state !== 'deleted') return ok(c, 200, existing) // 幂等：重复采用直接返回已有的
 
+    // 顺序关键：必须先 providers.put(p) 落库，再导入账号。
+    // providerId 是在 put 里由存储层分配并回填 p.providerId 的（store.ts 内存实现
+    // 与 SQLite 实现都是如此）；放到后面，importSuggestedAccounts 拿到的仍是
+    // 上面赋的 0，账号就带着 providerId=0 落库——而 pool/router 一律用
+    // `a.providerId === providerId` 严格匹配，0 永远命不中，一键导入的账号
+    // 因此根本不参与轮询（正是下面注释想防止的故障的另一种形态）。
+    // 以前这里 put 在最后，实测 adopt 返回 providerId=1 而账号是 0。
+    // quick-import 路径（第 228-241 行）顺序正确，两条路径就此对齐。
+    providers.put(p)
+    changed()
+
     // 采用必须一并把登录态导入账号池，否则 Provider 只挂着一个空的环境变量引用
     // （apiKeyEnv=WB_TOKEN），进程里没这个变量、池子也是空的 → 请求不带 Authorization
     // 打到上游，被前置网关拦成 HTML 401，用户以为「上游鉴权失败」（issue #1）。
@@ -115,8 +126,6 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
       importSuggestedAccounts(key, found.suggestedAccounts, p.providerId)
     warnings.push(...importWarnings)
     if (imported > 0) changed()
-    providers.put(p)
-    changed()
     const res: Record<string, unknown> = { ...p }
     if (warnings.length > 0) res.warnings = warnings
     return ok(c, 201, res)

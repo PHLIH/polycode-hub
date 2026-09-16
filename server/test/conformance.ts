@@ -1,6 +1,6 @@
-// TS 版一致性套件（逐语义移植 Go tests/conformance + tests/fixture）。
+// 一致性套件：三协议 × 入站/出站，逐语义覆盖全部 fixture。
 // 各编解码器测试只调用 inboundSuite / outboundSuite，即自动跑完全部 fixture。
-// fixture 源直接复用仓库根 tests/fixtures/（单一真相，不复制）。
+// fixture 单一真相在 server/test/fixtures/（不复制到别处）。
 
 import { readdirSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'

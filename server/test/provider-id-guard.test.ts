@@ -140,7 +140,9 @@ describe('Provider 视图不得把 Provider 读成 .id（两次真实复发的�
     expect(re.test(src)).toBe(true)
     const reP = new RegExp(`(^|[^\\w$.])p\\.id\\b`)
     expect(reP.test(src)).toBe(true)
-    // 模型/出口的 id 不该被误伤
+    // 上面三条只证明正则对各自形态有效。真正的"不误伤"靠 m/e 不在 PROVIDER_FILES
+    // 的 holders 列表里（见该文件 90 行注释），而不是靠正则放过它们——
+    // 换言之，若哪天把 m 或 e 加进 holders，这些 .id 就会真的被报出来。
     expect(new RegExp(`(^|[^\\w$.])m\\.id\\b`).test(src)).toBe(true)
   })
 

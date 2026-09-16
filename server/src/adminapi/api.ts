@@ -356,7 +356,10 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
       // 模型采用：只增不减。已有 ID 不删（元数据保留），但补协议与能力（上游新声明的以本次为准）。
       const ids = parsePatchModels(patch.models)
       if (!ids) return errRes(c, 400, ERR.INVALID_REQUEST, 'models 须为 ["id"] 或 [{"id"}]')
-      const have = new Set(p.models.map((m) => m.id))
+      // 去重由下面的 p.models.find(...) 承担（它同时负责"补协议与能力"），
+      // 不再另建 have 集合：以前这里建了 Set 并 have.add()，却没有任何 have.has()
+      // 读取点，属于只写不读的遗留物——留着只会诱导后人按"have 里没有才新增"重构，
+      // 而 have 是 p.models 的快照，两者状态并不真正同步。
       for (const input of ids) {
         if (input.id === '') continue
         const existing = p.models.find((m) => m.id === input.id)
@@ -370,7 +373,6 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
           }
           continue
         }
-        have.add(input.id)
         const nm: Model = { id: input.id, enabled: true, manual: false }
         if (input.protocol) nm.api = input.protocol
         if (input.caps) {
@@ -498,7 +500,7 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
   app.delete('/admin/api/providers/:pid', (c) => {
     const raw = c.req.param('pid')
     const p = findProvider(providers, raw)
-    // 回显原始 pid：这是全文件唯一一条不带 id 的 404，排查时少了关键字段。
+    // 回显原始 pid：非法 pid 与不存在的 Provider 一律 404，排查时要能看出调用方传的是什么。
     if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
     p.state = 'deleted'
     providers.put(p)

@@ -81,14 +81,13 @@ describe('errorKind 落库（ACCOUNT-HEALTH 步骤 1–3）', () => {
 
   // v3 → v4：provider_id 由「名字」换成数字内部 id，名字另存 provider_name 快照。
   //
-  // 注意（记录当前 store.ts 的实际行为，不是本测试的期望）：v3 库重建成 v4 形态时，
-  // 旧名字没有落进 provider_name 快照而是漏掉了（重建的 INSERT ... SELECT 里
-  // provider_id 位置写的是字面量 0，provider_name 位置才是读旧 provider_id 的表达式，
-  // 两者错位 → providerId=0 且 providerName=''）。resolveProviderIds 的判据正是
-  // provider_name != ''，于是它扫不到任何行，名字→id 的归因迁移整条失效
-  // （真实 data/usage.db 的 5576 行会全部停在 providerId=0）。
-  // 这是生产代码缺陷，本测试只钉住「迁移后表形态正确、行不丢」的可观察契约，
-  // 不把错误行为固化成期望。
+  // 迁移的实际行为（已核实，此前这段注释描述有误）：v3 库重建成 v4 形态时，
+  // provider_id 先落 0（等 resolveProviderIds 回填），旧名字则完整保留在
+  // provider_name 快照里（store.ts 的 nameExpr 位置正确，没有错位）。
+  // resolveProviderIds 的判据正是 `provider_id = 0 AND provider_name != ''`，
+  // 靠这张名字快照把历史行绑回真实 Provider。
+  // 所以名字快照是这条迁移链的关键契约，下面必须把它钉住：一旦快照丢失，
+  // resolveProviderIds 扫不到任何行，历史归因会全部停在 providerId=0。
   test('迁移 v3 → v4：旧行落 providerId=0（待解析），表重建为 INTEGER + provider_name', async () => {
     const path = join(dir, 'v3.db')
     const raw = new DatabaseSync(path)

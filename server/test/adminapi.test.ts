@@ -315,13 +315,10 @@ describe('providers CRUD（对齐 Go TestProviderCRUD/PatchReadonly/Validation�
     expect((await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })).status).toBe(409)
   })
 
-  // ⚠️ 生产代码 bug（本条用例暴露、尚未修）：`api.ts` 的 PROVIDER_PATCH_ALLOW 白名单
-  // 漏了 'name' 与 'state'，而白名单校验在改名/状态分支之前无条件执行，于是
-  //   PATCH {name}  → 400「字段 name 只读」
-  //   PATCH {state} → 400「字段 state 只读」
-  // 紧随其后的改名分支与 setters.state 成了死代码；前端 Providers.vue 编辑面板的
-  // patch 也没带 name，所以 UI 上「改名」同样是断的。
-  // 这里锚定「当前真实行为」，白名单修好后把下面两条改回 200 即可。
+  // 历史背景：PROVIDER_PATCH_ALLOW 曾漏掉 'name' 与 'state'，导致改名/改状态被
+  // 白名单拦成 400、紧随其后的改名分支与 setters.state 变成死代码，前端改名也是断的。
+  // 现已修复（见 api.ts:54-60 白名单，'name' / 'state' / 'enabled' 均在列），
+  // 下面两条断言 200 就是这条修复的护栏。
   // 核心能力：改名只动 name，providerId 与所有引用（账号归属、用量归因）都不动。
   // 这条断言是「改名不再需要删了重建」的护栏——删了重建会换 providerId 并让旧客户端失效。
   test('PATCH 改 name / state：改名后 providerId 与账号归属不变', async () => {
@@ -1322,6 +1319,38 @@ describe('discover 端点（DiscoverSource 打桩，对齐 Go discover_test.go�
     const credPath = join(process.cwd(), credFile)
     expect(readFileSync(credPath, 'utf8')).toBe(alive.token)
     expect(statSync(credPath).mode & 0o777).toBe(0o600)
+  })
+
+  // 回归锚点：adopt 里 providers.put(p) 必须在 importSuggestedAccounts 之前。
+  // providerId 是在 put 里由存储层分配并回填 p.providerId 的；以前 put 放在最后，
+  // 导入账号时拿到的还是 0 → 账号带着 providerId=0 落库。而 pool/router 一律用
+  // `a.providerId === providerId` 严格相等匹配（pool/account.ts、proxy.ts、probe.ts），
+  // 0 永远命不中，一键导入的账号因此根本不参与轮询——表面上"导入成功"，实际是死账号。
+  test('adopt 导入的账号归属到真实 providerId（不能是 0）', async () => {
+    isolateCwd()
+    const alive = makeAuthFile('主号')
+    const findings: Finding[] = [{
+      key: 'workbuddy', harness: 'WB', status: 'ready', detail: '',
+      suggestedProvider: { ...readyProvider('wb-auto'), credential: { apiKeyEnv: 'WB_TOKEN' } },
+      suggestedAccounts: [{ nickname: '主号', uid: 'u1', alive: true, tokenPath: alive.tokenPath }],
+    }]
+    const call = caller(build({ discover: new StubDiscover(findings) }))
+    const res = await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy' } })
+    expect(res.status).toBe(201)
+    const adopted = (await res.json()) as Provider
+    expect(adopted.providerId).toBeGreaterThan(0)
+
+    const accts = await call('GET', '/admin/api/accounts', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ accounts: Account[] }>)
+    expect(accts.accounts).toHaveLength(1)
+    // 核心断言：账号归属必须等于采用出来的 Provider，而不是 0
+    expect(accts.accounts[0]!.providerId).toBe(adopted.providerId)
+    expect(accts.accounts[0]!.providerId).toBeGreaterThan(0)
+
+    // 且这个 id 必须真能命中 Provider（0 命不中任何一行）
+    const ps = await call('GET', '/admin/api/providers', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ providers: Provider[] }>)
+    expect(ps.providers.some((p) => p.providerId === accts.accounts[0]!.providerId)).toBe(true)
   })
 
   test('adopt 幂等：重复采用不再重复建账号', async () => {

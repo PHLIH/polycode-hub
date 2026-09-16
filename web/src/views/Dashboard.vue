@@ -10,8 +10,9 @@ import { applyGroups, applyGroupsReport, rowKey } from '../mergeGroups'
 //   ② 按 provider/model 归因（额度到底花在哪）
 //   ③ 区间合计与缓存命中率
 // 两套独立时间语境（TIME-RANGE-FILTER §3.4 方案 B 分离，用户拍板）：
-//   热力图 = 长周期铺满趋势（365 天铺满，独立档位下拉，胶囊管不到它）；
-//   归因区 = stat card + 归因表跟胶囊（今天/7/30/自定义短区间）。
+//   热力图 = 长周期铺满趋势（365 天铺满，独立请求，胶囊管不到它）；
+//   归因区 = 前三张 stat card + 归因表跟胶囊（今天/7/30/自定义短区间）。
+//   例外：第四张「活跃天数」跟热力图（全周期），卡片上有「近一年」徽标注明。
 const heatBd = ref(null)   // 热力图数据（days 长区间，只用 daily）
 const attrBd = ref(null)   // 归因区数据（胶囊区间：totals + byModel）
 const providers = ref([])
@@ -28,7 +29,7 @@ const rangeLabel = computed(() =>
 // range → API 参数（自然日口径：今天 = 今日 00:00 起；近 N 天 = 含今日的 N 个本地日历日）。
 // 之前预设档发的是 {days} 滚动窗口（近 24h / 7×24h）：库里只有两天数据时切哪个档结果
 // 都一样，看起来就像「筛选根本没用」。改走 since/until 日历日后，后端按本地日分组
-// 过滤，与热力图/活跃天数的口径一致。热力图仍是独立的 365 天请求，不走这里。
+// 过滤（localtime），与热力图的口径一致。热力图是独立的 365 天请求，不走这里。
 const RANGE_DAYS = { today: 1, '7d': 7, '30d': 30 }
 const rangeQuery = computed(() => {
   if (range.value.mode === 'custom') return { since: range.value.since, until: range.value.until }
@@ -266,14 +267,18 @@ const MONTH_LABELS = computed(() => {
   })
 })
 
-// 活跃天数/峰值跟胶囊窗口（attrBd.daily），不是热力图那 365 天——
-// 四张卡是一个语义整体：都回答「当前选的这段时间里」怎么样。
+// 活跃天数/峰值跟热力图的 365 天全周期（heatBd），【不】跟胶囊。
+// 曾跟胶囊：默认「今天」时区间只有一天，卡片恒为 1（有量）/ 0（没量），
+// 用户看到的永远是「1 天」，以为坏了（真缺陷）。它要回答的是「这网关用了多久、
+// 哪天最猛」，是生命周期指标，不是区间指标——跟胶囊没有意义。
+// 代价：四张卡不再同源（前三张跟胶囊）。卡片标签上标了「近一年」明示，
+// 免得下次又被当成口径 bug。
 const activeDays = computed(() => {
-  const daily = (attrBd.value && attrBd.value.daily) || []
+  const daily = (heatBd.value && heatBd.value.daily) || []
   return daily.filter(d => d.totalTokens > 0 || d.requests > 0).length
 })
 const busiest = computed(() => {
-  const daily = (attrBd.value && attrBd.value.daily) || []
+  const daily = (heatBd.value && heatBd.value.daily) || []
   if (!daily.length) return null
   return daily.reduce((a, b) => (b.totalTokens > a.totalTokens ? b : a))
 })
@@ -614,7 +619,7 @@ function ttftText(m) {
       </div>
     </div>
     <div class="card">
-      <div class="card-label">活跃天数</div>
+      <div class="card-label">活跃天数 <span class="card-scope">近一年</span></div>
       <div class="card-value num">{{ activeDays }}</div>
       <div class="card-foot dim">
         <template v-if="busiest">峰值 {{ busiest.day }}（{{ fmt(busiest.totalTokens) }}）</template>
@@ -874,6 +879,13 @@ function ttftText(m) {
 }
 .card:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
 .card-label { color: var(--dim); font-size: 12px; margin-bottom: 6px; }
+/* 作用域徽标：本卡是全周期口径，不吃胶囊。前三张卡跟胶囊，若不说清，
+   用户（和下个改代码的人）会以为它也是区间值 —— 曾经因此被当成 bug。 */
+.card-scope {
+  margin-left: 5px; font-size: 10px; padding: 1px 5px; border-radius: 4px;
+  color: var(--dim); border: 1px solid var(--line); opacity: .85;
+  font-variant-numeric: tabular-nums;
+}
 .card-value { font-size: 22px; }
 .card-foot { font-size: 11px; margin-top: 6px; }
 
@@ -1069,7 +1081,8 @@ function ttftText(m) {
 
 /* ---- 时间胶囊（TIME-RANGE-FILTER §3.3）：轻量 popover，非全屏弹窗 ----
    胶囊 = 当前区间指示器（钟表icon + label），弹窗 = 预设三档 + 日期区间选择。
-   归因区所有数字（stat card + 归因表 + 活跃天数/峰值）都跟这个区间，热力图不管。 */
+   归因区数字都跟这个区间（stat card：总 token / 请求数 / 缓存命中率 + 归因表）。
+   例外：「活跃天数」跟热力图走全周期，不吃胶囊（见 activeDays 注释）。 */
 .range-pill-wrap { position: relative; }
 .range-pill {
   display: inline-flex; align-items: center; gap: 6px;

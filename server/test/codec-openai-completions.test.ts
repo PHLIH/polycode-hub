@@ -253,3 +253,56 @@ describe('缓存字段解析（CodeBuddy/hy4 真实载荷）', () => {
     expect(u?.cacheCreationTokens).toBe(77)
   })
 })
+
+// —— 末帧无尾随换行（真实缺陷回归）——
+// 背景：finish() 原先对残余半行调用 this.line(line) 却丢弃返回值
+// （feed() 是 `evs.push(...)`，两者不一致）。上游最后一帧不以 \n 结尾时——
+// openai 的末尾独立 usage chunk 正是这种形态——该帧被整个丢弃：
+// 最后一段正文消失，更糟的是 chunk() 不被调用、this.usage 不会被赋值，
+// message_delta 就不带 usage，计费侧拿到 0。
+// 所有 .sse fixture 恰好都以 0x0a 结尾，所以一致性套件测不出来，只能在这里钉死。
+describe('末帧无尾随换行（收尾不得丢帧）', () => {
+  function parse(sse: string): StreamEvent[] {
+    const sp = newOutbound().newStreamParser()
+    return [...sp.feed(enc(sse)), ...sp.finish()]
+  }
+
+  test('最后一帧不带 \\n：正文与 usage 都必须产出', () => {
+    const evs = parse(
+      'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m",' +
+      '"choices":[{"index":0,"delta":{"content":"最后一个字"},"finish_reason":"stop"}],' +
+      '"usage":{"prompt_tokens":23,"completion_tokens":108}}\n\n' +
+      'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m",' +
+      '"choices":[{"index":0,"delta":{"content":"收尾"},"finish_reason":"stop"}],' +
+      '"usage":{"prompt_tokens":30,"completion_tokens":120}}') // ← 无尾换行
+    const texts = evs.filter((e) => e.type === 'content_block_delta')
+      .map((e) => (e as { delta?: { text?: string } }).delta?.text)
+    expect(texts).toContain('最后一个字')
+    expect(texts).toContain('收尾') // 以前这一帧整个消失
+    const d = evs.find((e) => e.type === 'message_delta')
+    expect(d?.usage?.inputTokens).toBe(30)
+    expect(d?.usage?.outputTokens).toBe(120) // 以前恒为 undefined → 计费 0
+  })
+
+  test('末尾独立 usage chunk 且无尾换行：usage 仍要落进 message_delta', () => {
+    const evs = parse(
+      'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m",' +
+      '"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n' +
+      'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m",' +
+      '"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":9}}') // ← 无尾换行
+    const d = evs.find((e) => e.type === 'message_delta')
+    expect(d?.usage?.inputTokens).toBe(7)
+    expect(d?.usage?.outputTokens).toBe(9)
+    // 收尾序列完整性：message_stop 必须在最后，且 content_block_stop 先于 message_delta
+    expect(evs[evs.length - 1]?.type).toBe('message_stop')
+  })
+
+  test('带尾换行时行为不变（对照）', () => {
+    const withNl = parse(
+      'data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"m",' +
+      '"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}],' +
+      '"usage":{"prompt_tokens":1,"completion_tokens":2}}\n\n')
+    expect(withNl.find((e) => e.type === 'message_delta')?.usage?.outputTokens).toBe(2)
+    expect(withNl.filter((e) => e.type === 'content_block_delta')).toHaveLength(1)
+  })
+})

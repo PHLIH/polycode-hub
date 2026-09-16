@@ -813,13 +813,23 @@ class OutStreamParser implements StreamParser {
   }
 
   // 上游 EOF 时调用：先把残余半行按整行处理，无 [DONE] 则补发收尾事件。
+  //
+  // 残余行的事件必须**收集并排在 close() 之前**：上游最后一帧不带尾随换行时
+  // （openai 很常见——末尾独立的 usage chunk 常常就是没有 \n 结尾），
+  // 丢掉它等于丢掉最后一段正文，更糟的是 chunk() 根本不会被调用、
+  // this.usage 不会被赋值，message_delta 就不带 usage，计费侧拿到 0。
+  // 以前这里只调 `this.line(line)` 不接返回值（与 feed() 的 `evs.push(...)` 不一致），
+  // 内容静默消失；所有 .sse fixture 恰好都以 0x0a 结尾，所以一致性套件测不出来。
+  // 顺序也关键：先残余行、后 close()，否则 message_delta 先发出就把 usage 漏掉了
+  // （另两个编解码器 anthropicmessages/openairesponses 的 finish 同样是这个顺序）。
   finish(): StreamEvent[] {
+    const evs: StreamEvent[] = []
     if (this.buf.length > 0) {
       const line = dec(this.buf).replace(/\r+$/, '')
       this.buf = new Uint8Array(0)
-      this.line(line)
+      evs.push(...this.line(line))
     }
-    return this.close()
+    return evs.concat(this.close())
   }
 
   // 处理一行 SSE，返回产出的事件（可能为空）。

@@ -1,7 +1,7 @@
 // openai-responses 编解码器测试：
-//   1. 一致性套件（fixture 全量，单一真相 = 仓库根 tests/fixtures/openai-responses/）；
-//   2. internal/codec/openairesponses/{inbound,outbound}_test.go 补充单测逐条移植。
-// 运行：cd next && npx vitest run server/test/codec-openai-responses.test.ts
+//   1. 一致性套件（fixture 全量，单一真相 = server/test/fixtures/openai-responses/）；
+//   2. 入站解析 / 请求序列化 / 流式状态机的补充单测。
+// 运行（仓库根）：npx vitest run server/test/codec-openai-responses.test.ts
 import { describe, expect, test } from 'vitest'
 import { inboundSuite, outboundSuite } from './conformance.ts'
 import { getInbound, getOutbound } from '../src/ir/index.ts'
