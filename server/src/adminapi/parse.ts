@@ -35,7 +35,6 @@ function parseModel(v: unknown): Model | undefined {
   if (!isObj(v) || typeof v.id !== 'string' || v.id === '') return undefined
   const m: Model = {
     id: v.id,
-    providerId: str(v.providerId),
     manual: v.manual === true,
     enabled: v.enabled === true,
   }
@@ -53,8 +52,11 @@ function parseModel(v: unknown): Model | undefined {
 export function parseProvider(raw: unknown): Provider {
   const o = isObj(raw) ? raw : {}
   const p: Provider = {
-    id: str(o.id),
-    sourceId: str(o.sourceId),
+    // providerId=0 → 新建（存储层分配）；name 是对外名，可改。
+    providerId: num(o.providerId),
+    name: str(o.name),
+    // 兼容旧客户端的 enabled 布尔：true→active，false→paused。
+    state: (str(o.state) || (o.enabled === false ? 'paused' : 'active')) as Provider['state'],
     displayName: str(o.displayName),
     accessKind: str(o.accessKind) as Provider['accessKind'],
     risk: str(o.risk) as Provider['risk'],
@@ -62,7 +64,6 @@ export function parseProvider(raw: unknown): Provider {
     api: str(o.api), // 空 = 自动探测
     baseUrl: str(o.baseUrl),
     credential: parseCredential(o.credential),
-    enabled: o.enabled === true,
     priority: num(o.priority),
     models: Array.isArray(o.models)
       ? o.models.map(parseModel).filter((m): m is Model => m !== undefined)
@@ -101,7 +102,7 @@ export function parseAccount(raw: unknown): Account {
   const o = isObj(raw) ? raw : {}
   const a: Account = {
     id: str(o.id),
-    sourceId: str(o.sourceId),
+    providerId: num(o.providerId),
     credential: parseCredential(o.credential),
     status: str(o.status) as AccountStatus,
     fails: num(o.fails),

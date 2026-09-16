@@ -6,7 +6,7 @@ import { parse } from 'yaml'
 import {
   providerValidate,
   validRisk,
-  type Account, type Provider, type Source,
+  type Account, type Provider,
 } from '../model/index.ts'
 
 // 上游超时默认值。
@@ -42,7 +42,6 @@ export interface Config {
   gateway: GatewayConfig
   dataDir: string
   egresses: Egress[]
-  sources: Source[]
   providers: Provider[]
   accounts: Account[]
 }
@@ -90,7 +89,6 @@ const DYNAMIC_HEADERS: Record<string, [string, FieldSpec]> = {
 
 const MODEL: Record<string, [string, FieldSpec]> = {
   id: ['id', { kind: 'string' }],
-  provider_id: ['providerId', { kind: 'string' }],
   display_name: ['displayName', { kind: 'string' }],
   context_window: ['contextWindow', { kind: 'number' }],
   max_output_tokens: ['maxOutputTokens', { kind: 'number' }],
@@ -103,13 +101,14 @@ const MODEL: Record<string, [string, FieldSpec]> = {
 }
 
 const PROVIDER: Record<string, [string, FieldSpec]> = {
-  id: ['id', { kind: 'string' }],
-  source_id: ['sourceId', { kind: 'string' }],
+  name: ['name', { kind: 'string' }],
   display_name: ['displayName', { kind: 'string' }],
   access_kind: ['accessKind', { kind: 'string' }],
   risk: ['risk', { kind: 'string' }],
   risk_note: ['riskNote', { kind: 'string' }],
   stability: ['stability', { kind: 'string' }],
+  // 三态：active / paused / deleted。缺省 active（见 applyDefaults）。
+  state: ['state', { kind: 'string' }],
   api: ['api', { kind: 'string' }],
   base_url: ['baseUrl', { kind: 'string' }],
   credential: ['credential', { kind: 'object', spec: CREDENTIAL }],
@@ -130,16 +129,12 @@ const EGRESS: Record<string, [string, FieldSpec]> = {
   addr: ['addr', { kind: 'string' }],
 }
 
-const SOURCE: Record<string, [string, FieldSpec]> = {
-  id: ['id', { kind: 'string' }],
-  display_name: ['displayName', { kind: 'string' }],
-  enabled: ['enabled', { kind: 'boolean' }],
-  priority: ['priority', { kind: 'number' }],
-}
-
 const ACCOUNT: Record<string, [string, FieldSpec]> = {
   id: ['id', { kind: 'string' }],
-  source_id: ['sourceId', { kind: 'string' }],
+  // 账号挂在哪个 Provider 名下。YAML 里写 Provider 名最直观（内部会解析成数字 id）；
+  // 也接受 provider_id 直接给数字。
+  provider: ['providerName', { kind: 'string' }],
+  provider_id: ['providerId', { kind: 'number' }],
   display_name: ['displayName', { kind: 'string' }],
   credential: ['credential', { kind: 'object', spec: CREDENTIAL }],
   status: ['status', { kind: 'string' }],
@@ -164,7 +159,6 @@ const CONFIG: Record<string, [string, FieldSpec]> = {
   }],
   data_dir: ['dataDir', { kind: 'string' }],
   egresses: ['egresses', { kind: 'array', item: { kind: 'object', spec: EGRESS } }],
-  sources: ['sources', { kind: 'array', item: { kind: 'object', spec: SOURCE } }],
   providers: ['providers', { kind: 'array', item: { kind: 'object', spec: PROVIDER } }],
   accounts: ['accounts', { kind: 'array', item: { kind: 'object', spec: ACCOUNT } }],
 }
@@ -221,7 +215,6 @@ function fromRaw(raw: Record<string, unknown>): Config {
     gateway: (c.gateway ?? {}) as GatewayConfig,
     dataDir: c.dataDir ?? '',
     egresses: (c.egresses ?? []) as Config['egresses'],
-    sources: (c.sources ?? []) as Source[],
     providers: (c.providers ?? []) as Provider[],
     accounts: (c.accounts ?? []) as Account[],
   }
@@ -245,7 +238,6 @@ function defaults(): Config {
     },
     dataDir: 'data',
     egresses: [],
-    sources: [],
     providers: [],
     accounts: [],
   }
@@ -266,6 +258,8 @@ function applyDefaults(c: Config): void {
   if (!(c.gateway.streamIdleTimeoutMs > 0)) c.gateway.streamIdleTimeoutMs = DEFAULT_STREAM_IDLE_TIMEOUT_MS
   for (const p of c.providers) {
     if (!p.stability) p.stability = 'stable'
+    // state 缺失时按 active 处理：老配置只有 enabled 概念，语义上就是"生效"。
+    if (!p.state) p.state = 'active'
     if (!p.risk) p.risk = 'low'
     if (!p.accessKind) p.accessKind = 'official'
     p.models ??= [] // Go 侧 nil 切片语义等价空目录
@@ -275,6 +269,9 @@ function applyDefaults(c: Config): void {
   }
   for (const a of c.accounts) {
     if (!a.status) a.status = 'available'
+    // providerId 此刻可能还是 0：YAML 里写的归属是 Provider 名（providerName），
+    // 名字→数字 id 的解析必须在 provider 入库、拿到 id 之后（见 cli.ts seed 之后）。
+    if (!a.providerId) a.providerId = 0
   }
 }
 
@@ -287,31 +284,22 @@ function validate(c: Config): void {
   if (c.gateway.port <= 0 || c.gateway.port > 65535) {
     throw new Error(`gateway.port ${c.gateway.port} 非法`)
   }
-  const sources = new Set<string>()
-  for (const s of c.sources) {
-    if (!s.id) throw new Error('sources 条目 id 不能为空')
-    if (sources.has(s.id)) throw new Error(`source id "${s.id}" 重复`)
-    sources.add(s.id)
-  }
   const egressIDs = new Set(c.egresses.map((e) => e.id))
   const providers = new Set<string>()
   for (const p of c.providers) {
     if (p.egress && !egressIDs.has(p.egress)) {
-      throw new Error(`provider ${p.id} 引用了不存在的 egress "${p.egress}"（需先在顶层 egresses 定义）`)
+      throw new Error(`provider ${p.name} 引用了不存在的 egress "${p.egress}"（需先在顶层 egresses 定义）`)
     }
     for (const m of p.models ?? []) {
       if (m.egress && !egressIDs.has(m.egress)) {
-        throw new Error(`provider ${p.id} 模型 ${m.id} 引用了不存在的 egress "${m.egress}"（需先在顶层 egresses 定义）`)
+        throw new Error(`provider ${p.name} 模型 ${m.id} 引用了不存在的 egress "${m.egress}"（需先在顶层 egresses 定义）`)
       }
     }
     const err = providerValidate(p)
     if (err) throw new Error(err)
-    if (providers.has(p.id)) {
-      throw new Error(`provider id "${p.id}" 重复（ID 永久不可改，重复即冲突）`)
+    if (providers.has(p.name)) {
+      throw new Error(`provider name "${p.name}" 重复（名字唯一）`)
     }
-    providers.add(p.id)
-    if (!sources.has(p.sourceId)) {
-      throw new Error(`provider ${p.id} 引用了不存在的 source "${p.sourceId}"（需先在 sources 登记）`)
-    }
+    providers.add(p.name)
   }
 }

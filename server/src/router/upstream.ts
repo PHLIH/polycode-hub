@@ -8,8 +8,8 @@ import { spawn } from 'node:child_process'
 // 与 ProxyAgent 同源——npm undici 与 Node 内置 undici 是两代协议，跨包传 dispatcher 会
 // 报 invalid onRequestStart（实测）。版本自洽后按 Provider 分流出口才成立。
 import { fetch as undiciFetch, ProxyAgent } from 'undici'
-import { getOutbound, kindForStatus, UpstreamError, UPSTREAM, validProtocol,
-  type IrRequest, type Protocol, type StreamEvent } from '../ir/index.ts'
+import { getOutbound, kindForStatus, UpstreamError, UPSTREAM,
+  type IrRequest, type Protocol } from '../ir/index.ts'
 import { autoProtocol, forgetProtocol, rememberProtocol,
   capabilitiesFrom, credentialResolve, dynamicHeadersTimeout,
   type Capabilities, type DynamicHeadersSpec, type Provider } from '../model/index.ts'
@@ -108,14 +108,14 @@ export class Upstream {
         return await this.streamWith(p, irReq, proto)
       } catch (err) {
         if (!shouldTryOtherProtocol(err)) throw err
-        forgetProtocol(p.id, irReq.model) // 记住的协议失效 → 丢掉并重探
+        forgetProtocol(p.name, irReq.model) // 记住的协议失效 → 丢掉并重探
         lastErr = err
       }
     }
     for (const cand of probeOrder(proto)) {
       try {
         const s = await this.streamWith(p, irReq, cand)
-        rememberProtocol(p.id, irReq.model, cand)
+        rememberProtocol(p.name, irReq.model, cand)
         return s
       } catch (err) {
         lastErr = err
@@ -297,11 +297,11 @@ export class Upstream {
 // 只说「凭据无效」用户仍不知道去哪配；照抄上游 HTML 401 更是误导（issue #1）。
 export function missingCredentialMessage(p: Provider): string {
   if (p.credential.apiKeyFile) {
-    return `凭据文件读不到 provider=${p.id} file=${p.credential.apiKeyFile}`
+    return `凭据文件读不到 provider=${p.name} file=${p.credential.apiKeyFile}`
       + `（先确认文件存在且可读；Discover「一键导入」会把桌面登录态写入该文件）`
   }
   const env = p.credential.apiKeyEnv ?? ''
-  return `环境变量 ${env} 未设置 provider=${p.id}`
+  return `环境变量 ${env} 未设置 provider=${p.name}`
     + `（先 export ${env}=... 并重启网关，或到 Providers 点「一键导入」把桌面登录态导入账号池）`
 }
 
@@ -337,7 +337,7 @@ function ue2s(status: number, body: string): string {
 export function resolveProtocol(p: Provider, modelID: string): [Protocol, boolean] {
   const m = p.models?.find((x) => x.id === modelID)
   if (m?.api) return [m.api, true]
-  const fact = autoProtocol(p.id, modelID)
+  const fact = autoProtocol(p.name, modelID)
   if (fact) return [fact, true]
   if (p.api) return [p.api, true]
   return ['', false]

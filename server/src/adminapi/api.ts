@@ -5,10 +5,14 @@
 
 import { Hono, type Context } from 'hono'
 import { timingSafeEqual } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { writeFile0600 } from './credential_file.ts'
 import { ERR, validProtocol } from '../ir/index.ts'
 import {
   providerValidate, accountHealth, validAccessKind, validRisk,
-  type Account, type Model, type Provider,
+  credentialResolve, forgetProtocol,
+  type Account, type CredentialRef, type Model, type Provider,
 } from '../model/index.ts'
 import type { ProbeResult } from '../gateway/probe.ts'
 import { MemoryAccountStore, MemoryProviderStore, type AccountStore, type EgressStore, type ProviderStore } from './store.ts'
@@ -43,13 +47,21 @@ export interface AdminApiDeps {
 }
 
 // PATCH 白名单（只读字段出现即 400；ID 永久不可改；credential 只收引用）。
-// accessKind/risk/stability 是运维判断，允许改；id/api/baseUrl 是通道身份，改 = 新建 + 删旧。
+// accessKind/risk/stability/api 是运维判断，允许改；id 是通道身份，改 = 新建 + 删旧。
+// api 放开编辑：改完清掉该 Provider 的协议探测缓存（forgetProtocol），下次请求按新声明直达。
+// credentialInput 是「用户在界面粘的 Key 本体」输入口，由 handler 落成凭据文件（不收明文入库）；
+// credentialKind 声明它的语义（key=Key 本体 / env=环境变量名），两者总是成对出现。
 const PROVIDER_PATCH_ALLOW = new Set([
-  'enabled', 'priority', 'streamOnly', 'displayName', 'riskNote', 'risk',
-  'credential', 'models', 'probeModel', 'egress', 'stability', 'accessKind',
+  // name 可改：只动对外名，providerId 与所有引用（账号归属、用量归因）都不动。
+  // state 是三态开关（active/paused）；enabled 是它的布尔兼容写法。
+  'name', 'state', 'enabled', 'priority', 'streamOnly', 'displayName', 'riskNote', 'risk',
+  'credential', 'models', 'probeModel', 'egress', 'stability', 'accessKind', 'api',
+  'credentialInput', 'credentialKind', 'baseUrl',
 ])
 
-const ACCOUNT_PATCH_ALLOW = new Set(['status', 'displayName', 'credential', 'weight'])
+const ACCOUNT_PATCH_ALLOW = new Set([
+  'status', 'displayName', 'credential', 'weight', 'credentialInput', 'credentialKind',
+])
 
 // ---- 小件 ----
 
@@ -61,6 +73,54 @@ function ok(c: C, status: 200 | 201 | 409 | 501 | 502, v?: unknown): Response {
 
 function errRes(c: C, status: 400 | 401 | 403 | 404 | 409 | 500 | 501 | 502, typ: string, msg: string): Response {
   return c.json({ error: { type: typ, message: msg } }, status)
+}
+
+// ---- 粘贴的 Key → 凭据文件（真实缺陷修复）----
+//
+// 背景：管理台「API Key」框的语义是「环境变量名」，但用户看到这四个字就是把 Key
+// 粘进去——粘完保存，credential.apiKeyEnv 存下了 Key 本体，网关拿它当变量名去
+// process.env 里找，永远找不到，请求发出不带 Authorization，上游回 401。
+// 用户侧看到的报错是「环境变量 atr_xxx 未设置」——让人一头雾水：我明明填了 Key。
+//
+// 判别方式：**不猜形状**。实测 atr_EXAMPLE0000000000000000000000abcd 这类 Key
+// （36 位、全为 [A-Za-z0-9_]）与环境变量名的字符集完全重合，靠形状判别必然误判。
+// 因此由界面显式声明语义（credentialKind）：
+//   'key' → 当作 Key 本体，落凭据文件（用户粘完即能用）
+//   'env' → 当作环境变量名，维持原语义
+// 未声明（老客户端 / 直接调 API）时沿用历史行为 = env，不做任何猜测。
+export type CredentialInputKind = 'key' | 'env'
+
+// 凭据文件路径：一律落在 config/credentials/ 下（复用 discover 的路径守卫口径，
+// 防路径穿越）。文件名从 provider/account id 派生，只保留安全字符。
+// 注意 '..' 必须单独收敛：只保留 [a-zA-Z0-9._-] 时 '.' 是合法字符，id=".." 会拼出
+// "config/credentials/provider-..-key" —— 文件名本身不越界，但让人误读成上级目录，
+// 且某些平台对含 .. 的路径有额外解释。统一把连续点折成单个点。
+export function credentialPathFor(kind: string, id: string): string {
+  const safe = id.replace(/[^a-zA-Z0-9._-]/g, '-').replace(/\.{2,}/g, '.')
+  return join('config', 'credentials', `${kind}-${safe}-key`)
+}
+
+// 把「用户填的凭据输入 + 界面声明的语义」规范化成 CredentialRef。
+// 返回 [ref, err]：写文件失败时 err 非空（调用方转 500）。
+// kind 缺省 = 'env'（历史行为，绝不静默改写老配置的语义）。
+export function resolveCredentialInput(
+  input: string, kind: CredentialInputKind, ownerKind: string, id: string,
+): [CredentialRef | undefined, string] {
+  const v = input.trim()
+  if (v === '') return [undefined, '']
+  if (kind === 'env') return [{ apiKeyEnv: v }, '']
+  const file = credentialPathFor(ownerKind, id)
+  try {
+    writeFile0600(file, v)
+  } catch (e) {
+    return [undefined, `写凭据文件失败: ${(e as Error).message}`]
+  }
+  return [{ apiKeyFile: file }, '']
+}
+
+// 从请求体读出界面声明的凭据语义；未声明/非法值一律回落 'env'（老行为）。
+export function parseCredentialKind(raw: Record<string, unknown>): CredentialInputKind {
+  return raw.credentialKind === 'key' ? 'key' : 'env'
 }
 
 // 恒时比较（防时序攻击；对齐 Go subtle.ConstantTimeCompare 的判定语义）。
@@ -173,30 +233,103 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     return ok(c, 200, { providers: providers.list() })
   })
 
+  // 凭证明文按需查看：列表页永远只下发引用（防泄漏锚点见 adminapi.test.ts），
+  // 明文只在这个显式端点返回，且调用方必须是已通过 withAuth 的管理面。
+  // 返回 {source, present, value}：无凭据声明 → present=false,value=''；
+  // 声明了但解析失败（env 未设置/文件读不到）→ ok=true,present=false + hint 告诉去哪配。
+  function credentialView(cr: CredentialRef): {
+    source: string; present: boolean; value: string; hint: string
+  } {
+    if (cr.apiKeyFile) {
+      try {
+        const v = readFileSync(cr.apiKeyFile, 'utf8').trim()
+        return {
+          source: `文件 ${cr.apiKeyFile}`, present: v !== '', value: v,
+          hint: v === '' ? `文件存在但内容为空：${cr.apiKeyFile}` : '',
+        }
+      } catch {
+        return {
+          source: `文件 ${cr.apiKeyFile}`, present: false, value: '',
+          hint: `凭据文件读不到 file=${cr.apiKeyFile}（先确认文件存在且可读）`,
+        }
+      }
+    }
+    if (!cr.apiKeyEnv) return { source: '无（无需鉴权）', present: false, value: '', hint: '' }
+    const [v, resolved] = credentialResolve(cr, (name) =>
+      process.env[name] === undefined ? ['', false] : [process.env[name]!, true])
+    if (!resolved) {
+      return {
+        source: `env ${cr.apiKeyEnv}`, present: false, value: '',
+        hint: `环境变量 ${cr.apiKeyEnv} 未设置（先 export ${cr.apiKeyEnv}=... 并重启网关）`,
+      }
+    }
+    return {
+      source: `env ${cr.apiKeyEnv}`, present: v !== '', value: v,
+      hint: v === '' ? `环境变量 ${cr.apiKeyEnv} 为空` : '',
+    }
+  }
+
+  // 路径参数是 providerId（数字，内部标识）——改名不影响它。
+  app.get('/admin/api/providers/:pid/credential', (c) => {
+    const p = providers.get(Number(c.req.param('pid')))
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 不存在`)
+    return ok(c, 200, credentialView(p.credential ?? {}))
+  })
+
   app.post('/admin/api/providers', async (c) => {
     const raw = await jsonBody(c)
     if (raw === undefined) return errRes(c, 400, ERR.INVALID_REQUEST, '请求体不是合法 JSON')
     const p = parseProvider(raw)
+    p.providerId = 0 // 由存储层分配
     const verr = providerValidate(p)
     if (verr) return errRes(c, 400, ERR.INVALID_REQUEST, verr)
-    if (providers.get(p.id)) {
-      return errRes(c, 409, ERR.INVALID_REQUEST, `provider ${p.id} 已存在`)
+    // 重名规则：active / paused 占名，deleted 不占（删掉的名字可以复用，会拿到新 provider_id）。
+    const same = providers.getByName(p.name)
+    if (same && same.state !== 'deleted') {
+      return errRes(c, 409, ERR.INVALID_REQUEST,
+        `Provider 名 ${p.name} 已被占用（#${same.providerId}，${same.state}）。`
+        + `换个名字；若想复用该名字，先把它删掉。`)
+    }
+    // 用户在「API Key」框里粘的是 Key 本体（不是环境变量名）：落成凭据文件。
+    // 顺序关键：credentialInput 必须**覆盖** credential —— 前端编辑表单会同时回传
+    // 旧的 credential 引用（保住文件型密钥不被空表单清掉），若 Input 只是"没值才写"，
+    // 粘进来的新 Key 就会被旧引用盖掉，用户看到的是"改了没生效"。
+    // 直接传 credential{} 的旧调用方（配置种子/测试）不带 credentialInput，语义不变。
+    if (isObj(raw) && typeof raw.credentialInput === 'string' && raw.credentialInput.trim() !== '') {
+      const [ref, cerr] = resolveCredentialInput(
+        raw.credentialInput, parseCredentialKind(raw), 'provider', p.name)
+      if (cerr) return errRes(c, 500, ERR.API, cerr)
+      if (ref) p.credential = ref
     }
     providers.put(p)
     changed()
     return ok(c, 201, p)
   })
 
-  app.patch('/admin/api/providers/:id', async (c) => {
-    const id = c.req.param('id')
-    const p = providers.get(id)
-    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider ${id} 不存在`)
+  app.patch('/admin/api/providers/:pid', async (c) => {
+    const pid = Number(c.req.param('pid'))
+    const p = providers.get(pid)
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 不存在`)
     const patch = await jsonBody(c)
     if (!isObj(patch)) return errRes(c, 400, ERR.INVALID_REQUEST, '请求体不是合法 JSON')
     for (const k of Object.keys(patch)) {
       if (!PROVIDER_PATCH_ALLOW.has(k)) {
-        return errRes(c, 400, ERR.INVALID_REQUEST, `字段 ${k} 只读（改名/换协议 = 新建 + 删旧）`)
+        return errRes(c, 400, ERR.INVALID_REQUEST, `字段 ${k} 只读`)
       }
+    }
+    // 改名：只动 name，providerId 与所有引用（账号归属、用量归因）都不动。
+    // 目标名被别的活跃 Provider 占用则拒绝；占用者是自己的旧记录（同名）则忽略。
+    if (typeof patch.name === 'string' && patch.name !== p.name) {
+      const next = patch.name.trim()
+      if (next === '') return errRes(c, 400, ERR.INVALID_REQUEST, '名称不能为空')
+      if (!/^[a-z0-9-]+$/.test(next)) {
+        return errRes(c, 400, ERR.INVALID_REQUEST, '名称只允许小写字母/数字/连字符')
+      }
+      const other = providers.getByName(next)
+      if (other && other.state !== 'deleted' && other.providerId !== p.providerId) {
+        return errRes(c, 409, ERR.INVALID_REQUEST, `名称 ${next} 已被 #${other.providerId} 占用`)
+      }
+      p.name = next
     }
     if ('models' in patch) {
       // 模型采用：只增不减。已有 ID 不删（元数据保留），但补协议与能力（上游新声明的以本次为准）。
@@ -217,7 +350,7 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
           continue
         }
         have.add(input.id)
-        const nm: Model = { id: input.id, providerId: p.id, enabled: true, manual: false }
+        const nm: Model = { id: input.id, enabled: true, manual: false }
         if (input.protocol) nm.api = input.protocol
         if (input.caps) {
           nm.input = input.caps.input
@@ -228,9 +361,16 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
       }
     }
     const setters: Record<string, (v: unknown) => boolean> = {
+      // 开关即 state：active ↔ paused。deleted 只能由 DELETE 端点产生。
       enabled: (v) => {
         if (typeof v !== 'boolean') return false
-        p.enabled = v
+        if (v) p.state = 'active'
+        else if (p.state === 'active') p.state = 'paused'
+        return true
+      },
+      state: (v) => {
+        if (v !== 'active' && v !== 'paused') return false
+        p.state = v
         return true
       },
       priority: (v) => {
@@ -271,9 +411,25 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
         p.risk = v
         return true
       },
+      // 协议放开编辑：空 = 自动识别；非空必须是合法协议。改完清探测缓存，
+      // 否则进程内记住的旧协议会盖住新声明（resolveProtocol 先读 autoProtocol）。
+      api: (v) => {
+        if (typeof v !== 'string') return false
+        if (v !== '' && !validProtocol(v)) return false
+        if (p.api !== v) {
+          p.api = v
+          forgetProtocol(p.name, '')
+        }
+        return true
+      },
       credential: (v) => {
         if (!isObj(v)) return false
         p.credential = parseCredential(v)
+        return true
+      },
+      baseUrl: (v) => {
+        if (typeof v !== 'string' || v === '') return false
+        p.baseUrl = v
         return true
       },
       probeModel: (v) => {
@@ -290,10 +446,17 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
       },
     }
     for (const [k, v] of Object.entries(patch)) {
-      if (k === 'models') continue
+      if (k === 'models' || k === 'credentialInput' || k === 'credentialKind') continue
       const set = setters[k]
       if (!set) continue
       if (!set(v)) return errRes(c, 400, ERR.INVALID_REQUEST, `字段 ${k} 类型错误`)
+    }
+    // 编辑时同样支持粘贴 Key 本体（语义同 POST）：非空才覆盖，空串 = 不动原引用。
+    if (typeof patch.credentialInput === 'string' && patch.credentialInput.trim() !== '') {
+      const [ref, cerr] = resolveCredentialInput(
+        patch.credentialInput, parseCredentialKind(patch), 'provider', p.name)
+      if (cerr) return errRes(c, 500, ERR.API, cerr)
+      if (ref) p.credential = ref
     }
     // 逐字段的 setter 只看单值，拦不住跨字段组合：risk 与 riskNote 单看都合法，
     // 合起来可能违反「中/高风险必须带说明」。只在本次真的碰了 risk/riskNote 时才查，
@@ -301,7 +464,7 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     if ('risk' in patch || 'riskNote' in patch) {
       if ((p.risk === 'medium' || p.risk === 'high') && !(p.riskNote ?? '').trim()) {
         return errRes(c, 400, ERR.INVALID_REQUEST,
-          `provider ${p.id}: risk=${p.risk} 必须填写 risk_note（UI 必须显示风险说明）`)
+          `provider ${p.name}: risk=${p.risk} 必须填写 risk_note（UI 必须显示风险说明）`)
       }
     }
     providers.put(p)
@@ -309,16 +472,30 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     return ok(c, 200, p)
   })
 
-  app.delete('/admin/api/providers/:id', (c) => {
-    const id = c.req.param('id')
-    if (!providers.delete(id)) {
-      return errRes(c, 404, ERR.NOT_FOUND, 'provider 不存在')
-    }
+  // 删除 = 状态置 deleted（软删）。物理保留该行：历史用量要靠 providerId 回溯，
+  // 而且名字被释放后可被新建复用，同名不同 id 在归因上也分得清。
+  app.delete('/admin/api/providers/:pid', (c) => {
+    const p = providers.get(Number(c.req.param('pid')))
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, 'provider 不存在')
+    p.state = 'deleted'
+    providers.put(p)
     changed()
     return c.body(null, 204)
   })
 
   // ---- accounts ----
+
+  // 账号的「归属」= Provider.providerId（数字，永不变）。前端传来的是名字
+  // （用户心智单位），这里解析成 id 存下——Provider 改名后账号归属自动跟着走。
+  function providerForAccount(providerId: number): Provider | undefined {
+    return providers.list().find((p) => p.providerId === providerId && p.state !== 'deleted')
+  }
+
+  // 前端按名字指定归属时用：只有活跃 Provider 才算有效归属。
+  function activeProviderByName(name: string): Provider | undefined {
+    const p = providers.getByName(name)
+    return p && p.state !== 'deleted' ? p : undefined
+  }
 
   // 列表：DB 记录 + 池内运行时（冷却/连败）。没有池子时退化为纯 DB 状态。
   // 运行时与 DB 冲突时以运行时为准——池子才是真正在调度的那个对象。
@@ -344,15 +521,44 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     const raw = await jsonBody(c)
     if (raw === undefined) return errRes(c, 400, ERR.INVALID_REQUEST, '请求体不是合法 JSON')
     const ac = parseAccount(raw)
-    if (ac.id === '' || ac.sourceId === '') {
-      return errRes(c, 400, ERR.INVALID_REQUEST, 'id 与 sourceId 必填')
+    if (ac.id === '') {
+      return errRes(c, 400, ERR.INVALID_REQUEST, 'id 必填')
     }
+    // 归属：前端传名字（providerName），也接受已有的数字 providerId。
+    const wanted = isObj(raw)
+      ? (typeof raw.providerName === 'string' ? raw.providerName : '')
+      : ''
+    let owner: Provider | undefined
+    if (wanted !== '') {
+      owner = activeProviderByName(wanted)
+      if (!owner) {
+        return errRes(c, 400, ERR.INVALID_REQUEST,
+          `没有名为 ${wanted} 的 Provider（账号按 Provider 归属，先建 Provider 或从下拉里选）`)
+      }
+    } else if (ac.providerId > 0) {
+      owner = providerForAccount(ac.providerId)
+      if (!owner) {
+        return errRes(c, 400, ERR.INVALID_REQUEST, `provider #${ac.providerId} 不存在或已删除`)
+      }
+    } else {
+      return errRes(c, 400, ERR.INVALID_REQUEST, '归属 Provider 必填')
+    }
+    ac.providerId = owner.providerId
     if (!ac.status) ac.status = 'available'
     if (ac.status !== 'available' && ac.status !== 'disabled') {
       return errRes(c, 400, ERR.INVALID_REQUEST, '新建账号 status 只允许 available/disabled')
     }
     if (accounts.get(ac.id)) {
-      return errRes(c, 409, ERR.INVALID_REQUEST, `account ${ac.id} 已存在`)
+      // 重名直接拒（用户要求：重名就提示，不许悄悄覆盖）。
+      return errRes(c, 409, ERR.INVALID_REQUEST, `账号 ID ${ac.id} 已存在，换一个名字`)
+    }
+    // 与 Provider 同口径：界面里粘的 Key 本体落成凭据文件，不落明文入库。
+    // 同上，credentialInput 覆盖 credential（粘的 Key 必须赢过旧引用）。
+    if (isObj(raw) && typeof raw.credentialInput === 'string' && raw.credentialInput.trim() !== '') {
+      const [ref, cerr] = resolveCredentialInput(
+        raw.credentialInput, parseCredentialKind(raw), 'account', ac.id)
+      if (cerr) return errRes(c, 500, ERR.API, cerr)
+      if (ref) ac.credential = ref
     }
     accounts.put(ac)
     changed()
@@ -397,10 +603,17 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
       },
     }
     for (const [k, v] of Object.entries(patch)) {
-      if (k === 'status') continue
+      if (k === 'status' || k === 'credentialInput' || k === 'credentialKind') continue
       const set = setters[k]
       if (!set) continue
       if (!set(v)) return errRes(c, 400, ERR.INVALID_REQUEST, `字段 ${k} 类型错误`)
+    }
+    // 与 Provider 同口径：粘 Key 本体 → 落文件；空串 = 不动原引用。
+    if (typeof patch.credentialInput === 'string' && patch.credentialInput.trim() !== '') {
+      const [ref, cerr] = resolveCredentialInput(
+        patch.credentialInput, parseCredentialKind(patch), 'account', ac.id)
+      if (cerr) return errRes(c, 500, ERR.API, cerr)
+      if (ref) ac.credential = ref
     }
     accounts.put(ac)
     changed()
@@ -413,6 +626,13 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     }
     changed()
     return c.body(null, 204)
+  })
+
+  // 账号凭证明文按需查看：与 Provider 同口径（列表只下发引用，明文走显式端点）。
+  app.get('/admin/api/accounts/:id/credential', (c) => {
+    const ac = accounts.get(c.req.param('id'))
+    if (!ac) return errRes(c, 404, ERR.NOT_FOUND, `account ${c.req.param('id')} 不存在`)
+    return ok(c, 200, credentialView(ac.credential ?? {}))
   })
 
   // 人工恢复键：只清调度侧惩罚，不探活（零上游成本）。
@@ -507,16 +727,16 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
 
   // ---- Provider 测试 / 模型发现 / 扫描 ----
 
-  app.post('/admin/api/providers/:id/test', async (c) => {
+  app.post('/admin/api/providers/:pid/test', async (c) => {
     if (!deps.prober) return errRes(c, 501, ERR.API, 'Provider 测试未接线')
-    const res: ProbeResult = await deps.prober.probeProvider(c.req.param('id'))
+    const res: ProbeResult = await deps.prober.probeProvider(Number(c.req.param('pid')))
     return ok(c, 200, res)
   })
 
   // 批量实测候选模型；探到的协议写回模型目录（探测结果即事实，下次转发直达）。
-  app.post('/admin/api/providers/:id/scan', async (c) => {
+  app.post('/admin/api/providers/:pid/scan', async (c) => {
     if (!deps.modelProber) return errRes(c, 501, ERR.API, '批量模型扫描未接线')
-    const id = c.req.param('id')
+    const id = Number(c.req.param('pid'))
     const body = await jsonBody(c)
     const models = isObj(body) && Array.isArray(body.models)
       ? body.models.filter((x): x is string => typeof x === 'string')
@@ -542,11 +762,11 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
   })
 
   // 手工指定某模型的协议（空 = 继承 Provider 默认）；扫描自动写入，此端点是纠偏入口。
-  app.put('/admin/api/providers/:id/models/:model/protocol', async (c) => {
-    const id = c.req.param('id')
+  app.put('/admin/api/providers/:pid/models/:model/protocol', async (c) => {
+    const pid = Number(c.req.param('pid'))
     const modelID = c.req.param('model')
-    const p = providers.get(id)
-    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider ${id} 不存在`)
+    const p = providers.get(pid)
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 不存在`)
     const body = await jsonBody(c)
     if (!isObj(body)) return errRes(c, 400, ERR.INVALID_REQUEST, '请求体不是合法 JSON')
     const protocol = typeof body.protocol === 'string' ? body.protocol : ''
@@ -555,7 +775,7 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
         'protocol 只允许 openai-completions / openai-responses / anthropic-messages，或空字符串表示继承')
     }
     const m = p.models.find((x) => x.id === modelID)
-    if (!m) return errRes(c, 404, ERR.NOT_FOUND, `provider ${id} 下没有模型 ${modelID}`)
+    if (!m) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 下没有模型 ${modelID}`)
     if (protocol === '') delete m.api
     else m.api = protocol
     providers.put(p)
@@ -564,16 +784,16 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
   })
 
   // 手工指定某模型的出口代理（空 = 继承 Provider 默认）；引用顶层 egresses 的 id。
-  app.put('/admin/api/providers/:id/models/:model/egress', async (c) => {
-    const id = c.req.param('id')
+  app.put('/admin/api/providers/:pid/models/:model/egress', async (c) => {
+    const pid = Number(c.req.param('pid'))
     const modelID = c.req.param('model')
-    const p = providers.get(id)
-    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider ${id} 不存在`)
+    const p = providers.get(pid)
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 不存在`)
     const body = await jsonBody(c)
     if (!isObj(body)) return errRes(c, 400, ERR.INVALID_REQUEST, '请求体不是合法 JSON')
     const egress = typeof body.egress === 'string' ? body.egress : ''
     const m = p.models.find((x) => x.id === modelID)
-    if (!m) return errRes(c, 404, ERR.NOT_FOUND, `provider ${id} 下没有模型 ${modelID}`)
+    if (!m) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 下没有模型 ${modelID}`)
     if (egress === '') delete m.egress
     else m.egress = egress
     providers.put(p)
@@ -583,17 +803,17 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
 
   // 模型备注：一句话运维知识（如「23 点后才免费，白天用会扣额度」）。
   // 空串 = 删掉该字段，不留空值。与 displayName 分工不同：那是"叫什么"，这是"要注意什么"。
-  app.put('/admin/api/providers/:id/models/:model/note', async (c) => {
-    const id = c.req.param('id')
+  app.put('/admin/api/providers/:pid/models/:model/note', async (c) => {
+    const pid = Number(c.req.param('pid'))
     const modelID = c.req.param('model')
-    const p = providers.get(id)
-    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider ${id} 不存在`)
+    const p = providers.get(pid)
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 不存在`)
     const body = await jsonBody(c)
     if (!isObj(body) || typeof body.note !== 'string') {
       return errRes(c, 400, ERR.INVALID_REQUEST, '请求体须为 {"note": string}')
     }
     const m = p.models.find((x) => x.id === modelID)
-    if (!m) return errRes(c, 404, ERR.NOT_FOUND, `provider ${id} 下没有模型 ${modelID}`)
+    if (!m) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 下没有模型 ${modelID}`)
     // 限长：这是一行提示，不是文档（前端也是单行输入）。
     const note = body.note.trim().slice(0, 200)
     if (note === '') delete m.note
@@ -604,17 +824,17 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
   })
 
   // 开关单个模型的启用：对外暴露（/v1/models）、路由匹配、测试候选都以它为准。
-  app.put('/admin/api/providers/:id/models/:model/enabled', async (c) => {
-    const id = c.req.param('id')
+  app.put('/admin/api/providers/:pid/models/:model/enabled', async (c) => {
+    const pid = Number(c.req.param('pid'))
     const modelID = c.req.param('model')
-    const p = providers.get(id)
-    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider ${id} 不存在`)
+    const p = providers.get(pid)
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 不存在`)
     const body = await jsonBody(c)
     if (!isObj(body) || typeof body.enabled !== 'boolean') {
       return errRes(c, 400, ERR.INVALID_REQUEST, '请求体须为 {"enabled": boolean}')
     }
     const m = p.models.find((x) => x.id === modelID)
-    if (!m) return errRes(c, 404, ERR.NOT_FOUND, `provider ${id} 下没有模型 ${modelID}`)
+    if (!m) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 下没有模型 ${modelID}`)
     m.enabled = body.enabled
     providers.put(p)
     changed()
@@ -623,13 +843,13 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
 
   // 删除单个模型：手填错的/上游已下架的，得能摘掉。
   // PATCH models 是「只增不减」，所以删除必须是独立端点（否则手填的模型永远删不掉）。
-  app.delete('/admin/api/providers/:id/models/:model', (c) => {
-    const id = c.req.param('id')
+  app.delete('/admin/api/providers/:pid/models/:model', (c) => {
+    const pid = Number(c.req.param('pid'))
     const modelID = c.req.param('model')
-    const p = providers.get(id)
-    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider ${id} 不存在`)
+    const p = providers.get(pid)
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 不存在`)
     const i = p.models.findIndex((x) => x.id === modelID)
-    if (i < 0) return errRes(c, 404, ERR.NOT_FOUND, `provider ${id} 下没有模型 ${modelID}`)
+    if (i < 0) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 下没有模型 ${modelID}`)
     p.models.splice(i, 1)
     providers.put(p)
     changed()
@@ -637,12 +857,12 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
   })
 
   // 拉取上游模型目录；listler 报错时 502（前端引导手填）。
-  app.get('/admin/api/providers/:id/models', async (c) => {
+  app.get('/admin/api/providers/:pid/models', async (c) => {
     const lister: ProviderModelLister | undefined = deps.lister
     if (!lister) return errRes(c, 501, ERR.API, '模型发现未接线')
     let list: ModelList
     try {
-      list = await lister.listProviderModels(c.req.param('id'))
+      list = await lister.listProviderModels(Number(c.req.param('pid')))
     } catch (e) {
       return errRes(c, 502, ERR.API, (e as Error).message)
     }

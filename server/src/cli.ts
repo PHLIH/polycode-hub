@@ -120,10 +120,33 @@ export async function runServe(args: string[]): Promise<void> {
   px.setAccountPool(acctPool)
 
   seedProvidersIfEmpty(providers, cfg.providers)
+  // 账号归属解析：YAML 里写的是 Provider 名，落库要的是数字 providerId。
+  // 必须在 provider 入库（拿到自增 id）之后做。
+  {
+    const idByName = new Map(providers.list().map((p) => [p.name, p.providerId] as const))
+    for (const a of cfg.accounts) {
+      const named = (a as { providerName?: string }).providerName
+      if (!named) continue
+      const id = idByName.get(named)
+      if (id === undefined) {
+        console.error(`账号 ${a.id} 归属的 Provider「${named}」不存在，该账号不会参与轮询`)
+        continue
+      }
+      a.providerId = id
+      delete (a as { providerName?: string }).providerName
+    }
+  }
   seedAccountsIfEmpty(accounts, cfg.accounts)
 
+  // 用量表的历史行：provider_id 由「Provider 名」迁到数字内部 id。
+  // 必须在 Provider 入库之后跑（名字→id 的权威来源就是这张表）。
+  // 查不到对应 Provider 的历史行标 -1，但 provider_name 快照保住了展示。
+  const named = new Map(providers.list().map((p) => [p.name, p.providerId] as const))
+  const fixed = usageStore.resolveProviderIds((n) => named.get(n))
+  if (fixed > 0) console.log(`用量归因迁移：${fixed} 个历史 Provider 名已绑定到内部 id`)
+
   const probe = new Probe(sched, up, usageStore, acctPool,
-    (sourceID) => sourceID === 'workbuddy'
+    (providerName) => providerName === 'workbuddy'
       ? discoverWorkBuddyModels(join(process.env.HOME ?? '', '.workbuddy'))
       : [])
 
@@ -159,9 +182,9 @@ export async function runServe(args: string[]): Promise<void> {
       },
     },
     accountProber: { probeAccount: (id, model) => probe.probeAccount(id, model) },
-    prober: { probeProvider: (id) => probe.probeProvider(id) },
-    lister: { listProviderModels: (id) => probe.listProviderModels(id) },
-    modelProber: { probeModels: (id, models) => probe.probeModels(id, models) },
+    prober: { probeProvider: (pid) => probe.probeProvider(pid) },
+    lister: { listProviderModels: (pid) => probe.listProviderModels(pid) },
+    modelProber: { probeModels: (pid, models) => probe.probeModels(pid, models) },
     notify: syncStores,
     sidecar: createSidecarApp(sidecarSvc, providers, syncStores),
     projects: createProjectsApp(projectsMgr, { defaultModel: cfg.gateway.defaultModel }),
@@ -237,12 +260,14 @@ async function runAdopt(args: string[]): Promise<void> {
     fatal(new Error(`${found.harness} 未就绪（${found.status}）：${(found.actions ?? []).join('；')}`))
   }
   const p = { ...found.suggestedProvider! }
-  if (id) p.id = id
+  if (id) p.name = id
+  p.providerId = 0
   const invalid = providerValidate(p)
   if (invalid) fatal(new Error(invalid))
-  if (providers.get(p.id)) fatal(new Error(`provider ${p.id} 已存在`))
+  const same = providers.getByName(p.name)
+  if (same && same.state !== 'deleted') fatal(new Error(`provider ${p.name} 已存在`))
   providers.put(p)
-  console.log(`已采用: ${p.id} (${found.harness})`)
+  console.log(`已采用: ${p.name} (#${p.providerId}, ${found.harness})`)
 }
 
 // ---- zcode 子命令 ----

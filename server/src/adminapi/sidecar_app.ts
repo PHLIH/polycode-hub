@@ -5,8 +5,10 @@ import { existsSync, statSync } from 'node:fs'
 import { Hono, type Context } from 'hono'
 import { validatePort, type Sidecar } from '../sidecar/sidecar.ts'
 
+// sidecar 只关心「zcode-plan-local」这一个 Provider 的 baseUrl，
+// 按对外名查（名字比内部 id 更适合这类固定目标）。
 export interface SidecarStoreAdapter {
-  get(id: string): { baseUrl?: string } | undefined
+  getByName(name: string): { baseUrl?: string } | undefined
   put(p: { baseUrl?: string }): void
 }
 
@@ -42,7 +44,7 @@ export function createSidecarApp(
 
   // GET / → 状态 + 安装/配置信息。
   app.get('/', async (c) => {
-    const endpoint = providers.get('zcode-plan-local')?.baseUrl ?? ''
+    const endpoint = providers.getByName('zcode-plan-local')?.baseUrl ?? ''
     const builtin = `http://127.0.0.1:${svc.port}`
     return c.json({
       running: await svc.running(),
@@ -123,7 +125,7 @@ export function createSidecarApp(
             return err(c, 400, (e as Error).message)
           }
         }
-        const p = providers.get('zcode-plan-local')
+        const p = providers.getByName('zcode-plan-local')
         if (p && p.baseUrl !== `http://127.0.0.1:${port}`) {
           providers.put({ ...p, baseUrl: `http://127.0.0.1:${port}` })
           changed()
@@ -160,7 +162,7 @@ export function createSidecarApp(
           } catch { alive = false }
           return c.json({ ok: alive, url })
         }
-        const p = providers.get('zcode-plan-local')
+        const p = providers.getByName('zcode-plan-local')
         if (!p) return err(c, 404, 'provider zcode-plan-local 不存在')
         providers.put({ ...p, baseUrl: url.replace(/\/+$/, '') })
         changed()

@@ -8,27 +8,30 @@ export interface SchedulerInput {
 }
 
 function filterProviders(providers: Provider[], riskMax: Risk): Provider[] {
-  const kept = providers.filter((p) => p.enabled && riskAllowed(riskMax, p.risk))
+  // 只有 active 参与路由；paused（开关关掉）与 deleted 都不进入候选。
+  const kept = providers.filter((p) => p.state === 'active' && riskAllowed(riskMax, p.risk))
   // priority 升序稳定排序；同 priority 内保持配置顺序（轮转由 pickOrder 完成）
   return kept.map((p, i) => ({ p, i }))
     .sort((a, b) => a.p.priority - b.p.priority || a.i - b.i)
     .map((x) => ({ ...x.p }))
 }
 
+// 限定名 <prefix>/<modelId>：prefix 是 Provider id（客户端从 /v1/models 拿到什么就填什么）。
+// 历史上 prefix 是抽象的「源」名，它与 Provider 恒为 1:1，多一层概念只让人对不上号。
 export function splitModelRef(
-  name: string, sources: string[],
-): { source: string; model: string; qualified: boolean } {
+  name: string, providerIDs: string[],
+): { provider: string; model: string; qualified: boolean } {
   const i = name.indexOf('/')
-  if (i > 0 && i < name.length - 1 && sources.includes(name.slice(0, i))) {
-    return { source: name.slice(0, i), model: name.slice(i + 1), qualified: true }
+  if (i > 0 && i < name.length - 1 && providerIDs.includes(name.slice(0, i))) {
+    return { provider: name.slice(0, i), model: name.slice(i + 1), qualified: true }
   }
-  return { source: '', model: name, qualified: false }
+  return { provider: '', model: name, qualified: false }
 }
 
-function sourcesOf(providers: Provider[]): string[] {
+function providerNamesOf(providers: Provider[]): string[] {
   const out: string[] = []
   for (const p of providers) {
-    if (!out.includes(p.sourceId)) out.push(p.sourceId)
+    if (!out.includes(p.name)) out.push(p.name)
   }
   return out
 }
@@ -36,12 +39,12 @@ function sourcesOf(providers: Provider[]): string[] {
 function matchModel(p: Provider, name: string): [Model, boolean] {
   if (!p.models || p.models.length === 0) {
     // 未声明 Models 的 Provider 视为透明代理，接受任意模型
-    return [{ id: name, providerId: p.id, input: ['text'], manual: false, enabled: false }, true]
+    return [{ id: name, input: ['text'], manual: false, enabled: false }, true]
   }
   for (const m of p.models) {
     if (m.id === name && m.enabled) return [m, true]
   }
-  return [{ id: '', providerId: p.id, manual: false, enabled: false }, false]
+  return [{ id: '', manual: false, enabled: false }, false]
 }
 
 export class Scheduler {
@@ -87,10 +90,10 @@ export class Scheduler {
     if (modelName === undefined) return this.pickOrderPublic()
     if (modelName === '') return this.pickOrderPublic()
     const cands = this.pickOrderPublic()
-    const { source, model: bare, qualified } = splitModelRef(modelName, sourcesOf(this.list))
+    const { provider, model: bare, qualified } = splitModelRef(modelName, providerNamesOf(this.list))
     const out: Provider[] = []
     for (const p of cands) {
-      if (qualified && p.sourceId !== source) continue
+      if (qualified && p.name !== provider) continue
       if (!stream && p.streamOnly) continue
       const [m, ok] = matchModel(p, bare)
       if (!ok) continue
@@ -100,18 +103,20 @@ export class Scheduler {
     return out
   }
 
-  // 用本集合的 source 解析限定名（proxy 剥前缀用）。
-  splitRef(name: string): { source: string; model: string; qualified: boolean } {
-    return splitModelRef(name, sourcesOf(this.list))
+  // 用本集合的 Provider id 解析限定名（proxy 剥前缀用）。
+  splitRef(name: string): { provider: string; model: string; qualified: boolean } {
+    return splitModelRef(name, providerNamesOf(this.list))
   }
 
   // 查找 Provider 下指定模型的能力元数据。
-  modelOf(providerID: string, modelName: string): [Model, boolean] {
+  // 按内部 id 查（数字，改名不影响）。
+  // 按 Provider 内部 id 查它名下的模型（模型是 Provider 的从属数据，不带反向引用）
+  modelOf(providerId: number, modelName: string): [Model, boolean] {
     for (const p of this.list) {
-      if (p.id !== providerID) continue
+      if (p.providerId !== providerId) continue
       return matchModel(p, modelName)
     }
-    return [{ id: '', providerId: '', manual: false, enabled: false }, false]
+    return [{ id: '', manual: false, enabled: false }, false]
   }
 }
 

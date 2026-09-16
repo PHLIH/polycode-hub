@@ -6,22 +6,14 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { Provider } from '../model/index.ts'
+import type { Finding } from '../adminapi/types.ts'
 
 export type Status = 'ready' | 'expired' | 'missing' | 'unknown' | 'unreachable'
 
-// 一条发现结果（JSON 可序列化，无密钥）。
-export interface Finding {
-  key: string // 稳定标识：workbuddy/zcode/opencode-zen
-  harness: string // 展示名
-  status?: Status // 返回前必被赋值（对齐 Go 的先构建后置状态）
-  detail?: string // 脱敏说明（昵称/有效期/模型数）
-  actions?: string[] // 下一步指引
-  suggestedProvider?: Provider // 采用草稿（无密钥明文）
-  // 本机发现的多账号登录态（WorkBuddy 类，脱敏）。
-  // 客户端切号不删旧文件，多账号天然共存——发现时一次全部列出。
-  suggestedAccounts?: DiscoveredAccount[]
-  adoptedProviderId?: string // 已接管该登录态的 Provider（管理面标注）
-}
+// Finding 的唯一定义在 adminapi/types.ts（发现层要产出、管理面要消费、前端要渲染）。
+// 这里曾各自定义一份，结果 adoptedProviderId 一边是 string 一边是 number 悄悄漂移，
+// 前端把 Provider 内部 id 当名字渲染成「已由 Provider「3」接管」。类型只留一处。
+export type { Finding }
 
 // 从客户端本地发现的单个登录态（脱敏，不含 token 本体）。
 export interface DiscoveredAccount {
@@ -135,15 +127,16 @@ function fmtLocal(d: Date): string {
 
 function wbSuggestedProvider(): Provider {
   return {
-    id: 'wb-auto', sourceId: 'workbuddy', displayName: 'WorkBuddy（自动发现）',
+    providerId: 0, name: 'workbuddy', state: 'active' as const, displayName: 'WorkBuddy（自动发现）',
     accessKind: 'session-reuse', risk: 'medium',
     riskNote: '复用本机桌面登录态；只走流式；不要并发压测',
     stability: 'beta', api: 'openai-completions',
     baseUrl: 'https://copilot.tencent.com/v2',
     credential: { apiKeyEnv: 'WB_TOKEN' },
     headers: { 'X-Product': 'SaaS', 'X-Domain': 'copilot.tencent.com' },
-    enabled: true, priority: 1,
-    models: [{ id: 'hy3-preview', providerId: 'wb-auto', displayName: 'HY免费', manual: false, enabled: true }],
+    priority: 1,
+    // providerId 由存储层在建 Provider 时分配（此处占位 0）
+    models: [{ id: 'hy3-preview', displayName: 'HY免费', manual: false, enabled: true }],
   }
 }
 
@@ -244,7 +237,7 @@ export function checkZCode(dirs: string[]): Finding {
 
 function zenSuggestedProvider(baseURL: string): Provider {
   return {
-    id: 'zen-auto', sourceId: 'opencode', displayName: 'Zen免费档（自动发现）',
+    providerId: 0, name: 'opencode', state: 'active' as const, displayName: 'Zen免费档（自动发现）',
     accessKind: 'reverse', risk: 'high',
     riskNote: '逆向私有协议头；免费档按 IP 限速',
     stability: 'beta', api: 'openai-completions',
@@ -254,10 +247,10 @@ function zenSuggestedProvider(baseURL: string): Provider {
       'x-opencode-client': 'cli', 'x-opencode-project': 'global',
       'x-opencode-request': 'msg_polycode', 'x-opencode-session': 'ses_polycode',
     },
-    enabled: true, priority: 1,
+    priority: 1,
     models: [
-      { id: 'mimo-v2.5-free', providerId: 'zen-auto', manual: false, enabled: true },
-      { id: 'nemotron-3-ultra-free', providerId: 'zen-auto', manual: false, enabled: true },
+      { id: 'mimo-v2.5-free', manual: false, enabled: true },
+      { id: 'nemotron-3-ultra-free', manual: false, enabled: true },
     ],
   }
 }

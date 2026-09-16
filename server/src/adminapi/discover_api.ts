@@ -3,8 +3,9 @@
 // 红线：token 全程服务端读写、不经过前端、不落日志；tokenPath 必须在本次扫描结果内
 // （防任意文件读）；credentialFile 只允许写在 config/credentials/ 下（防路径穿越）。
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname, join, normalize, sep } from 'node:path'
+import { readFileSync } from 'node:fs'
+import { join, normalize, sep } from 'node:path'
+import { writeFile0600 } from './credential_file.ts'
 import { ERR } from '../ir/index.ts'
 import { providerValidate, type Account, type Provider } from '../model/index.ts'
 import type { Context, Hono } from 'hono'
@@ -60,11 +61,6 @@ function readAccessToken(tokenPath: string): string {
   return token
 }
 
-function writeFile0600(path: string, content: string): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
-  writeFileSync(path, content, { mode: 0o600 })
-}
-
 export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
   const { providers, accounts, changed, discover } = ctx
 
@@ -72,26 +68,16 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
   app.get('/admin/api/discover', async (c) => {
     if (!discover) return ok(c, 200, { findings: [] })
     const findings = (await discover.scan()).map((f) => ({ ...f }))
-    // 上游源 → 已接管它的 Provider ID（List 顺序首个）。
-    // 只认 DB 里真实存在的行：删干净之后必须回到「未接管」，
+    // 已接管判定：发现项草稿的 Provider 名是否已有活跃行。
+    // 只看未删除的行：删干净之后必须回到「未接管」，
     // 否则发现页永远显示「已导入」而「一键导入」被禁用 → 用户既导不进来也无处可删。
-    const adoptedBy = new Map<string, string>()
-    for (const p of providers.list()) {
-      if (p.sourceId === '') continue
-      if (!adoptedBy.has(p.sourceId)) adoptedBy.set(p.sourceId, p.id)
-    }
-    // 同理，id 本身也要能对上：草稿 id 与库里实际 id 不一致时，
-    // 仍然按真实行的 id 报「已接管」，但前端要能拿它去定位/删除那一行。
+    const active = new Map(providers.list()
+      .filter((p) => p.state !== 'deleted')
+      .map((p) => [p.name, p] as const))
     for (const f of findings) {
-      const hit = adoptedBy.get(f.key)
-      if (hit) {
-        f.adoptedProviderId = hit
-        continue
-      }
-      if (f.suggestedProvider) {
-        const hit2 = adoptedBy.get(f.suggestedProvider.sourceId)
-        if (hit2) f.adoptedProviderId = hit2
-      }
+      const draft = f.suggestedProvider
+      const hit = draft ? active.get(draft.name) : undefined
+      if (hit) f.adoptedProviderId = hit.providerId // 报真实行 id，前端据此定位/删除
     }
     return ok(c, 200, { findings })
   })
@@ -101,7 +87,7 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     if (!discover) return errRes(c, 501, ERR.API, '发现未接线')
     const body = await jsonBody(c)
     const key = isObj(body) ? field(body, 'key') : ''
-    const customID = isObj(body) ? field(body, 'id') : ''
+    const customName = isObj(body) ? field(body, 'name') : ''
     if (key === '') return errRes(c, 400, ERR.INVALID_REQUEST, 'key 必填')
     const found = (await discover.scan()).find((f) => f.key === key)
     if (!found) return errRes(c, 404, ERR.NOT_FOUND, `未发现 ${key}`)
@@ -113,18 +99,20 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
       return errRes(c, 500, ERR.API, '该发现项无采用草稿')
     }
     const p: Provider = cloneProvider(found.suggestedProvider)
-    if (customID !== '') p.id = customID
+    if (customName !== '') p.name = customName
+    p.providerId = 0
     const verr = providerValidate(p)
     if (verr) return errRes(c, 400, ERR.INVALID_REQUEST, verr)
-    const existing = providers.get(p.id)
-    if (existing) return ok(c, 200, existing) // 幂等：重复采用直接返回已有的
+    const existing = providers.getByName(p.name)
+    if (existing && existing.state !== 'deleted') return ok(c, 200, existing) // 幂等：重复采用直接返回已有的
 
     // 采用必须一并把登录态导入账号池，否则 Provider 只挂着一个空的环境变量引用
     // （apiKeyEnv=WB_TOKEN），进程里没这个变量、池子也是空的 → 请求不带 Authorization
     // 打到上游，被前置网关拦成 HTML 401，用户以为「上游鉴权失败」（issue #1）。
     // 与 quick-import 共用同一段逻辑，避免两条路径的凭据处理再次漂移。
     const warnings = applyCredentialDefaults(p)
-    const { warnings: importWarnings, imported } = importSuggestedAccounts(key, found.suggestedAccounts)
+    const { warnings: importWarnings, imported } =
+      importSuggestedAccounts(key, found.suggestedAccounts, p.providerId)
     warnings.push(...importWarnings)
     if (imported > 0) changed()
     providers.put(p)
@@ -167,6 +155,12 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     if (accounts.get(accountID)) {
       return errRes(c, 409, ERR.INVALID_REQUEST, `账号 ${accountID} 已存在`)
     }
+    // 归属：该 harness 已被哪个 Provider 接管（账号挂在它名下）。
+    const owner = providerOfFinding(key)
+    if (!owner) {
+      return errRes(c, 400, ERR.INVALID_REQUEST,
+        `还没有接管 ${key} 的 Provider，先「一键导入」采用它，再导账号`)
+    }
     // 服务端读 token → 写凭据文件（0600）→ 建 account（只存文件引用）。
     let token: string
     try {
@@ -183,7 +177,7 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     }
     const acct: Account = {
       id: accountID,
-      sourceId: key,
+      providerId: owner.providerId,
       displayName: displayName !== '' ? displayName : acct0.nickname,
       credential: { apiKeyFile: credentialFile },
       status: 'available',
@@ -218,14 +212,17 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     if (verr) return errRes(c, 400, ERR.INVALID_REQUEST, verr)
     let p: Provider
     let created: boolean
-    const existing = providers.get(suggested.id)
+    const existing = providers.getByName(suggested.name)
     if (existing) {
       p = existing
       created = false
     } else {
-      const sameSource = providers.list().find((q) => q.sourceId !== '' && q.sourceId === suggested.sourceId)
-      if (sameSource) {
-        p = sameSource
+      // 幂等第二层：同名且未删除的 Provider 已存在（用户之前手工建过）——
+      // 视为已接管，不重复建。
+      const named = providers.getByName(suggested.name)
+      const sameProvider = named && named.state !== 'deleted' ? named : undefined
+      if (sameProvider) {
+        p = sameProvider
         created = false
       } else {
         providers.put(suggested)
@@ -241,7 +238,7 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     // ③ 全量导入共存登录态（只导扫描结果里、活着的；按 token 内容去重；
     //    tokenPath 来自本次扫描结果，不收前端路径）。
     const { warnings: importWarnings, imported, skipped } =
-      importSuggestedAccounts(key, found.suggestedAccounts)
+      importSuggestedAccounts(key, found.suggestedAccounts, p.providerId)
     if (imported > 0) changed()
     warnings.push(...importWarnings)
 
@@ -272,7 +269,7 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
   // 把本次扫描到的共存登录态导入账号池（adopt 与 quick-import 共用）。
   // 只导活着的；tokenPath 一律取自扫描结果，不收前端传入的路径。
   function importSuggestedAccounts(
-    key: string, suggested: DiscoveredAccount[] | undefined,
+    key: string, suggested: DiscoveredAccount[] | undefined, ownerId: number,
   ): { warnings: string[]; imported: number; skipped: number } {
     const warnings: string[] = []
     let imported = 0
@@ -286,12 +283,12 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
         warnings.push(`${acc.nickname}：跳过（${(e as Error).message}）`)
         continue
       }
-      if (sourceAccountHasToken(key, tok)) {
+      if (sourceAccountHasToken(ownerId, tok)) {
         skipped++
         continue
       }
       // 同身份但 token 变了 = 登录态轮换：原位更新凭据文件，不另建新账号。
-      const same = findSameIdentity(key, acc.nickname)
+      const same = findSameIdentity(ownerId, acc.nickname)
       if (same && same.credential.apiKeyFile) {
         try {
           writeFile0600(same.credential.apiKeyFile, tok)
@@ -318,7 +315,7 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
         continue
       }
       accounts.put({
-        id, sourceId: key, displayName: acc.nickname,
+        id, providerId: ownerId, displayName: acc.nickname,
         credential: { apiKeyFile: credFile },
         status: 'available', fails: 0,
       })
@@ -327,10 +324,19 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     return { warnings, imported, skipped }
   }
 
-  // 同源账号池里是否已有这个 token（按凭据文件内容比对；读不了视为不重复）。
-  function sourceAccountHasToken(key: string, token: string): boolean {
+  // harness key → 已接管它的 Provider（未删除）。discover 的 key 是 harness 名
+  // （workbuddy / opencode-zen），而账号归属要的是 Provider.providerId。
+  function providerOfFinding(key: string, suggested?: Provider): Provider | undefined {
+    const byName = suggested ? providers.getByName(suggested.name) : undefined
+    if (byName && byName.state !== 'deleted') return byName
+    const hit = providers.getByName(key)
+    return hit && hit.state !== 'deleted' ? hit : undefined
+  }
+
+  // 同 Provider 账号池里是否已有这个 token（按凭据文件内容比对；读不了视为不重复）。
+  function sourceAccountHasToken(providerId: number, token: string): boolean {
     for (const acct of accounts.list()) {
-      if (acct.sourceId !== key || !acct.credential.apiKeyFile) continue
+      if (acct.providerId !== providerId || !acct.credential.apiKeyFile) continue
       try {
         if (readFileSync(acct.credential.apiKeyFile, 'utf8') === token) return true
       } catch {
@@ -340,10 +346,11 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     return false
   }
 
-  // 同源且显示名含昵称的账号（昵称是稳定身份，显示名可能带后缀，包含匹配）。
-  function findSameIdentity(key: string, nickname: string): Account | undefined {
+  // 同 Provider 且显示名含昵称的账号（昵称是稳定身份，显示名可能带后缀，包含匹配）。
+  function findSameIdentity(providerId: number, nickname: string): Account | undefined {
     if (nickname === '') return undefined
-    return accounts.list().find((a) => a.sourceId === key && (a.displayName ?? '').includes(nickname))
+    return accounts.list().find(
+      (a) => a.providerId === providerId && (a.displayName ?? '').includes(nickname))
   }
 }
 

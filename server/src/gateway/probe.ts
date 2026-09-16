@@ -67,10 +67,11 @@ export function freeAmong(ids: string[]): string[] {
   return ids.filter((id) => looksFree(id))
 }
 
-// 从客户端本地痕迹发现模型（按 source 分派）：当前为桩实现（恒返回空，
+// 从客户端本地痕迹发现模型（按 Provider 名分派）：当前为桩实现（恒返回空，
 // 调用方回落本地配置）；workbuddy 痕迹发现由 cli 层经 discoverLocal 参数注入（见 cli.ts runServe）。
-export function discoverLocalModels(sourceID: string): string[] {
-  void sourceID
+// 参数是 Provider 名（不是内部 id）：分派依据是"这是哪个上游"，而名字才是它。
+export function discoverLocalModels(providerName: string): string[] {
+  void providerName
   return []
 }
 
@@ -90,13 +91,13 @@ export class Probe {
   private up: Upstream
   private usage: UsageWriter | null
   private accounts: AccountPool | null
-  private discoverLocal: (sourceID: string) => string[]
+  private discoverLocal: (providerName: string) => string[]
   constructor(
     sched: Scheduler,
     up: Upstream,
     usage: UsageWriter | null,
     accounts: AccountPool | null = null,
-    discoverLocal: (sourceID: string) => string[] = discoverLocalModels,
+    discoverLocal: (providerName: string) => string[] = discoverLocalModels,
   ) {
     this.sched = sched
     this.up = up
@@ -107,10 +108,10 @@ export class Probe {
 
   // 对指定 Provider 打一次最小真实流式请求（首段文本 + 首字延迟回显）。
   // 锁定单个 Provider，不换源；任何失败都如实返回，不抛错。
-  async probeProvider(id: string): Promise<ProbeResult> {
+  async probeProvider(providerId: number): Promise<ProbeResult> {
     const fail = (error: string, latencyMs: number): ProbeResult => ({ ok: false, error, latencyMs })
-    const found = this.sched.providers().find((p) => p.id === id)
-    if (!found) return fail(`provider ${id} 不存在`, 0)
+    const found = this.sched.providers().find((p) => p.providerId === providerId)
+    if (!found) return fail(`provider #${providerId} 不存在`, 0)
     let bare = found.probeModel ?? ''
     if (!bare) {
       for (const m of found.models) {
@@ -122,7 +123,7 @@ export class Probe {
     const pr = await this.probeWithProtocols(pv, bare)
     if (!pr.ok) return fail('上游错误: ' + pr.error, pr.latencyMs ?? 0)
     return {
-      ok: true, model: `${found.sourceId}/${bare}`, protocol: pr.protocol,
+      ok: true, model: `${found.name}/${bare}`, protocol: pr.protocol,
       text: pr.text, latencyMs: pr.latencyMs,
     }
   }
@@ -134,8 +135,8 @@ export class Probe {
     const fail = (error: string): ProbeResult => ({ ok: false, error, latencyMs: 0 })
     const acct = this.accounts?.get(accountID)
     if (!acct) return fail(`账号 ${accountID} 不存在`)
-    const p = this.sched.providers().find((x) => x.sourceId === acct.sourceId)
-    if (!p) return fail(`账号 ${accountID} 所属源 ${acct.sourceId} 没有可用的 Provider`)
+    const p = this.sched.providers().find((x) => x.providerId === acct.providerId)
+    if (!p) return fail(`账号 ${accountID} 归属 Provider #${acct.providerId} 不存在`)
     const bare = modelID || p.probeModel || p.models.find((m) => m.enabled)?.id || ''
     if (!bare) return fail('该源没有可测模型：先到 Provider 页获取模型列表')
     const pv: Provider = { ...p, credential: acct.credential }
@@ -144,13 +145,13 @@ export class Probe {
     // kind 一并传下去：quota 走 exhausted（不自动恢复），其余走定时冷却。
     this.accounts?.markResult(accountID, pr.ok, cooldownFor(pr.kind ?? 'unknown'), new Date(), pr.ok ? '' : (pr.kind ?? ''))
     if (!pr.ok) return fail('上游错误: ' + pr.error)
-    return { ok: true, model: `${acct.sourceId}/${bare}`, protocol: pr.protocol, text: pr.text, latencyMs: pr.latencyMs }
+    return { ok: true, model: `${p.name}/${bare}`, protocol: pr.protocol, text: pr.text, latencyMs: pr.latencyMs }
   }
 
   // 批量实测候选模型：并发打最小真实请求，逐个报告可用性。空列表时用已配置的启用模型。
-  async probeModels(id: string, models: string[]): Promise<ModelProbe[]> {
-    const found = this.sched.providers().find((p) => p.id === id)
-    if (!found) return [{ model: '', ok: false, error: `provider ${id} 不存在` }]
+  async probeModels(providerId: number, models: string[]): Promise<ModelProbe[]> {
+    const found = this.sched.providers().find((p) => p.providerId === providerId)
+    if (!found) return [{ model: '', ok: false, error: `provider #${providerId} 不存在` }]
     if (models.length === 0) {
       models = found.models.filter((m) => m.enabled).map((m) => m.id)
     }
@@ -185,7 +186,7 @@ export class Probe {
       if (r.ok) {
         // 只记最终采用的那次（试错过程不记账，避免一次测试记出多条）。
         void this.usage?.insertLog({ ...r.ul, status: 'ok', latencyMs: r.firstMs })
-        rememberProtocol(pv.id, modelID, proto) // 探到即记住，转发直达
+        rememberProtocol(pv.name, modelID, proto) // 探到即记住，转发直达
         return { model: modelID, ok: true, protocol: proto, text: r.text, latencyMs: r.firstMs }
       }
       lastErr = r.error
@@ -210,7 +211,7 @@ export class Probe {
     if (!this.accounts) return p
     const now = new Date()
     const acct = this.accounts.snapshot().find(
-      (a) => a.sourceId === p.sourceId && accountEffectiveStatus(a, now) === 'available')
+      (a) => a.providerId === p.providerId && accountEffectiveStatus(a, now) === 'available')
     return acct ? { ...p, credential: acct.credential } : p
   }
 
@@ -224,7 +225,7 @@ export class Probe {
     const ms = () => Date.now() - t0
     const ul: UsageLog = {
       id: 0, ts: new Date(t0), requestId: requestID(),
-      sourceId: pv.sourceId, providerId: pv.id, modelId: bare, stream: true,
+      providerId: pv.providerId, providerName: pv.name, modelId: bare, stream: true,
       inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0,
       reasoningTokens: 0, totalTokens: 0, accuracy: 'unknown', latencyMs: 0, status: 'ok',
     }
@@ -286,9 +287,9 @@ export class Probe {
 
   // 拉取指定 Provider 的模型目录：先问上游实时列表；失败（无接口/网络/鉴权等）
   // 则回落本地配置/客户端痕迹。
-  async listProviderModels(id: string): Promise<ModelList> {
-    const p = this.sched.providers().find((x) => x.id === id)
-    if (!p) throw new UpstreamError(0, 'bad_request', `provider ${id} 不存在`)
+  async listProviderModels(providerId: number): Promise<ModelList> {
+    const p = this.sched.providers().find((x) => x.providerId === providerId)
+    if (!p) throw new UpstreamError(0, 'bad_request', `provider #${providerId} 不存在`)
     try {
       const [ids, declared, caps] = await this.up.fetchModelsWithProtocols(p)
       const protos: Record<string, string> = { ...declared }
@@ -301,7 +302,7 @@ export class Probe {
         if (m) {
           if (m.api) protos[mid] = m.api // 模型目录里已存的（扫描/采纳写入，落库）
           else {
-            const got = autoProtocol(p.id, mid)
+            const got = autoProtocol(p.name, mid)
             if (got) protos[mid] = got // 进程内探测缓存
           }
           if ((m.input?.length ?? 0) > 0 || (m.contextWindow ?? 0) > 0) {
@@ -312,7 +313,7 @@ export class Probe {
           }
           continue
         }
-        const got = autoProtocol(p.id, mid)
+        const got = autoProtocol(p.name, mid)
         if (got) protos[mid] = got
       }
       return { models: ids, source: 'upstream', protocols: protos, free: freeAmong(ids), caps: outCaps }
@@ -321,10 +322,10 @@ export class Probe {
       const protos2: Record<string, string> = {}
       for (const m of p.models) {
         if (m.enabled && m.api) { protos2[m.id] = m.api; continue }
-        const got = autoProtocol(p.id, m.id)
+        const got = autoProtocol(p.name, m.id)
         if (got) protos2[m.id] = got
       }
-      const fromTrace = this.discoverLocal(p.sourceId)
+      const fromTrace = this.discoverLocal(p.name)
       const models = [...fromTrace]
       const seen = new Set(fromTrace)
       let addedFromConfig = false
@@ -370,7 +371,7 @@ function pinModelProtocol(models: Provider['models'], modelID: string, proto: st
   const out = models.map((m) => ({ ...m }))
   const found = out.find((m) => m.id === modelID)
   if (found) found.api = proto
-  else out.push({ id: modelID, providerId: '', api: proto, manual: false, enabled: true })
+  else out.push({ id: modelID, api: proto, manual: false, enabled: true })
   return out
 }
 

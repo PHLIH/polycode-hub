@@ -96,6 +96,42 @@ interface LockedUpstream {
   acctId: string
 }
 
+// 候选为空的诊断文案。
+//
+// 用户最容易踩的坑是「Provider 改名 / 删除后，客户端里还配着旧前缀」——那时泛泛
+// 说一句「无可用 Provider」等于没说：用户手里明明有个能用的 Provider，却不知道
+// 该改哪里。所以这里按前缀逐个查证，把真实原因点名（包括"这个名字属于已删除的
+// Provider"），并给出下一步动作。
+export function noCandidateMessage(modelRef: string, providers: Provider[]): string {
+  const i = modelRef.indexOf('/')
+  const prefix = i > 0 ? modelRef.slice(0, i) : ''
+  const bare = i > 0 ? modelRef.slice(i + 1) : modelRef
+  if (prefix === '') {
+    if (providers.length === 0) return `模型 ${modelRef} 无可用 Provider（还没有配置任何 Provider）`
+    return `模型 ${modelRef} 无可用 Provider：没有哪个来源声明了它`
+      + `（到 Providers 页拉取上游模型列表并勾选采用）`
+  }
+  const sameName = providers.filter((p) => p.name === prefix)
+  const byState = (st: Provider['state']) => sameName.filter((p) => p.state === st)
+  const ids = (ps: Provider[]) => ps.map((p) => `#${p.providerId}`).join('、')
+  const active = byState('active')
+  if (active.length > 0) {
+    return `Provider「${prefix}」（${ids(active)}）没有声明模型 ${bare}`
+      + `（或该项未勾选采用；也可能被风险上限/上下文预检排除）`
+  }
+  const deleted = byState('deleted')
+  if (deleted.length > 0) {
+    return `Provider「${prefix}」已删除（${ids(deleted)}），前缀 ${prefix}/ 已失效。`
+      + `若刚重建了同名来源，请确认它已启用；否则用 GET /v1/models 查当前可用的模型 ID`
+  }
+  const paused = byState('paused')
+  if (paused.length > 0) {
+    return `Provider「${prefix}」已暂停（${ids(paused)}），到 Providers 页打开开关即可恢复`
+  }
+  return `未知的 Provider 前缀「${prefix}」（请求的模型：${modelRef}）。`
+    + `用 GET /v1/models 查看当前可用的模型 ID`
+}
+
 export class Proxy {
   // 转发门面：入站编解码 → 调度换源 → 上游流 → 出站解析 → SSE 回写。
   // 单例常驻（构造时注入 cfg/sched/up/usage；账号池经 setAccountPool 后挂）。
@@ -139,11 +175,11 @@ export class Proxy {
 
   // handleHealth：apps 只数启用中的 Provider —— 监控要看的是"真能用的有几个"。
   private handleHealth(c: Context): Response {
-    const apps = this.sched.providers().filter((p) => p.enabled).length
+    const apps = this.sched.providers().filter((p) => p.state === 'active').length
     return c.json({ ok: true, apps })
   }
 
-  // 返回可用模型目录（OpenAI {"data":[{id}]} 形态，id 为限定名 sourceId/modelId）。
+  // 返回可用模型目录（OpenAI {"data":[{id}]} 形态，id 为限定名 providerId/modelId）。
   private handleModels(c: Context): Response {
     const key = this.cfg.gateway.gatewayKey
     if (key && !bearerMatch(c.req.header('authorization'), key)) {
@@ -151,9 +187,9 @@ export class Proxy {
     }
     const out: { id: string; object: string; owned_by: string }[] = []
     for (const p of this.sched.providers()) {
-      if (!p.enabled) continue
+      if (p.state !== 'active') continue
       for (const m of p.models) {
-        if (m.enabled) out.push({ id: `${p.sourceId}/${m.id}`, object: 'model', owned_by: p.sourceId })
+        if (m.enabled) out.push({ id: `${p.name}/${m.id}`, object: 'model', owned_by: p.name })
       }
     }
     return Response.json({ object: 'list', data: out })
@@ -182,7 +218,7 @@ export class Proxy {
     const cands = this.sched.pickOrder(irReq.model, estimate, this.cfg.gateway.precheckContext, irReq.stream)
     if (cands.length === 0) {
       return writeIrError(inb, irError(ERR.NOT_FOUND,
-        `模型 ${irReq.model} 无可用 Provider（未声明或全部被风险上限/上下文预检排除）`))
+        noCandidateMessage(irReq.model, this.sched.providers())))
     }
     // 限定名剥前缀：上游只认裸模型名；用量记账按裸名归一。
     const split = this.sched.splitRef(irReq.model)
@@ -201,7 +237,7 @@ export class Proxy {
     // 首字节闸门尚未过：forward() 会先等首个真实事件再承诺 200，此后才禁止换源）。
     const attempt = async (pv: Provider, acct: Account | null): Promise<boolean> => {
       const pvv: Provider = acct ? { ...pv, credential: acct.credential } : { ...pv } // 账号 JWT 覆盖 Provider 凭据
-      const [m] = this.sched.modelOf(pv.id, irReq.model)
+      const [m] = this.sched.modelOf(pv.providerId, irReq.model)
       if (m.egress) pvv.egress = m.egress // 模型级出口覆盖 Provider 级（未声明的模型继承 Provider）
       try {
         const stream = await this.up.stream(pvv, irReq)
@@ -216,16 +252,16 @@ export class Proxy {
         if (acct) {
           this.accounts!.markResult(acct.id, false, cooldownFor(ue.kind), new Date(), ue.kind)
           if (ue.kind === UPSTREAM.AUTH) {
-            console.error(`账号鉴权失败已冷却，疑似凭据过期，请重登后用 POST /admin/api/accounts/{id}/recheck 恢复 account=${acct.id} source=${pvv.sourceId}`)
+            console.error(`账号鉴权失败已冷却，疑似凭据过期，请重登后用 POST /admin/api/accounts/{id}/recheck 恢复 account=${acct.id} provider=${pvv.name}`)
           }
         }
-        console.warn(`上游失败，尝试换源 provider=${pv.id} account=${acct?.id ?? '-'} kind=${ue.kind} status=${ue.status} err=${ue.message}`)
+        console.warn(`上游失败，尝试换源 provider=${pv.name} account=${acct?.id ?? '-'} kind=${ue.kind} status=${ue.status} err=${ue.message}`)
         return false // 首字节前：允许换源
       }
     }
 
     for (const pv of cands) {
-      if (!this.accounts || !this.accounts.hasFor(pv.sourceId)) {
+      if (!this.accounts || !this.accounts.hasFor(pv.providerId)) {
         if (await attempt(pv, null)) break
         continue
       }
@@ -233,7 +269,7 @@ export class Proxy {
       for (let i = 0; i < cands.length + 1; i++) {
         let acct: Account
         try {
-          acct = this.accounts.pick(pv.sourceId, new Date())
+          acct = this.accounts.pick(pv.providerId, new Date())
         } catch {
           break // 全冷却
         }
@@ -250,7 +286,7 @@ export class Proxy {
       const last = cands[cands.length - 1]!
       this.logUsage({
         id: 0, ts: new Date(start), requestId: requestID(),
-        sourceId: last.sourceId, providerId: last.id, modelId: irReq.model, stream: irReq.stream,
+        providerId: last.providerId, providerName: last.name, modelId: irReq.model, stream: irReq.stream,
         accountId: lastAcctId,
         inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0,
         reasoningTokens: 0, totalTokens: 0, accuracy: 'unknown', latencyMs: 0, status: 'ok',
@@ -264,7 +300,7 @@ export class Proxy {
 
   // 指定账号转发（x-polycode-account）：直接走该账号，失败即报错，
   // 禁止静默回退到轮询（否则用户以为走的是指定账号）。
-  // 4xx 语义：账号不存在 → 404；source 不匹配 → 400；冷却中 → 429。
+  // 4xx 语义：账号不存在 → 404；归属 Provider 不匹配 → 400；冷却中 → 429。
   private async servePinned(
     inb: InboundCodec, p: Protocol,
     irReq: import('../ir/index.ts').IrRequest, start: number,
@@ -275,10 +311,10 @@ export class Proxy {
       return writeIrErrorStatus(inb,
         irError(ERR.NOT_FOUND, `指定账号 ${pinnedId} 不存在`), 404)
     }
-    const targets = cands.filter((pv) => pv.sourceId === acct.sourceId)
+    const targets = cands.filter((pv) => pv.providerId === acct.providerId)
     if (targets.length === 0) {
       return writeIrErrorStatus(inb, irError(ERR.INVALID_REQUEST,
-        `指定账号 ${pinnedId} 归属源 ${acct.sourceId}，与请求模型可用的 Provider 不匹配（不换号）`), 400)
+        `指定账号 ${pinnedId} 归属 Provider #${acct.providerId}，与请求模型可用的 Provider 不匹配（不换号）`), 400)
     }
     if (accountEffectiveStatus(acct, new Date()) !== 'available') {
       return writeIrErrorStatus(inb,
@@ -287,7 +323,7 @@ export class Proxy {
     // 同源多个 Provider 命中时取第一个（与轮询路径的候选顺序一致）。
     const pv = targets[0]!
     const pvv: Provider = { ...pv, credential: acct.credential }
-    const [m] = this.sched.modelOf(pv.id, irReq.model)
+    const [m] = this.sched.modelOf(pv.providerId, irReq.model)
     if (m.egress) pvv.egress = m.egress
     let stream: ReadableStream<Uint8Array>
     try {
@@ -298,12 +334,12 @@ export class Proxy {
         : new UpstreamError(0, UPSTREAM.UNKNOWN, (err as Error).message)
       this.accounts!.markResult(acct.id, false, cooldownFor(ue.kind), new Date(), ue.kind)
       if (ue.kind === UPSTREAM.AUTH) {
-        console.error(`账号鉴权失败已冷却，疑似凭据过期，请重登后用 POST /admin/api/accounts/{id}/recheck 恢复 account=${acct.id} source=${pvv.sourceId}`)
+        console.error(`账号鉴权失败已冷却，疑似凭据过期，请重登后用 POST /admin/api/accounts/{id}/recheck 恢复 account=${acct.id} provider=${pvv.name}`)
       }
       // 指定账号的失败账：归因该账号（tokens 为 0），不换号。
       this.logUsage({
         id: 0, ts: new Date(start), requestId: requestID(),
-        sourceId: pvv.sourceId, providerId: pv.id, modelId: irReq.model, stream: irReq.stream,
+        providerId: pv.providerId, providerName: pv.name, modelId: irReq.model, stream: irReq.stream,
         accountId: acct.id,
         inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0,
         reasoningTokens: 0, totalTokens: 0, accuracy: 'unknown', latencyMs: 0, status: 'ok',
@@ -336,8 +372,7 @@ export class Proxy {
       id: 0,
       ts: new Date(start),
       requestId: requestID(),
-      sourceId: pv.sourceId,
-      providerId: pv.id,
+      providerId: pv.providerId, providerName: pv.name,
       accountId: acctId, // 归因到账号（空 = Provider 级凭据）
       modelId: irReq.model,
       stream: irReq.stream,
@@ -403,7 +438,7 @@ export class Proxy {
           try {
             evs = sp.feed(value)
           } catch (ferr) {
-            console.warn(`上游流解析异常 provider=${pv.id} err=${(ferr as Error).message}`)
+            console.warn(`上游流解析异常 provider=${pv.name} err=${(ferr as Error).message}`)
           }
           // 心跳注释行不算首字节：上游可能一直发 `: keep-alive` 却从不给数据。
           if (evs.length > 0) { firstChunk = value; pendingEvents = evs; break }
@@ -423,7 +458,7 @@ export class Proxy {
         const msg = timedOut
           ? `上游未在 ${Math.round(timeoutMs / 1000)}s 内返回首字节（已掐断）`
           : '上游未返回任何内容就结束了连接'
-        console.warn(`上游首字节失败 provider=${pv.id} account=${acctId || '-'} ${msg}`)
+        console.warn(`上游首字节失败 provider=${pv.name} account=${acctId || '-'} ${msg}`)
         const irErr = mapUpstreamError(new UpstreamError(0, ul.errorKind, msg))
         return writeIrErrorStatus(inb, irErr, irErr.httpStatus)
       }
@@ -489,7 +524,7 @@ export class Proxy {
               try {
                 evs = sp.feed(value)
               } catch (ferr) {
-                console.warn(`上游流解析异常 provider=${pv.id} err=${(ferr as Error).message}`)
+                console.warn(`上游流解析异常 provider=${pv.name} err=${(ferr as Error).message}`)
                 evs = []
               }
               emit(evs)
@@ -504,17 +539,17 @@ export class Proxy {
         if (timedOut) {
           const secs = Math.round(this.cfg.gateway.streamIdleTimeoutMs / 1000)
           upErr = new Error(`上游流中途静默超时（${secs}s 无新数据）`)
-          console.warn(`上游超时掐断 provider=${pv.id} account=${acctId || '-'}`)
+          console.warn(`上游超时掐断 provider=${pv.name} account=${acctId || '-'}`)
         }
         try {
           emit(sp.finish())
         } catch (ferr) {
-          console.warn(`上游流收尾解析异常 provider=${pv.id} err=${(ferr as Error).message}`)
+          console.warn(`上游流收尾解析异常 provider=${pv.name} err=${(ferr as Error).message}`)
         }
 
         // 上游中途断流：换源闸门已过（首字节已吐），只能补发 error 帧并收尾。
         if (upErr && !clientErr) {
-          console.warn(`上游流中断 provider=${pv.id} err=${upErr.message}`)
+          console.warn(`上游流中断 provider=${pv.name} err=${upErr.message}`)
           emit([
             { type: 'error', error: irError(ERR.API, '上游连接中断: ' + upErr.message) },
             { type: 'message_stop' },

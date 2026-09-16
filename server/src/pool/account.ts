@@ -14,10 +14,10 @@ export class ErrNoAccount extends Error {
 }
 
 export class AccountPool {
-  // 同源账号的加权轮询与冷却：pick 只给可用者，markResult 按 kind 惩罚，
+  // 同 Provider 账号的加权轮询与冷却：pick 只给可用者，markResult 按 kind 惩罚，
   // 冷却到期自动复位。惩罚经 Persister 落盘（cli 注入写回 admin_accounts）。
   private accounts: Account[]
-  private rr = new Map<string, number>() // sourceID → 加权轮询计数（单调递增，总权重取模）
+  private rr = new Map<number, number>() // providerId → 加权轮询计数（单调递增，总权重取模）
   // 惩罚状态回写存储（fails/cooldownUntil）。未注入则不落盘（测试/只读场景照旧）。
   private persist: Persister = noPersist
 
@@ -26,22 +26,22 @@ export class AccountPool {
     this.persist = persist
   }
 
-  // 报告该源是否配置了账号（哪怕全部冷却）：
-  // 供调度区分「无账号 → 走 Provider 凭据」与「有账号但全冷却 → 跳过该源」。
-  hasFor(sourceID: string): boolean {
-    return this.accounts.some((a) => a.sourceId === sourceID)
+  // 报告该 Provider 是否配置了账号（哪怕全部冷却）：
+  // 供调度区分「无账号 → 走 Provider 凭据」与「有账号但全冷却 → 跳过该 Provider」。
+  hasFor(providerId: number): boolean {
+    return this.accounts.some((a) => a.providerId === providerId)
   }
 
-  // 加权轮询返回 sourceID 下一个可用账号（权重按 Account.weight，缺省/<=0 按 1）。
+  // 加权轮询返回该 Provider 下一个可用账号（权重按 Account.weight，缺省/<=0 按 1）。
   // 跳过 disabled/exhausted/冷却未到期者；冷却到期自动复位。
   // 关/失效的账号不在 eligible 里，分母是可用者的权重和——自动重算，不用手动调。
-  // 无可用账号时抛 ErrNoAccount（调度器据此换源/报错，不静默等待）。
-  pick(sourceID: string, now: Date): Account {
-    const eligible = this.eligible(this.accounts.filter((a) => a.sourceId === sourceID), now)
+  // 无可用账号时抛 ErrNoAccount（调度器据此换 Provider/报错，不静默等待）。
+  pick(providerId: number, now: Date): Account {
+    const eligible = this.eligible(this.accounts.filter((a) => a.providerId === providerId), now)
     if (eligible.length === 0) throw new ErrNoAccount()
     const total = eligible.reduce((s, a) => s + weightOf(a), 0)
-    const idx = (this.rr.get(sourceID) ?? -1) + 1
-    this.rr.set(sourceID, idx)
+    const idx = (this.rr.get(providerId) ?? -1) + 1
+    this.rr.set(providerId, idx)
     let slot = idx % total
     for (const a of eligible) {
       slot -= weightOf(a)
