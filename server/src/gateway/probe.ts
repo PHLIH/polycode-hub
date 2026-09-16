@@ -63,6 +63,21 @@ function retryableProbeErr(err: unknown): boolean {
   return kind === 'rate_limit' || kind === 'quota' || kind === 'server' || kind === 'network'
 }
 
+// 非法 providerId 的最后一道防线（NaN / undefined / 非正整数）。
+//
+// 背景：这三个探针原先只用 `===` 查找。NaN 与任何值都不相等（连它自己都不等），
+// 所以查找必然落空，报错再用模板字面量把 NaN 渲染成「provider #NaN 不存在」——
+// 排查时看不出是谁传错了，还会被读成「Provider 被删了」。历史上前端误传 .id
+// 时这里吐出的是 `#undefined`（见 Providers.vue 的修复）。管理面现在都先查库
+// 再传真实 id，这里兜住绕过管理面的直接调用。
+// 返回错误文案；id 合法时返回空串。
+function badProviderID(providerId: number): string {
+  if (typeof providerId !== 'number' || !Number.isInteger(providerId) || providerId <= 0) {
+    return `provider #${String(providerId)} 不存在`
+  }
+  return ''
+}
+
 export function freeAmong(ids: string[]): string[] {
   return ids.filter((id) => looksFree(id))
 }
@@ -110,6 +125,8 @@ export class Probe {
   // 锁定单个 Provider，不换源；任何失败都如实返回，不抛错。
   async probeProvider(providerId: number): Promise<ProbeResult> {
     const fail = (error: string, latencyMs: number): ProbeResult => ({ ok: false, error, latencyMs })
+    const bad = badProviderID(providerId)
+    if (bad) return fail(bad, 0)
     const found = this.sched.providers().find((p) => p.providerId === providerId)
     if (!found) return fail(`provider #${providerId} 不存在`, 0)
     let bare = found.probeModel ?? ''
@@ -150,6 +167,8 @@ export class Probe {
 
   // 批量实测候选模型：并发打最小真实请求，逐个报告可用性。空列表时用已配置的启用模型。
   async probeModels(providerId: number, models: string[]): Promise<ModelProbe[]> {
+    const bad = badProviderID(providerId)
+    if (bad) return [{ model: '', ok: false, error: bad }]
     const found = this.sched.providers().find((p) => p.providerId === providerId)
     if (!found) return [{ model: '', ok: false, error: `provider #${providerId} 不存在` }]
     if (models.length === 0) {
@@ -288,6 +307,11 @@ export class Probe {
   // 拉取指定 Provider 的模型目录：先问上游实时列表；失败（无接口/网络/鉴权等）
   // 则回落本地配置/客户端痕迹。
   async listProviderModels(providerId: number): Promise<ModelList> {
+    // 注意契约：这里是三个探针里唯一抛错的一个（另两个返回 ok:false / results[]）。
+    // 调用方（api.ts 的 GET /providers/:pid/models）先查库，所以走到这里的非法 id
+    // 只会来自绕过管理面的直接调用；仍然如实抛，但文案里带上原始值。
+    const bad = badProviderID(providerId)
+    if (bad) throw new UpstreamError(0, 'bad_request', bad)
     const p = this.sched.providers().find((x) => x.providerId === providerId)
     if (!p) throw new UpstreamError(0, 'bad_request', `provider #${providerId} 不存在`)
     try {

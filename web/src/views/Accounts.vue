@@ -207,7 +207,15 @@ onMounted(load)
 const groups = computed(() => {
   const bySource = {}
   for (const a of list.value) (bySource[String(a.providerId)] ||= []).push(a)
-  const ids = [...new Set([...sourceOptions.value, ...Object.keys(bySource)])]
+  // 分组键一律是 providerId 字符串（账号归属本来就是 providerId），显示名经 nameById 映射。
+  // 以前这里把 sourceOptions（Provider 名）和 id 字符串混进同一个数组：有账号的分组键是 "3"，
+  // 分组头的「＋添加账号」就把 "3" 当 providerName 预填 → 保存 400「没有名为 3 的 Provider」，
+  // 同一个 Provider 还会裂��「3」和「orcarouter」两组（一组有账号、一组假空）。
+  const keys = new Set(Object.keys(bySource))
+  for (const p of providers.value) {
+    if (p.state !== 'deleted') keys.add(String(p.providerId))
+  }
+  const ids = [...keys]
   const cmp = (a, b) =>
     ((hOf(b) || {}).errorRate || 0) - ((hOf(a) || {}).errorRate || 0) ||
     ((hOf(b) || {}).requests || 0) - ((hOf(a) || {}).requests || 0)
@@ -238,6 +246,12 @@ const siblingProviders = computed(() => (form.providerName ? [form.providerName]
 function providersOf(groupKey) {
   const n = nameById.value.get(String(groupKey))
   return n ? [n] : []
+}
+
+// 分组头显示名：正常是 Provider 名；归属的 Provider 已被物理删除（providerId = -1）
+// 时给人话，而不是把 "-1" 当名字打在标题上。
+function groupLabel(key) {
+  return nameById.value.get(String(key)) || (String(key) === '-1' ? '（Provider 已删除）' : String(key))
 }
 
 // 展开查看健康详情（自绘深色，替代 el-table 的白色展开行）
@@ -369,7 +383,7 @@ async function setWeight(a, v) {
   <!-- 账号按归属 Provider 分组：加账号 = 往某个 Provider 下面加，providerId 预绑定 -->
   <section v-for="g in groups" :key="g.id" class="src">
     <header class="src-head">
-      <h3>{{ providersOf(g.id)[0] || g.id }}</h3>
+      <h3>{{ groupLabel(g.id) }}</h3>
       <span v-if="nameById.get(String(g.id))" class="mono pid-h">#{{ g.id }}</span>
       <span class="src-count num">{{ g.accounts.length }} 个账号</span>
       <!-- 名下账号接管该 Provider 鉴权（见 siblingProviders 注释）：有账号时必须说清楚，
@@ -379,7 +393,9 @@ async function setWeight(a, v) {
         接管 {{ providersOf(g.id).join('、') }} 的鉴权
       </span>
       <span class="grow"></span>
-      <button class="btn" @click="openCreate(g.id)">＋ 添加账号</button>
+      <!-- 分组键是 providerId，弹窗要的是 Provider 名：这里显式映射一次。
+           查不到名字（Provider 已删除）就留空，让用户在下拉里自己选，不要把 id 当名字填进去。 -->
+      <button class="btn" @click="openCreate(nameById.get(String(g.id)) || '')">＋ 添加账号</button>
     </header>
 
     <p v-if="!g.accounts.length" class="src-empty">这个源下面还没有账号，点「添加账号」把 API Key 挂进来。</p>

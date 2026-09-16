@@ -1039,28 +1039,66 @@ describe('recheck 恢复键（对齐 Go TestAccountRecheck）', () => {
 // ---- test / models / scan / protocol ----
 
 describe('test/models/scan/protocol 端点（Probe 接口打桩）', () => {
-  test('test：打通回显文本；未接线 501', async () => {
-    const ok = caller(build({ prober: new StubProber({ ok: true, model: 'zcode/glm-5', text: 'hi', latencyMs: 320 }) }))
+  test('test：打通回显文本；不存在 404；未接线 501', async () => {
+    // 夹具必须预置 provider 1：探测类端点现在先查库再打上游，
+    // 「不存在的 Provider」应当是 404，而不是 200 + {ok:false}。
+    const p1 = mkProvider({ name: 'p1', providerId: 1 })
+    const ok = caller(build({
+      providers: [p1],
+      prober: new StubProber({ ok: true, model: 'zcode/glm-5', text: 'hi', latencyMs: 320 }),
+    }))
     const res = await ok('POST', '/admin/api/providers/1/test', { key: 'secret' })
     expect(res.status).toBe(200)
     expect(await res.json()).toMatchObject({ ok: true, text: 'hi', latencyMs: 320 })
+
+    // 回归：不存在 / 非法 pid 曾返回 200 + {ok:false,error:"provider #NaN 不存在"}
+    const missing = await ok('POST', '/admin/api/providers/99999/test', { key: 'secret' })
+    expect(missing.status).toBe(404)
+    expect(await missing.json()).toMatchObject({ error: { message: 'provider #99999 不存在' } })
 
     const unwired = caller(build())
     expect((await unwired('POST', '/admin/api/providers/1/test', { key: 'secret' })).status).toBe(501)
   })
 
-  test('models：透出上游列表；listler 报错 502；未接线 501', async () => {
+  test('models：透出上游列表；不存在 404；listler 报错 502；未接线 501', async () => {
     const list: ModelList = { models: ['glm-5', 'glm-6'], source: 'upstream' }
-    const wired = caller(build({ lister: new StubLister(list) }))
+    const p1 = mkProvider({ name: 'p1', providerId: 1 })
+    const wired = caller(build({ providers: [p1], lister: new StubLister(list) }))
     const res = await wired('GET', '/admin/api/providers/1/models', { key: 'secret' })
     expect(res.status).toBe(200)
     expect(await res.json()).toMatchObject({ models: ['glm-5', 'glm-6'], source: 'upstream' })
 
-    const err = caller(build({ lister: new StubLister(undefined, '上游不支持模型列表') }))
+    // 「上游挂了」= 502，「没有这个 Provider」= 404：两者必须分得开，
+    // 否则前端只能把不存在的 Provider 提示成"拉不到列表，请手填模型"。
+    const err = caller(build({ providers: [p1], lister: new StubLister(undefined, '上游不支持模型列表') }))
     expect((await err('GET', '/admin/api/providers/1/models', { key: 'secret' })).status).toBe(502)
+
+    const missing = caller(build({ lister: new StubLister(list) }))
+    const missRes = await missing('GET', '/admin/api/providers/99999/models', { key: 'secret' })
+    expect(missRes.status).toBe(404)
+    expect(await missRes.json()).toMatchObject({ error: { message: 'provider #99999 不存在' } })
 
     const unwired = caller(build())
     expect((await unwired('GET', '/admin/api/providers/1/models', { key: 'secret' })).status).toBe(501)
+  })
+
+  test('非法 pid（NaN/undefined/非整数）：一律 404 且原样回显，不落到存储层', async () => {
+    // 回归锚点：前端误传 .id 时曾打出 /providers/undefined/...，后端 Number() 化后
+    // 变成 NaN 继续往下传，报错成了「provider #NaN 不存在」，排查时看不出是谁传错了。
+    const call = caller(build({
+      providers: [mkProvider({ name: 'p1', providerId: 1 })],
+      prober: new StubProber({ ok: true, text: 'x' }),
+      lister: new StubLister({ models: ['m'], source: 'upstream' }),
+      modelProber: new StubModelProber([]),
+    }))
+    for (const raw of ['abc', 'undefined', 'NaN', '0', '-1', '5.5']) {
+      const r = await call('GET', `/admin/api/providers/${raw}/models`, { key: 'secret' })
+      expect(r.status).toBe(404)
+      // 必须回显原始串（而不是 Number 后的 NaN）：这是排查"谁传错了"的唯一线索
+      expect(await r.json()).toMatchObject({ error: { message: `provider #${raw} 不存在` } })
+    }
+    // 合法但不存在：同样是 404
+    expect((await call('GET', '/admin/api/providers/99999/models', { key: 'secret' })).status).toBe(404)
   })
 
   test('scan：回传结果并把探到的协议写回模型目录', async () => {

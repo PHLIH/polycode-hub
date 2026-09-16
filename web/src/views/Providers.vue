@@ -348,11 +348,11 @@ async function removeClash() {
 async function refreshTarget(id) {
   try {
     const fresh = await api.providers()
-    const found = (fresh || []).find(x => x.id === id)
+    const found = (fresh || []).find(x => x.providerId === id)
     if (!found) return
     modelsTarget.value = found
     // 就地更新列表里那一行：换掉对象即可（key 稳定，卡片展开态不丢）
-    const i = list.value.findIndex(x => x.id === id)
+    const i = list.value.findIndex(x => x.providerId === id)
     if (i >= 0) list.value.splice(i, 1, found)
   } catch { /* 拉不到就用旧快照 */ }
 }
@@ -460,11 +460,11 @@ async function appendHandModels() {
   }).filter(e => e.id)
   if (!entries.length) { ElMessage.warning('先每行写一个模型 ID'); return }
   try {
-    await api.updateProvider(modelsTarget.value.id, { models: entries })
+    await api.updateProvider(modelsTarget.value.providerId, { models: entries })
     ElMessage.success(`已追加 ${entries.length} 个模型`)
     handModels.value = ''
-    await refreshTarget(modelsTarget.value.id)
-    const res = await api.fetchProviderModels(modelsTarget.value.id)
+    await refreshTarget(modelsTarget.value.providerId)
+    const res = await api.fetchProviderModels(modelsTarget.value.providerId)
     fetched.value = res.models || []
     declaredProtocols.value = res.protocols || {}
     // 手填追加后同样只勾「已暴露的」，不预勾新加的
@@ -484,8 +484,8 @@ async function adoptModels() {
     const want = new Set(picked.value)
     const toOff = before.filter(m => !want.has(m.id))
     const toOn = (target.models || []).filter(m => want.has(m.id) && !m.enabled)
-    for (const m of toOff) await api.updateProviderModelEnabled(target.id, m.id, false)
-    for (const m of toOn) await api.updateProviderModelEnabled(target.id, m.id, true)
+    for (const m of toOff) await api.updateProviderModelEnabled(target.providerId, m.id, false)
+    for (const m of toOn) await api.updateProviderModelEnabled(target.providerId, m.id, true)
 
     // 勾选里还没采用的（上游新模型）走 PATCH models 追加，顺带写入声明的协议/能力
     const known = new Set((target.models || []).map(m => m.id))
@@ -494,7 +494,7 @@ async function adoptModels() {
       const models = fresh.map(id => ({
         id, protocol: declaredProtocols.value[id] || '', caps: declaredCaps.value[id] || null
       }))
-      await api.updateProvider(target.id, { models })
+      await api.updateProvider(target.providerId, { models })
     }
 
     const n = picked.value.length
@@ -698,7 +698,7 @@ async function adoptModels() {
     <template #header>
       <div class="md-head">
         <span class="md-title">模型</span>
-        <span class="mono md-target">{{ modelsTarget ? modelsTarget.id : '' }}</span>
+        <span class="mono md-target">{{ modelsTarget ? modelsTarget.name : '' }}</span>
         <button class="md-close" @click="modelsDlg = false" aria-label="关闭">✕</button>
       </div>
     </template>

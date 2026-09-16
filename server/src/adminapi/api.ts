@@ -138,6 +138,26 @@ async function jsonBody(c: C): Promise<unknown> {
   return c.req.json().catch(() => undefined)
 }
 
+// 路径参数 :pid 的共享解析：只接受十进制正整数串。
+//
+// 为什么不用裸 Number()：它会把 " 5"、"0x11"、"5.5" 都放进来，非法输入则静默变成 NaN。
+// NaN 一旦往下传，错误信息就成了「provider #NaN 不存在」——既看不出是谁传的，
+// 还会被读成「Provider 被删了」。更糟的是 NaN 会一路穿到存储层：内存实现 get(NaN)
+// 恰好安全返回 undefined，SQLite 绑定 NaN 的行为却没保证（可能直接抛错 → 500）。
+// 所以解析失败返回 undefined，调用方一律回 404 并**回显原始字符串**（保留排查线索）。
+function parsePid(raw: string): number | undefined {
+  if (!/^[0-9]+$/.test(raw)) return undefined
+  const n = Number(raw)
+  return Number.isSafeInteger(n) && n > 0 ? n : undefined
+}
+
+// 路径参数 → Provider：非法 pid 与查不到的 id 一视同仁（都 undefined），
+// 调用方统一回 404。这样"非法输入"永远到不了存储层。
+function findProvider(store: ProviderStore, raw: string): Provider | undefined {
+  const pid = parsePid(raw)
+  return pid === undefined ? undefined : store.get(pid)
+}
+
 interface CapsPatch {
   input?: string[]
   contextWindow?: number
@@ -271,8 +291,9 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
 
   // 路径参数是 providerId（数字，内部标识）——改名不影响它。
   app.get('/admin/api/providers/:pid/credential', (c) => {
-    const p = providers.get(Number(c.req.param('pid')))
-    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 不存在`)
+    const raw = c.req.param('pid')
+    const p = findProvider(providers, raw)
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
     return ok(c, 200, credentialView(p.credential ?? {}))
   })
 
@@ -307,9 +328,9 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
   })
 
   app.patch('/admin/api/providers/:pid', async (c) => {
-    const pid = Number(c.req.param('pid'))
-    const p = providers.get(pid)
-    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 不存在`)
+    const raw = c.req.param('pid')
+    const p = findProvider(providers, raw)
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
     const patch = await jsonBody(c)
     if (!isObj(patch)) return errRes(c, 400, ERR.INVALID_REQUEST, '请求体不是合法 JSON')
     for (const k of Object.keys(patch)) {
@@ -475,8 +496,10 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
   // 删除 = 状态置 deleted（软删）。物理保留该行：历史用量要靠 providerId 回溯，
   // 而且名字被释放后可被新建复用，同名不同 id 在归因上也分得清。
   app.delete('/admin/api/providers/:pid', (c) => {
-    const p = providers.get(Number(c.req.param('pid')))
-    if (!p) return errRes(c, 404, ERR.NOT_FOUND, 'provider 不存在')
+    const raw = c.req.param('pid')
+    const p = findProvider(providers, raw)
+    // 回显原始 pid：这是全文件唯一一条不带 id 的 404，排查时少了关键字段。
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
     p.state = 'deleted'
     providers.put(p)
     changed()
@@ -729,14 +752,24 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
 
   app.post('/admin/api/providers/:pid/test', async (c) => {
     if (!deps.prober) return errRes(c, 501, ERR.API, 'Provider 测试未接线')
-    const res: ProbeResult = await deps.prober.probeProvider(Number(c.req.param('pid')))
+    const raw = c.req.param('pid')
+    // 先查库：不存在的 Provider 是 404，不是 200 + {ok:false}。
+    // 以前把 Number(raw) 直接交给 prober，NaN 会变成「provider #NaN 不存在」的 200 响应，
+    // 前端拿 ok:false 当"测试失败"渲染，实际是调用方传错了 id。
+    const p = findProvider(providers, raw)
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
+    const res: ProbeResult = await deps.prober.probeProvider(p.providerId)
     return ok(c, 200, res)
   })
 
   // 批量实测候选模型；探到的协议写回模型目录（探测结果即事实，下次转发直达）。
   app.post('/admin/api/providers/:pid/scan', async (c) => {
     if (!deps.modelProber) return errRes(c, 501, ERR.API, '批量模型扫描未接线')
-    const id = Number(c.req.param('pid'))
+    const raw = c.req.param('pid')
+    // 同上：不存在/非法 id 是 404，不能让 NaN 穿到 prober 变成 200 + results[].error。
+    const target = findProvider(providers, raw)
+    if (!target) return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
+    const id = target.providerId
     const body = await jsonBody(c)
     const models = isObj(body) && Array.isArray(body.models)
       ? body.models.filter((x): x is string => typeof x === 'string')
@@ -763,10 +796,11 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
 
   // 手工指定某模型的协议（空 = 继承 Provider 默认）；扫描自动写入，此端点是纠偏入口。
   app.put('/admin/api/providers/:pid/models/:model/protocol', async (c) => {
-    const pid = Number(c.req.param('pid'))
+    const raw = c.req.param('pid')
+    const pid = parsePid(raw)
     const modelID = c.req.param('model')
-    const p = providers.get(pid)
-    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 不存在`)
+    const p = pid === undefined ? undefined : providers.get(pid)
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
     const body = await jsonBody(c)
     if (!isObj(body)) return errRes(c, 400, ERR.INVALID_REQUEST, '请求体不是合法 JSON')
     const protocol = typeof body.protocol === 'string' ? body.protocol : ''
@@ -785,10 +819,11 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
 
   // 手工指定某模型的出口代理（空 = 继承 Provider 默认）；引用顶层 egresses 的 id。
   app.put('/admin/api/providers/:pid/models/:model/egress', async (c) => {
-    const pid = Number(c.req.param('pid'))
+    const raw = c.req.param('pid')
+    const pid = parsePid(raw)
     const modelID = c.req.param('model')
-    const p = providers.get(pid)
-    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 不存在`)
+    const p = pid === undefined ? undefined : providers.get(pid)
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
     const body = await jsonBody(c)
     if (!isObj(body)) return errRes(c, 400, ERR.INVALID_REQUEST, '请求体不是合法 JSON')
     const egress = typeof body.egress === 'string' ? body.egress : ''
@@ -804,10 +839,11 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
   // 模型备注：一句话运维知识（如「23 点后才免费，白天用会扣额度」）。
   // 空串 = 删掉该字段，不留空值。与 displayName 分工不同：那是"叫什么"，这是"要注意什么"。
   app.put('/admin/api/providers/:pid/models/:model/note', async (c) => {
-    const pid = Number(c.req.param('pid'))
+    const raw = c.req.param('pid')
+    const pid = parsePid(raw)
     const modelID = c.req.param('model')
-    const p = providers.get(pid)
-    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 不存在`)
+    const p = pid === undefined ? undefined : providers.get(pid)
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
     const body = await jsonBody(c)
     if (!isObj(body) || typeof body.note !== 'string') {
       return errRes(c, 400, ERR.INVALID_REQUEST, '请求体须为 {"note": string}')
@@ -825,10 +861,11 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
 
   // 开关单个模型的启用：对外暴露（/v1/models）、路由匹配、测试候选都以它为准。
   app.put('/admin/api/providers/:pid/models/:model/enabled', async (c) => {
-    const pid = Number(c.req.param('pid'))
+    const raw = c.req.param('pid')
+    const pid = parsePid(raw)
     const modelID = c.req.param('model')
-    const p = providers.get(pid)
-    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 不存在`)
+    const p = pid === undefined ? undefined : providers.get(pid)
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
     const body = await jsonBody(c)
     if (!isObj(body) || typeof body.enabled !== 'boolean') {
       return errRes(c, 400, ERR.INVALID_REQUEST, '请求体须为 {"enabled": boolean}')
@@ -844,10 +881,11 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
   // 删除单个模型：手填错的/上游已下架的，得能摘掉。
   // PATCH models 是「只增不减」，所以删除必须是独立端点（否则手填的模型永远删不掉）。
   app.delete('/admin/api/providers/:pid/models/:model', (c) => {
-    const pid = Number(c.req.param('pid'))
+    const raw = c.req.param('pid')
+    const pid = parsePid(raw)
     const modelID = c.req.param('model')
-    const p = providers.get(pid)
-    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 不存在`)
+    const p = pid === undefined ? undefined : providers.get(pid)
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
     const i = p.models.findIndex((x) => x.id === modelID)
     if (i < 0) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 下没有模型 ${modelID}`)
     p.models.splice(i, 1)
@@ -860,9 +898,14 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
   app.get('/admin/api/providers/:pid/models', async (c) => {
     const lister: ProviderModelLister | undefined = deps.lister
     if (!lister) return errRes(c, 501, ERR.API, '模型发现未接线')
+    const raw = c.req.param('pid')
+    // 不存在 → 404（回显原始串）。以前一律 catch 成 502，把"没有这个 Provider"
+    // 和"上游真的挂了"混成同一个状态码，前端只能提示用户去手填模型。
+    const p = findProvider(providers, raw)
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
     let list: ModelList
     try {
-      list = await lister.listProviderModels(Number(c.req.param('pid')))
+      list = await lister.listProviderModels(p.providerId)
     } catch (e) {
       return errRes(c, 502, ERR.API, (e as Error).message)
     }

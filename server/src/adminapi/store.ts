@@ -65,7 +65,10 @@ export class MemoryProviderStore implements ProviderStore {
 
   put(p: Provider): void {
     const q = cloneProvider(p)
-    if (!(q.providerId > 0)) q.providerId = ++this.seq
+    // 只有「安全正整数」才算已有 id；其余（0 / 负数 / NaN / Infinity / 小数）一律当新建分配。
+    // 以前写的是 `!(id > 0)`：NaN 恰好被这条收住（NaN > 0 === false），但 Infinity > 0
+    // 为真，会被当成合法 key 存进 Map（此后 get(Infinity) 能命中），负数则被静默改写。
+    if (!(Number.isSafeInteger(q.providerId) && q.providerId > 0)) q.providerId = ++this.seq
     this.m.set(q.providerId, q)
     p.providerId = q.providerId
   }
@@ -244,6 +247,10 @@ export class SQLiteProviderStore implements ProviderStore {
   }
 
   get(providerId: number): Provider | undefined {
+    // NaN / 非整数绝不进 SQL：node:sqlite 对 NaN 绑定的行为没有保证（可能直接抛错，
+    // 而调用方大多没有 try/catch，会冒泡成 500——「不存在的 Provider」应当是 404）。
+    // 内存实现里 Map.get(NaN) 恰好安全，两条路径的行为差异正是这个守卫要抹平的。
+    if (!(Number.isSafeInteger(providerId) && providerId > 0)) return undefined
     const row = this.db.prepare(
       `SELECT provider_id, name, state, data FROM admin_providers WHERE provider_id = ?`)
       .get(providerId) as unknown as
@@ -264,8 +271,12 @@ export class SQLiteProviderStore implements ProviderStore {
 
   // 写回：providerId 为 0 表示新建（由 AUTOINCREMENT 分配并回填）。
   put(p: Provider): void {
-    const { providerId, name, state, ...body } = p
+    const { name, state, ...body } = p
     const json = JSON.stringify(body)
+    // 与内存实现同口径：只有安全正整数算已有 id，其余（0/负/NaN/Infinity/小数）当新建。
+    // 判据必须是 isSafeInteger 而不只是 `> 0`：Infinity > 0 为真，会被当合法主键写进
+    // AUTOINCREMENT 列（那里存得下，但此后任何按 id 的查找都对不上）。
+    const providerId = Number.isSafeInteger(p.providerId) && p.providerId > 0 ? p.providerId : 0
     if (providerId > 0) {
       // upsert：带 id 写入时，行不存在也要落库。
       // 只用 UPDATE 的话，调用方（配置播种/夹具预置固定 id）会静默丢失写入——

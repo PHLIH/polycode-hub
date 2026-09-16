@@ -236,9 +236,12 @@ async function adopt(f) {
   try {
     const p = await api.adopt(f.key)
     const accts = (f.suggestedAccounts || []).filter(a => a.alive).length
+    // 后端返回的是 Provider 本体（字段是 name / providerId，没有 id）：
+    // 以前读 p.id 恒 undefined，采用成功也弹「已采用为 Provider「undefined」」。
+    const label = `${p.name} (#${p.providerId})`
     ElMessage.success(accts > 0
-      ? `已采用为 Provider「${p.id}」，${accts} 个登录态已入账号池，去 Provider 页确认模型`
-      : `已采用为 Provider「${p.id}」，去 Provider 页确认模型`)
+      ? `已采用为 Provider「${label}」，${accts} 个登录态已入账号池，去 Provider 页确认模型`
+      : `已采用为 Provider「${label}」，去 Provider 页确认模型`)
     for (const w of p.warnings || []) ElMessage.warning(w, { duration: 6000 })
     await Promise.all([rescan(), loadPool()])
   } catch (e) { ElMessage.error(e.message) }
