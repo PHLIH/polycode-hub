@@ -319,8 +319,7 @@ function failClass(rate) {
   if (!rate) return 'dim'
   return rate > 0.1 ? 'bad' : 'warn'
 }
-// byModel：按 providerId+modelId 合并。provider 改挂 source 后，历史记录保留旧
-// source_id，按 source 分组会把同一个 provider 裂成两行同名——这里归一掉。
+// byModel：按 providerName+modelId 合并（后端 GROUP BY 同口径，这里兜一层）。
 const FIELDS = ['requests', 'inputTokens', 'outputTokens', 'cacheReadTokens',
   'cacheCreationTokens', 'reasoningTokens', 'totalTokens', 'errors']
 // 由「后端算好的命中率」反推该行的分母（命中数 / 命中率）。
@@ -332,12 +331,12 @@ function denomOf(r) {
 const byModel = computed(() => {
   const merged = new Map()
   for (const m of (attrBd.value && attrBd.value.byModel) || []) {
-    const k = m.providerId + '/' + m.modelId
+    const k = m.providerName + '/' + m.modelId
     const acc = merged.get(k)
     if (!acc) merged.set(k, { ...m })
     else {
       for (const f of FIELDS) acc[f] = (acc[f] || 0) + (m[f] || 0)
-      // TPS/TTFT 合并：sampled 加权平均（展示用途；同 model 跨 source 的场景极罕见）
+      // TPS/TTFT 合并：sampled 加权平均（展示用途；同 model 跨 Provider 的场景极罕见）
       for (const f of ['avgTps', 'avgTtftMs']) {
         const a = acc[f], b = m[f]
         if (a == null && b == null) { acc[f] = null; continue }
@@ -346,14 +345,14 @@ const byModel = computed(() => {
       }
       acc.sampled = (acc.sampled || 0) + (m.sampled || 0)
       // 命中率不能平均（各行权重不同）：按后端算出的率反推各自分母再加总，
-      // 维持「命中数 / 输入侧」口径。（仅同 provider 同 model 跨 source 时走到这里）
+      // 维持「命中数 / 输入侧」口径。（仅同 provider 同 model 跨来源时走到这里）
       acc._num = (acc._num ?? acc.cacheReadTokens ?? 0) + (m.cacheReadTokens || 0)
       acc._denom = (acc._denom ?? denomOf(acc)) + denomOf(m)
     }
   }
   // 命中率由后端算好（cacheHitRate = cacheRead / input，见 usage/store.ts hitRate）：
   // 前端不再自行用单一公式重算（那正是之前的错误来源）。
-  // 只有发生跨 source 合并（_denom 被写入）的行才需要按反推的分母重算。
+  // 只有发生合并（_denom 被写入）的行才需要按反推的分母重算。
   for (const m of merged.values()) {
     if (m._denom !== undefined) {
       m.cacheHitRate = m._denom > 0 ? m._num / m._denom : null
@@ -363,20 +362,67 @@ const byModel = computed(() => {
   return [...merged.values()]
 })
 // 占比：相对区间总 token（不是相对最大值——那样第一名恒为 100%，条子永远满格）
+// 占比基准随视图变：视图 A 以合并后的来源行为分母，视图 C 以模型汇总行为分母。
+// 分母必须与当前表里的行一致，否则进度条会按另一套总量算（看起来永远填不满）。
+function shareBase() {
+  return groupByModel.value ? modelRows.value : groupedModels.value
+}
 function share(x) {
-  return shareOf(groupedModels.value, x)
+  return shareOf(shareBase(), x)
 }
 function shareTip(x) {
-  return shareTitle(groupedModels.value, x)
+  return shareTitle(shareBase(), x)
 }
 
-// sourceName：优先按 providerId 精确匹配显示名，再退回 sourceId。
-// 只按 sourceId 匹配会把 sidecar 流量（source 记成 zcode 时）错标成"API计费通道"。
-function sourceName(sid, pid) {
-  const p = providers.value.find(x => x.id === pid) ||
-    providers.value.find(x => x.sourceId === sid || x.id === sid)
-  return (p && (p.displayName || p.id)) || sid
+// 归因行的「来源」= providerName 快照（后端随每条用量一同落库）。
+// 它天然解决了两个问题：Provider 改名/删除后历史行仍显示当时的名字；
+// 删除后重建同名不会裂成两行（分组键就是名字）。
+function srcName(row) {
+  return row.providerName || '（未知来源）'
 }
+// 聚合视图（C）里一行的 Provider 明细：名字 + #id + 该来源的 token 量。
+function memberLabel(m) {
+  const id = srcIdOf(m)
+  return id ? `${srcName(m)} #${id}` : srcName(m)
+}
+// 内部 id 标注：名字可能重复（删除后重建），用 #id 让用户能区分是哪一个。
+// 查不到活跃 Provider 时（历史/已删）只显示名字，不硬编一个假 id。
+function srcIdOf(row) {
+  const p = providers.value.find(x => x.providerId === row.providerId)
+  return p ? p.providerId : (row.providerId > 0 ? row.providerId : 0)
+}
+// 「按模型统计」视图：把同一个模型的多个 Provider 行合成一行，Provider 作为明细展开。
+// 归因默认视图（A）一行 = 一个 Provider × 一个模型；聚合视图（C）一行 = 一个模型。
+const groupByModel = ref(false)
+const modelRows = computed(() => {
+  if (!groupByModel.value) return []
+  const acc = new Map()
+  for (const m of byModel.value) {
+    const k = m.modelId
+    let row = acc.get(k)
+    if (!row) {
+      row = { modelId: k, _members: [], requests: 0, inputTokens: 0, outputTokens: 0,
+        cacheReadTokens: 0, cacheCreationTokens: 0, reasoningTokens: 0,
+        totalTokens: 0, errors: 0, sampled: 0, _tpsWeighted: 0, _ttftWeighted: 0,
+        _num: 0, _denom: 0 }
+      acc.set(k, row)
+    }
+    row._members.push(m)
+    for (const f of FIELDS) row[f] = (row[f] || 0) + (m[f] || 0)
+    row._num += m.cacheReadTokens || 0
+    row._denom += denomOf(m)
+    const w = m.sampled || 0
+    if (m.avgTps != null) { row._tpsWeighted += m.avgTps * w; row._ttftWeighted += (m.avgTtftMs ?? 0) * w }
+    row.sampled += w
+  }
+  for (const r of acc.values()) {
+    r.cacheHitRate = r._denom > 0 ? r._num / r._denom : null
+    r.avgTps = r.sampled > 0 ? r._tpsWeighted / r.sampled : null
+    r.avgTtftMs = r.sampled > 0 ? r._ttftWeighted / r.sampled : null
+    delete r._num; delete r._denom; delete r._tpsWeighted; delete r._ttftWeighted
+  }
+  return [...acc.values()].sort((a, b) => (b.totalTokens || 0) - (a.totalTokens || 0))
+})
 
 // ---- 归因表：搜索 / 排序 / 分页（纯前端，数据量小） ----
 const q = ref('')
@@ -388,7 +434,7 @@ const SORTABLE = ['requests', 'inputTokens', 'outputTokens', 'avgTps', 'cacheRea
 
 // ---- 手动合并组（纯前端，localStorage 持久化） ----
 // 场景：zen（手配）与 zen-auto（自动发现）是同一类上游，理应算一笔账。
-// 规则只存本机浏览器：[{ id, name, keys: ['providerId/modelId'] }]。
+// 规则只存本机浏览器：[{ id, name, keys: ['providerName/modelId'] }]。
 const MERGE_KEY = 'polycode-hub.mergeGroups.v1'
 function loadGroups() {
   try {
@@ -421,7 +467,7 @@ function toggleCheck(k) {
 }
 // 行 key：组行不可勾选（避免组套组）；明细展开行也不进勾选
 function checkKeyOf(m) {
-  return m._groupId ? null : (m.providerId + '/' + m.modelId)
+  return m._groupId ? null : (m.providerName + '/' + m.modelId)
 }
 const canMerge = computed(() => checkedKeys.value.size >= 2)
 function doMerge() {
@@ -455,7 +501,7 @@ const renamingId = ref(null)
 const renamingName = ref('')
 function startRename(m) {
   renamingId.value = m._groupId
-  renamingName.value = m.providerId
+  renamingName.value = m.providerName
   nextTick(() => {
     const el = document.querySelector('.rename-input input')
     if (el) { el.focus(); el.select() }
@@ -490,7 +536,7 @@ const filteredModels = computed(() => {
   const kw = q.value.trim().toLowerCase()
   const rows = kw
     ? groupedModels.value.filter(m =>
-      (m.modelId || '').toLowerCase().includes(kw) || (m.providerId || '').toLowerCase().includes(kw))
+      (m.modelId || '').toLowerCase().includes(kw) || (m.providerName || '').toLowerCase().includes(kw))
     : groupedModels.value
   const d = sortDir.value === 'desc' ? -1 : 1
   return [...rows].sort((a, b) =>
@@ -617,11 +663,17 @@ function ttftText(m) {
 
   <section class="panel">
     <div class="panel-head">
-      <h3>用量归因（provider / 模型）</h3>
+      <h3>用量归因（{{ groupByModel ? '模型' : '来源 / 模型' }}）</h3>
       <div class="controls">
         <el-input v-if="byModel.length" v-model="q" size="small" clearable placeholder="搜索模型名" style="width:160px" />
+        <!-- 视图切换：默认一行 = 一个来源×一个模型；按模型统计把同一模型的多个来源合成一行 -->
+        <button v-if="byModel.length" class="merge-toggle" :class="{ on: groupByModel }"
+          :title="groupByModel ? '当前：按模型汇总（展开看各来源）' : '当前：按来源×模型分行'"
+          @click="groupByModel = !groupByModel">
+          {{ groupByModel ? '按来源分行' : '按模型统计' }}
+        </button>
         <!-- 合并模式开关：时间胶囊右边。开启后各行出现勾选框，选中即合 -->
-        <button v-if="byModel.length" class="merge-toggle" :class="{ on: merging }" @click="toggleMergeMode">
+        <button v-if="byModel.length && !groupByModel" class="merge-toggle" :class="{ on: merging }" @click="toggleMergeMode">
           {{ merging ? '取消合并' : '合并' }}
         </button>
         <!-- 时间胶囊只管归因区（stat card + 归因表），管不到热力图 -->
@@ -677,12 +729,59 @@ function ttftText(m) {
           <th class="bar-col">占比</th>
         </tr>
       </thead>
-      <tbody>
-        <template v-for="m in pagedModels" :key="(m._groupId || '') + m.sourceId + '/' + m.providerId + '/' + m.modelId">
+      <!-- 视图 C：按模型统计。一行 = 一个模型；来源作为可展开明细，带各自 token 量。 -->
+      <tbody v-if="groupByModel">
+        <template v-for="r in modelRows" :key="'gm-' + r.modelId">
+          <tr>
+            <td>
+              <div class="model-line"><span class="model-name">{{ r.modelId }}</span></div>
+              <div class="src-name sub-src">
+                <button class="link-btn" @click="toggleExpand('gm-' + r.modelId)">
+                  {{ expandedGroups.has('gm-' + r.modelId) ? '收起' : '展开' }}({{ r._members.length }} 个来源)
+                </button>
+              </div>
+            </td>
+            <td class="n num">{{ fmt(r.requests) }}</td>
+            <td class="n num">{{ fmt(r.inputTokens) }}</td>
+            <td class="n num">{{ fmt(r.outputTokens) }}</td>
+            <td class="n num" :class="{ dim: !r.sampled }">{{ tpsText(r) }}</td>
+            <td class="n num">{{ fmt(r.cacheReadTokens) }}</td>
+            <td class="n num" :class="{ dim: r.cacheHitRate == null }">
+              {{ r.cacheHitRate == null ? '—' : pct(r.cacheHitRate) }}
+            </td>
+            <td class="n num strong">{{ fmt(r.totalTokens) }}</td>
+            <td class="n num" :class="{ 'err': r.errors > 0 }">{{ r.errors || '' }}</td>
+            <td class="n num" :class="{ dim: r.avgTtftMs == null }">{{ ttftText(r) }}</td>
+            <td class="bar-col"><div class="bar"><div class="bar-fill" :style="{ width: (share(r) * 100) + '%' }" /></div></td>
+          </tr>
+          <tr v-for="sub in (expandedGroups.has('gm-' + r.modelId) ? r._members : [])"
+            :key="'gmsub-' + r.modelId + '-' + sub.providerName" class="sub-row">
+            <td>
+              <div class="src-name sub-name">
+                {{ memberLabel(sub) }}
+              </div>
+            </td>
+            <td class="n num">{{ fmt(sub.requests) }}</td>
+            <td class="n num">{{ fmt(sub.inputTokens) }}</td>
+            <td class="n num">{{ fmt(sub.outputTokens) }}</td>
+            <td class="n num" :class="{ dim: sub.sampled === 0 }">{{ tpsText(sub) }}</td>
+            <td class="n num">{{ fmt(sub.cacheReadTokens) }}</td>
+            <td class="n num" :class="{ dim: sub.cacheHitRate == null }">
+              {{ sub.cacheHitRate == null ? '—' : pct(sub.cacheHitRate) }}
+            </td>
+            <td class="n num">{{ fmt(sub.totalTokens) }}</td>
+            <td class="n num" :class="{ 'err': sub.errors > 0 }">{{ sub.errors || '' }}</td>
+            <td class="n num" :class="{ dim: sub.avgTtftMs == null }">{{ ttftText(sub) }}</td>
+            <td class="bar-col"><div class="bar"><div class="bar-fill" :style="{ width: (share(sub) * 100) + '%' }" /></div></td>
+          </tr>
+        </template>
+      </tbody>
+      <tbody v-else>
+        <template v-for="m in pagedModels" :key="(m._groupId || '') + m.providerName + '/' + m.modelId">
         <tr>
           <td v-if="merging" class="check-col">
             <input v-if="checkKeyOf(m)" type="checkbox" :checked="checkedKeys.has(checkKeyOf(m))"
-              @change="toggleCheck(checkKeyOf(m))" :aria-label="'选择 ' + m.providerId + '/' + m.modelId" />
+              @change="toggleCheck(checkKeyOf(m))" :aria-label="'选择 ' + m.providerName + '/' + m.modelId" />
           </td>
           <td>
             <!-- 组行：组名 + 展开/重命名/拆分；明细行：原 provider 显示名 + 模型 -->
@@ -693,7 +792,7 @@ function ttftText(m) {
                   @keydown.enter="e => { if (!e.isComposing) commitRename() }"
                   @keydown.esc="cancelRename" @blur="commitRename" />
               </div>
-              <div v-else class="src-name">{{ m.providerId }}
+              <div v-else class="src-name">{{ m.providerName }}
                 <button class="link-btn" @click="toggleExpand(m._groupId)">
                   {{ expandedGroups.has(m._groupId) ? '收起' : '展开' }}({{ m._members.length }})
                 </button>
@@ -703,8 +802,11 @@ function ttftText(m) {
               <div class="model-line dim">手动合并组</div>
             </template>
             <template v-else>
-              <div class="src-name">{{ sourceName(m.sourceId, m.providerId) }}</div>
+              <!-- 归因视图 A：模型是主（用户按模型认账），Provider 是辅并标内部 id -->
               <div class="model-line"><span class="model-name">{{ m.modelId }}</span></div>
+              <div class="src-name sub-src">
+                {{ srcName(m) }}<span v-if="srcIdOf(m)" class="mono pid">#{{ srcIdOf(m) }}</span>
+              </div>
             </template>
           </td>
           <td class="n num">{{ fmt(m.requests) }}</td>
@@ -724,11 +826,13 @@ function ttftText(m) {
         </tr>
         <!-- 展开的组明细：缩进展示原行 -->
         <tr v-if="m._groupId && expandedGroups.has(m._groupId)" v-for="sub in m._members"
-          :key="'sub-' + sub.sourceId + '/' + sub.providerId + '/' + sub.modelId" class="sub-row">
+          :key="'sub-' + sub.providerName + '/' + sub.modelId" class="sub-row">
           <td v-if="merging" class="check-col"></td>
           <td>
-            <div class="src-name sub-name">{{ sourceName(sub.sourceId, sub.providerId) }}</div>
             <div class="model-line"><span class="model-name">{{ sub.modelId }}</span></div>
+            <div class="src-name sub-name sub-src">
+              {{ srcName(sub) }}<span v-if="srcIdOf(sub)" class="mono pid">#{{ srcIdOf(sub) }}</span>
+            </div>
           </td>
           <td class="n num">{{ fmt(sub.requests) }}</td>
           <td class="n num">{{ fmt(sub.inputTokens) }}</td>
@@ -953,6 +1057,10 @@ function ttftText(m) {
 .attr .strong { font-weight: 600; }
 .attr .err { color: var(--bad); }
 .model-name { font-family: var(--mono); }
+/* 归因行里的内部分 id：名字可能重复（删除后重建），#N 用来区分是哪一个 */
+.pid { color: var(--dim); opacity: .65; margin-left: 6px; font-size: 11px; }
+/* 视图 A 里模型是主行、来源是副行，副行字号收一档 */
+.sub-src { font-size: 11.5px; color: var(--dim); margin-top: 2px; }
 .src-name { font-weight: 600; font-size: 12px; }
 .model-line { font-size: 11px; color: var(--dim); }
 .bar-col { width: 120px; }

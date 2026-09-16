@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref, nextTick } from 'vue'
+import { computed, ref, nextTick, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, AbortError } from '../api.js'
 
@@ -22,7 +22,7 @@ const KIND_LABELS = {
 }
 const RISK_LABELS = { low: '低风险', medium: '中风险', high: '高风险' }
 
-const keyOf = (p, id) => `${p.id}/${id}`
+const keyOf = (p, id) => `${p.providerId}/${id}`
 const modelOf = (p, id) => ((p && p.models) || []).find(x => x.id === id)
 
 // 展开行展示的就是「模型」按钮里勾选的那批——唯一的真相源（/v1/models 与测试候选同源）
@@ -31,14 +31,51 @@ const exposedCount = computed(() => exposedModels.value.length)
 const totalCount = computed(() => (props.p.models || []).length)
 
 // 数据核对用：这些字段在创建表单里都填了，原表格一行也放不下，收进「接入信息」。
-// API Key 只显示「引用来源」（环境变量名或文件路径），永不显示 Key 本身——明文不落盘、不回显。
+// API Key 默认只显示「引用来源」（环境变量名或文件路径）；明文按需现取现显，
+// 不随列表下发、不落盘（后端 /credential 显式端点，见 adminapi/api.ts credentialView）。
 const metaOpen = ref(false)
+const cred = ref(null) // {source, present, value, hint}：点「查看明文」后才有
+const credLoading = ref(false)
+const credShown = ref(false)
+async function toggleCred() {
+  if (credShown.value) { credShown.value = false; return }
+  if (!cred.value) {
+    credLoading.value = true
+    try { cred.value = await api.providerCredential(props.p.providerId) }
+    catch (e) { ElMessage.error(`查看明文失败：${e.message}`); return }
+    finally { credLoading.value = false }
+  }
+  credShown.value = true
+}
+async function copyCred() {
+  const v = cred.value && cred.value.value ? cred.value.value : ''
+  if (!v) return
+  try {
+    await navigator.clipboard.writeText(v)
+    ElMessage.success('API Key 已复制')
+  } catch {
+    ElMessage.error('复制失败：浏览器拒绝了剪贴板')
+  }
+}
 function apiKeyRef(p) {
   const c = (p && p.credential) || {}
   if (c.apiKeyFile) return `文件 ${c.apiKeyFile}`
   if (c.apiKeyEnv) return `env ${c.apiKeyEnv}`
   return '无（复用登录态或无需鉴权）'
 }
+
+// 本 Provider 名下的账号会接管鉴权：真实转发（proxy.ts）与探测（probe.ts）都取
+// 该 Provider 第一个可用账号的凭据覆盖 Provider 凭据。所以卡片上「我配的 Key」
+// 可能根本没在用——不标出来，用户会对着一个明明有效的 Key 排查半天 401。
+const peerAccounts = ref([])
+async function loadPeers() {
+  if (!props.p.providerId) return
+  try {
+    const all = await api.accounts()
+    peerAccounts.value = all.filter(a => a.providerId === props.p.providerId && a.status !== 'disabled')
+  } catch { peerAccounts.value = [] }
+}
+onMounted(loadPeers)
 const META = computed(() => [
   ['接入方式', KIND_LABELS[props.p.accessKind] || props.p.accessKind],
   ['风险', RISK_LABELS[props.p.risk] || props.p.risk],
@@ -57,7 +94,7 @@ const probeModel = ref(props.p.probeModel || '')
 
 async function saveProbeModel() {
   try {
-    await api.updateProvider(props.p.id, { probeModel: probeModel.value.trim() })
+    await api.updateProvider(props.p.providerId, { probeModel: probeModel.value.trim() })
     props.p.probeModel = probeModel.value.trim()
     emit('test', props.p)
   } catch (e) { ElMessage.error(e.message) }
@@ -99,7 +136,7 @@ function patchRowModel(p, id, key, val) {
 
 async function setModelProtocol(p, id, proto) {
   try {
-    await api.updateProviderModelProtocol(p.id, id, proto)
+    await api.updateProviderModelProtocol(p.providerId, id, proto)
     patchRowModel(p, id, 'api', proto)
     ElMessage.success(`${id} → ${proto || '继承 Provider 默认'}`)
   } catch (e) { ElMessage.error(e.message) }
@@ -107,7 +144,7 @@ async function setModelProtocol(p, id, proto) {
 
 async function setModelEgress(p, id, eg) {
   try {
-    await api.updateProviderModelEgress(p.id, id, eg)
+    await api.updateProviderModelEgress(p.providerId, id, eg)
     patchRowModel(p, id, 'egress', eg)
     ElMessage.success(`${id} 出口 → ${eg || '直连'}`)
   } catch (e) { ElMessage.error(e.message) }
@@ -125,7 +162,7 @@ async function detect(p, id) {
   detectCtrl[k] = ctrl
   detecting.value[k] = true
   try {
-    const rs = await api.scanProviderModels(p.id, [id], { signal: ctrl.signal })
+    const rs = await api.scanProviderModels(p.providerId, [id], { signal: ctrl.signal })
     const r = rs && rs[0]
     if (!r) throw new Error('无结果')
     scanRes.value[k] = r // 行内标签立即反映结果
@@ -152,10 +189,10 @@ async function detect(p, id) {
 // 删除单个模型：手填错的/上游已下架的得能摘掉（PATCH models 只增不减）
 async function removeModel(p, id) {
   try {
-    await ElMessageBox.confirm(`从「${p.id}」删除模型 ${id}？`, '确认删除', { type: 'warning' })
+    await ElMessageBox.confirm(`从「${p.name}」删除模型 ${id}？`, '确认删除', { type: 'warning' })
   } catch { return }
   try {
-    await api.deleteProviderModel(p.id, id)
+    await api.deleteProviderModel(p.providerId, id)
     ElMessage.success(`已删除 ${id}`)
     emit('reload')
   } catch (e) { ElMessage.error(e.message) }
@@ -183,7 +220,7 @@ async function saveNote(p, id) {
   const note = noteDraft.value.trim()
   if (note === (m.note || '')) { noteEdit.value = ''; return } // 没改就不打接口
   try {
-    await api.updateProviderModelNote(p.id, id, note)
+    await api.updateProviderModelNote(p.providerId, id, note)
     patchRowModel(p, id, 'note', note)
     noteEdit.value = ''
     ElMessage.success(note ? '备注已保存' : '备注已清除')
@@ -198,18 +235,18 @@ function onHeadClick() {
 
 async function toggle() {
   try {
-    await api.updateProvider(props.p.id, { enabled: !props.p.enabled })
+    await api.updateProvider(props.p.providerId, { state: props.p.state !== 'active' ? 'active' : 'paused' })
     emit('reload')
   } catch (e) { ElMessage.error(e.message) }
 }
 </script>
 
 <template>
-  <article class="strip" :class="{ off: !p.enabled, expanded: open }">
+  <article class="strip" :class="{ off: p.state !== 'active', expanded: open }">
     <!-- 左侧状态脊：一路贯通的竖线，承载启用态与展开态 -->
     <div class="spine">
-      <span class="spine-dot" :class="p.enabled ? 'ok' : ''" />
-      <span class="spine-line" :class="p.enabled ? 'ok' : ''" />
+      <span class="spine-dot" :class="p.state === 'active' ? 'ok' : ''" />
+      <span class="spine-line" :class="p.state === 'active' ? 'ok' : ''" />
     </div>
 
     <div class="body">
@@ -222,7 +259,7 @@ async function toggle() {
 
         <div class="ident">
           <div class="row1">
-            <span class="name">{{ p.displayName || p.id }}</span>
+            <span class="name">{{ p.displayName || p.name }}</span>
             <span v-if="p.streamOnly" class="chip"
               title="上游只支持流式，非流式请求会跳过此源">只流式</span>
             <span v-if="p.risk !== 'low'" class="chip" :class="riskClass"
@@ -231,9 +268,8 @@ async function toggle() {
               :title="p.riskNote || ''">{{ p.stability }}</span>
           </div>
           <div class="row2">
-            <span class="mono id">{{ p.id }}</span>
-            <span v-if="p.sourceId" class="sep" aria-hidden="true" />
-            <span v-if="p.sourceId" class="src" :title="`归属上游源：${p.sourceId}`">源 {{ p.sourceId }}</span>
+            <span class="mono id">{{ p.name }}</span>
+            <span class="mono pid" :title="`内部 id（改名不变，账号与用量按它归因）`">#{{ p.providerId }}</span>
             <span class="sep" aria-hidden="true" />
             <span class="mono url" :title="p.baseUrl">{{ p.baseUrl }}</span>
             <span class="sep" aria-hidden="true" />
@@ -257,7 +293,7 @@ async function toggle() {
           <button class="act" @click.stop="emit('edit', p)">编辑</button>
           <button class="act danger" @click.stop="emit('remove', p)">删除</button>
           <span class="vr" aria-hidden="true" />
-          <el-switch :model-value="p.enabled" @change="toggle" @click.stop />
+          <el-switch :model-value="p.state === 'active'" @change="toggle" @click.stop />
         </div>
       </div>
 
@@ -339,12 +375,32 @@ async function toggle() {
         <span v-if="!metaOpen" class="dim meta-line">{{ metaLine }}</span>
         <span v-if="p.riskNote && !metaOpen" class="risk-note" :title="p.riskNote">{{ p.riskNote }}</span>
       </div>
-      <dl v-if="metaOpen" class="meta">
+      <div v-if="metaOpen" class="meta-wrap">
+      <p v-if="peerAccounts.length" class="takeover-note">
+        鉴权已被账号池接管：本 Provider 名下 <span class="mono">{{ peerAccounts.map(a => a.id).join('、') }}</span>
+        的凭据会覆盖 Provider 自己配的 Key（转发与测试同一条规则）。
+        上面那行「API Key」只在账号全部停用/失效时才生效。
+      </p>
+      <dl class="meta">
         <div v-for="[k, v] in META" :key="k" class="meta-row">
-          <dt>{{ k }}</dt><dd>{{ v }}</dd>
+          <dt>{{ k }}</dt>
+          <dd v-if="k !== 'API Key'">{{ v }}</dd>
+          <dd v-else class="cred-dd">
+            <span>{{ v }}</span>
+            <button class="act tiny" :disabled="credLoading" @click="toggleCred">
+              {{ credLoading ? '读取中…' : (credShown ? '隐藏明文' : '查看明文') }}</button>
+            <template v-if="credShown && cred">
+              <span v-if="!cred.present" class="dim cred-hint">{{ cred.hint || '暂无可用明文' }}</span>
+              <template v-else>
+                <code class="mono cred-val">{{ cred.value }}</code>
+                <button class="act tiny" @click="copyCred">复制</button>
+              </template>
+            </template>
+          </dd>
         </div>
         <p v-if="p.riskNote" class="risk-full">{{ p.riskNote }}</p>
       </dl>
+      </div>
 
       <div v-if="open || testRes || testing" class="probe-row">
         <span class="dim">测试模型</span>
@@ -402,6 +458,8 @@ async function toggle() {
 .name { font-size: 14px; font-weight: 600; letter-spacing: .01em; }
 .row2 { display: flex; align-items: baseline; gap: 0; margin-top: 3px; font-size: 11.5px; color: var(--dim); min-width: 0; }
 .id { color: var(--dim); }
+/* 内部 id：改名不变的身份，展示在名字旁边（用户要能对上归因表里的 #N） */
+.pid { color: var(--dim); opacity: .7; margin-left: 5px; font-size: 11px; }
 .src { color: var(--accent); }
 .url, .proto { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 34ch; }
 /* 1px 竖线代替「·」连接元信息（中点是生成式默认） */
@@ -512,7 +570,22 @@ async function toggle() {
 .meta-row { display: flex; gap: 12px; padding: 3px 0; }
 .meta-row dt { width: 66px; flex: none; color: var(--dim); margin: 0; }
 .meta-row dd { margin: 0; color: var(--text); }
+.cred-dd { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.cred-val {
+  max-width: 34ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  background: var(--bg); border: 1px solid var(--line); border-radius: var(--r-ctl);
+  padding: 1px 8px; font-size: 11.5px; user-select: all;
+}
+.cred-hint { font-size: 11px; }
 .risk-full { margin: 6px 0 0; font-size: 11.5px; color: var(--warn); }
+/* 鉴权被同源账号接管：这是「我配的 Key 为什么没用」的答案，必须显眼 */
+.takeover-note {
+  margin: 8px 0 0; padding: 7px 10px; font-size: 11.5px; line-height: 1.6;
+  color: var(--warn); border-radius: var(--r-ctl);
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+  border-left: 2px solid var(--warn);
+}
+.takeover-note .mono { overflow-wrap: anywhere; }
 
 .probe-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; font-size: 12px; }
 .probe-sel { width: 300px; }

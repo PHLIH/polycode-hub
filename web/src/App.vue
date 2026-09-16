@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, onMounted } from 'vue'
 import { api, getKey, setKey, clearKey, AuthError } from './api.js'
 import Login from './views/Login.vue'
 import Dashboard from './views/Dashboard.vue'

@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, reactive, nextTick } from 'vue'
+import { ref, computed, onMounted, reactive } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api.js'
 import ProviderCard from './ProviderCard.vue'
@@ -65,10 +65,15 @@ const STAB = [
 ]
 
 const form = reactive({
-  id: '', sourceId: '', displayName: '', api: 'anthropic-messages',
+  name: '', displayName: '', api: 'anthropic-messages',
   baseURL: '', accessKind: 'official', risk: 'low', riskNote: '',
-  stability: 'stable', credentialEnv: '', enabled: true,
-  modelsText: '', streamOnly: false, egress: ''
+  stability: 'stable', credentialEnv: '', state: 'active',
+  modelsText: '', streamOnly: false, egress: '',
+  // 凭据输入语义（真实缺陷修复）：'key' = 直接粘 API Key 本体，后端落成凭据文件；
+  // 'env' = 填环境变量名（老语义）。默认 'key' —— 用户点开这个框就是想填 Key，
+  // 而 Key 本体与环境变量名在字符形状上无法区分（atr_xxx 两种都合法），
+  // 所以必须由界面显式声明，不能靠后端猜。
+  credentialKind: 'key'
 })
 
 // 高级选项默认折叠：稳定性/只走流式/手填模型都是配一次就不再动的。
@@ -88,12 +93,15 @@ const advSummary = computed(() => {
   return parts.length ? parts.join(' · ') : '默认'
 })
 
-// buildCredential：只写环境变量引用（API Key 明文不落盘）。
-// 注意：不返回 {} 去覆盖已有引用——文件型引用（一键导入生成的）由后端保留，
-// 前端一旦用空对象覆盖，那些 Provider 的 Key 会当场丢失。
+// buildCredential：把「用户填的凭据输入 + 语义」交给后端处理。
+//
+// 为什么不在这里拼 apiKeyEnv/apiKeyFile：
+//   'key' 语义下 Key 要落成凭据文件（0600），写文件、路径收敛、防穿越都在后端做，
+//   前端碰不到明文落盘逻辑，也就不会出现"前端猜错语义 → 存成变量名 → 上游 401"。
+// 返回 null 表示用户没填（不覆盖已有引用，文件型 Key 不会被空表单清掉）。
 function buildCredential() {
-  const env = form.credentialEnv.trim()
-  return env ? { apiKeyEnv: env } : null
+  const v = form.credentialEnv.trim()
+  return v ? { credentialInput: v, credentialKind: form.credentialKind } : null
 }
 
 async function load() {
@@ -103,31 +111,6 @@ async function load() {
   } catch (e) { err.value = e.message }
 }
 onMounted(load)
-
-// 概览数字：这页真正在管的东西有多少，一眼能核对。
-// tone 统一回答「这项是否处于应有的状态」：ok=没事，warn=要处理，off=没有可用通道。
-// 四张卡同一条规则——混着中性灰会被读成「那张没渲染出来」。
-const stat = computed(() => {
-  let models = 0
-  for (const p of list.value) models += exposedModels(p).length
-  const total = list.value.length
-  const on = list.value.filter(p => p.enabled).length
-  const bare = list.value.filter(p => !exposedModels(p).length).length
-  return {
-    total,
-    on,
-    models,
-    bare,
-    tone: {
-      // 一个 Provider 都没有 = 这页还没开始工作；有启用的才算在跑
-      on: total === 0 ? 'off' : (on > 0 ? 'ok' : 'warn'),
-      // 配了但全停着 = 配了等于没配
-      total: total === 0 ? 'off' : (on > 0 ? 'ok' : 'warn'),
-      models: total === 0 ? 'off' : (models > 0 ? 'ok' : 'warn'),
-      bare: bare > 0 ? 'warn' : 'ok'
-    }
-  }
-})
 
 // ---- 一键导入：发现到的 harness 一键「采用 Provider + 账号入池」，不用看文档 ----
 const findings = ref([])
@@ -177,27 +160,28 @@ async function quickImport(f) {
 
 function openCreate() {
   Object.assign(form, {
-    id: '', sourceId: 'default', displayName: '', api: '',
+    name: '', displayName: '', api: '',
     baseURL: '', accessKind: 'official', risk: 'low', riskNote: '',
-    stability: 'stable', credentialEnv: '', enabled: true,
-    modelsText: '', streamOnly: false, egress: ''
+    stability: 'stable', credentialEnv: '', state: 'active',
+    modelsText: '', streamOnly: false, egress: '', credentialKind: 'key'
   })
   advOpen.value = false
   editing.value = null
   dialog.value = true
 }
 
-// openEdit：API Key 一栏只回显环境变量引用。
-// 文件型引用（一键导入/发现生成的）显示为一条只读说明，不提供编辑入口——
+// openEdit：API Key 一栏只回显「引用来源」。
+// 文件型引用（一键导入/粘贴 Key 生成的）不回显路径也不提供编辑入口——
 // 用户不关心 Key 存在哪个文件，但也不能让它在保存时被悄悄清掉。
+// 输入框留空 = 不改凭据；要换 Key 就重新粘一个（语义切回 'key'）。
 function openEdit(p) {
   const c = (p && p.credential) || {}
   Object.assign(form, {
-    id: p.id, sourceId: p.sourceId, displayName: p.displayName || '', api: p.api,
+    name: p.name, displayName: p.displayName || '', api: p.api,
     baseURL: p.baseUrl, accessKind: p.accessKind, risk: p.risk, riskNote: p.riskNote || '',
     stability: p.stability, credentialEnv: c.apiKeyEnv || '',
-    enabled: !!p.enabled, modelsText: '', streamOnly: !!p.streamOnly,
-    egress: p.egress || ''
+    state: p.state === 'active' ? 'active' : 'paused', modelsText: '', streamOnly: !!p.streamOnly,
+    egress: p.egress || '', credentialKind: 'key'
   })
   editing.value = p
   advOpen.value = false
@@ -213,8 +197,9 @@ function parseModelsText() {
 }
 
 async function save() {
-  if (!form.id) { ElMessage.warning('Provider ID 必填（小写字母/数字/连字符，保存后不可改）'); return }
+  if (!form.name) { ElMessage.warning('名称必填（小写字母/数字/连字符；它同时是模型 ID 的前缀）'); return }
   if (!form.baseURL) { ElMessage.warning('baseURL 必填'); return }
+
   if ((form.risk === 'medium' || form.risk === 'high') && !form.riskNote) {
     // 风险栏在折叠区里：只弹 toast 的话，用户看不到该改哪个框。
     // 自动展开高级选项，让出错的字段当场可见。
@@ -227,25 +212,30 @@ async function save() {
     const cred = buildCredential()
     if (editing.value) {
       const patch = {
-        displayName: form.displayName, enabled: form.enabled,
+        // 改名与换 baseUrl 都走 PATCH（providerId 不变，引用不断）
+        name: form.name, baseUrl: form.baseURL,
+        displayName: form.displayName, state: form.state,
         riskNote: form.riskNote, streamOnly: form.streamOnly,
-        stability: form.stability, accessKind: form.accessKind, risk: form.risk
+        stability: form.stability, accessKind: form.accessKind, risk: form.risk,
+        api: form.api,
       }
       const extra = parseModelsText()
       if (extra.length) patch.models = extra
-      // 只有用户确实填了 env 才写回 credential。留空 = 不动原有引用：
+      // 只有用户确实填了才写回凭据。留空 = 不动原有引用：
       // 文件型引用（一键导入生成的）不能被空表单覆盖掉。
-      if (cred) patch.credential = cred
-      await api.updateProvider(form.id, patch)
+      // cred 带的是 {credentialInput, credentialKind}，由后端按语义落文件/存变量名。
+      if (cred) Object.assign(patch, cred)
+      await api.updateProvider(editing.value.providerId, patch)
     } else {
       await api.createProvider({
-        id: form.id, sourceId: form.sourceId, displayName: form.displayName,
+        name: form.name, displayName: form.displayName,
         api: form.api, baseUrl: form.baseURL, accessKind: form.accessKind,
         risk: form.risk, riskNote: form.riskNote, stability: form.stability,
-        credential: cred || {},
+        credential: {},
         egress: form.egress || '',
-        enabled: form.enabled,
-        models: parseModelsText().map(id => ({ id, enabled: true }))
+        state: form.state,
+        models: parseModelsText().map(id => ({ id, enabled: true })),
+        ...(cred || {})
       })
     }
     dialog.value = false
@@ -258,11 +248,11 @@ async function save() {
 
 // 测试：结果就地落到卡片上（弹框换成了卡片内的一条结果条）
 async function test(p) {
-  testing.value = p.id
+  testing.value = p.providerId
   try {
-    testRes.value = { ...testRes.value, [p.id]: await api.testProvider(p.id) }
+    testRes.value = { ...testRes.value, [p.providerId]: await api.testProvider(p.providerId) }
   } catch (e) {
-    testRes.value = { ...testRes.value, [p.id]: { ok: false, error: e.message } }
+    testRes.value = { ...testRes.value, [p.providerId]: { ok: false, error: e.message } }
   } finally {
     testing.value = ''
   }
@@ -270,9 +260,13 @@ async function test(p) {
 
 async function remove(p) {
   try {
-    await ElMessageBox.confirm(`删除 Provider「${p.id}」？引用它的配置会失效。`, '确认删除', { type: 'warning' })
+    await ElMessageBox.confirm(
+      `删除 Provider「${p.name}」（#${p.providerId}）？\n\n`
+      + `用它模型 ID 的客户端（如 ${p.name}/xxx）会收到明确报错。\n`
+      + `历史用量归因保留；该名字可以被新建的 Provider 复用。`,
+      '确认删除', { type: 'warning', dangerouslyUseHTMLString: false })
   } catch { return }
-  try { await api.deleteProvider(p.id); ElMessage.success('已删除'); load() }
+  try { await api.deleteProvider(p.providerId); ElMessage.success('已删除'); load() }
   catch (e) { ElMessage.error(e.message) }
 }
 
@@ -283,8 +277,13 @@ function apiHint(v) {
 }
 
 // 协议显示名：空值 = 自动识别（新增 Provider 的推荐选项）
+// 括号里是拼在 baseURL 后面的操作路径（requestPath，见 server/src/ir/codec.ts 约定）。
 function apiLabel(v) {
-  return v ? v : '自动识别（推荐）'
+  if (!v) return '自动识别（推荐）'
+  if (v === 'anthropic-messages') return 'anthropic-messages（+ /v1/messages）'
+  if (v === 'openai-completions') return 'openai-completions（+ chat/completions）'
+  if (v === 'openai-responses') return 'openai-responses（+ responses）'
+  return v
 }
 
 // Clash 出口快捷配置：本地场景基本只需要一个 Clash 混合端口
@@ -367,8 +366,8 @@ async function openModels(p) {
   modelsDlg.value = true
   try {
     // 先取最新 Provider：协议可能已被扫描探到并写回，用旧快照会显示成「继承默认」。
-    await refreshTarget(p.id)
-    const res = await api.fetchProviderModels(p.id)
+    await refreshTarget(p.providerId)
+    const res = await api.fetchProviderModels(p.providerId)
     const ids = res.models || []
     fetched.value = ids
     fetchedSource.value = res.source || ''
@@ -526,38 +525,6 @@ async function adoptModels() {
     </div>
   </header>
 
-  <!-- 概览：四张独立卡片，每张自带状态脊——数字回答「配好了没」 -->
-  <div class="ledger">
-    <div class="stat-card" :class="stat.tone.on">
-      <span class="edge" />
-      <div class="stat-body">
-        <span class="n">{{ stat.on }}</span>
-        <span class="k">启用中</span>
-      </div>
-    </div>
-    <div class="stat-card" :class="stat.tone.total">
-      <span class="edge" />
-      <div class="stat-body">
-        <span class="n">{{ stat.total }}</span>
-        <span class="k">共配置</span>
-      </div>
-    </div>
-    <div class="stat-card" :class="stat.tone.models">
-      <span class="edge" />
-      <div class="stat-body">
-        <span class="n">{{ stat.models }}</span>
-        <span class="k">对外模型</span>
-      </div>
-    </div>
-    <div class="stat-card" :class="stat.tone.bare">
-      <span class="edge" />
-      <div class="stat-body">
-        <span class="n">{{ stat.bare }}</span>
-        <span class="k">未选模型</span>
-      </div>
-    </div>
-  </div>
-
   <p v-if="err" class="err">加载失败：{{ err }}</p>
 
   <section class="qi">
@@ -597,8 +564,8 @@ async function adoptModels() {
     <button class="btn" @click="openCreate">添加外部 API</button>
   </div>
 
-  <ProviderCard v-for="p in list" :key="p.id" :p="p" :egresses="egressOptions"
-    :testing="testing === p.id" :test-res="testRes[p.id]"
+  <ProviderCard v-for="p in list" :key="p.providerId" :p="p" :egresses="egressOptions"
+    :testing="testing === p.providerId" :test-res="testRes[p.providerId]"
     @test="test" @reload="load" @models="openModels" @edit="openEdit" @remove="remove" />
 
   <el-dialog v-model="clashDlg" title="Clash 出口" width="480px">
@@ -627,14 +594,15 @@ async function adoptModels() {
   <el-dialog v-model="dialog" :title="editing ? '编辑 Provider' : '添加外部 API'" width="560px">
     <el-form label-width="110px">
       <el-form-item label="ID">
-        <el-input v-model="form.id" :disabled="!!editing" placeholder="如 acme-vllm（保存后不可改）" />
-      </el-form-item>
-      <el-form-item label="Source">
-        <el-input v-model="form.sourceId" :disabled="!!editing" placeholder="归属的上游源 ID" />
+        <el-input v-model="form.name" placeholder="如 acme-vllm（模型 ID 前缀：acme-vllm/xxx）" />
+        <div class="field-hint">
+          对外名——模型 ID 的前缀（<span class="mono">{{ form.name || 'name' }}/模型</span>）、账号归属、发现页判重都用它。
+          <template v-if="editing">可以改；改名后旧前缀立即失效，接口会给出明确报错。</template>
+        </div>
       </el-form-item>
       <el-form-item label="显示名"><el-input v-model="form.displayName" /></el-form-item>
       <el-form-item label="协议">
-        <el-select v-model="form.api" :disabled="!!editing" style="width:100%">
+        <el-select v-model="form.api" style="width:100%">
           <el-option v-for="a in APIS" :key="a.v || 'auto'" :value="a.v" :label="apiLabel(a.v)" />
         </el-select>
         <div class="field-hint">{{ apiHint(form.api) }}</div>
@@ -644,13 +612,30 @@ async function adoptModels() {
         <div class="field-hint">如 https://api.acme.com/v1 —— 不带 /chat/completions、/messages 这类操作路径。</div>
       </el-form-item>
       <el-form-item label="API Key">
-        <el-input v-model="form.credentialEnv" class="mono" placeholder="环境变量名，如 ACME_API_KEY（推荐）" />
+        <!-- 真实缺陷修复：以前这里只接受「环境变量名」，但用户看到「API Key」就是粘 Key，
+             粘完存成 apiKeyEnv → 网关当变量名找不到 → 上游 401，报错还说「环境变量未设置」。
+             Key 本体与变量名在字符形状上无法区分，所以由用户显式选语义，不靠猜。 -->
+        <el-radio-group v-model="form.credentialKind" size="small" class="cred-kind">
+          <el-radio-button value="key">直接填 Key</el-radio-button>
+          <el-radio-button value="env">用环境变量</el-radio-button>
+        </el-radio-group>
+        <el-input v-model="form.credentialEnv" class="mono" type="password" show-password
+          :placeholder="form.credentialKind === 'key'
+            ? '粘贴 API Key，如 sk-xxx / atr_xxx（保存后落到 config/credentials/）'
+            : '环境变量名，如 ACME_API_KEY'" />
         <div class="field-hint">
-          只存引用、不存明文：网关每次请求现读这个环境变量。留空 = 该上游无需鉴权。
+          <template v-if="form.credentialKind === 'key'">
+            粘进来即可用：保存后写入 <span class="mono">config/credentials/</span>（0600），
+            密钥不落数据库、不在列表回显。留空 = 不改动现有凭据。
+          </template>
+          <template v-else">
+            只存引用不存明文：网关每次请求现读该环境变量（改值需重启网关）。
+            留空 = 不改动现有凭据。
+          </template>
         </div>
         <div v-if="usesKeyFile" class="keyfile-note">
-          当前 Key 由一键导入生成的密钥文件提供（<span class="mono">{{ editing.credential.apiKeyFile }}</span>）。
-          留空即保持不变；填了环境变量名则以它为准。
+          当前 Key 由密钥文件提供（<span class="mono">{{ editing.credential.apiKeyFile }}</span>）。
+          留空即保持不变；重新粘贴一个 Key 或改填环境变量名则以本次为准。
         </div>
       </el-form-item>
 
@@ -698,7 +683,10 @@ async function adoptModels() {
         </div>
       </div>
 
-      <el-form-item label="启用"><el-switch v-model="form.enabled" /></el-form-item>
+      <el-form-item label="启用">
+        <el-switch :model-value="form.state === 'active'"
+          @update:model-value="v => form.state = v ? 'active' : 'paused'" />
+      </el-form-item>
     </el-form>
     <template #footer>
       <button class="btn ghost" @click="dialog = false">取消</button>
@@ -794,25 +782,6 @@ async function adoptModels() {
 .err { color: var(--bad); font-size: 12px; }
 .mono { font-family: var(--mono); }
 
-/* 概览：四张独立卡片（连体的一行会被误读成表头，拆开各自回答一件事） */
-.ledger { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 16px; }
-.stat-card {
-  display: flex; align-items: stretch; background: var(--panel);
-  border: 1px solid var(--line); border-radius: var(--r-box); overflow: hidden;
-}
-/* 左侧状态脊：与下面每条 Provider 用同一套语言。
-   四张卡同一条规则（ok/warn/off），不出现第二种读法。 */
-.edge { flex: none; width: 3px; background: var(--dim); }
-.stat-card.ok .edge { background: var(--ok); }
-.stat-card.warn .edge { background: var(--warn); }
-.stat-card.off .edge { background: var(--dim); }
-.stat-body { flex: 1; min-width: 0; padding: 11px 14px; display: flex; flex-direction: column; gap: 3px; }
-.stat-body .n { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 22px; line-height: 1; }
-.stat-body .k { font-size: 11px; color: var(--dim); }
-.stat-card.warn .n, .stat-card.warn .k { color: var(--warn); }
-/* 全停用/全空：数字也退到暗色，与「在跑」区分开 */
-.stat-card.off .n { color: var(--dim); }
-
 /* ---- 一键导入 ---- */
 .qi { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-box); padding: 14px 16px; margin-bottom: 16px; }
 .panel-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
@@ -844,6 +813,10 @@ async function adoptModels() {
   font-size: 11px; line-height: 1.5; padding-top: 6px; color: var(--accent);
 }
 .keyfile-note .mono { overflow-wrap: anywhere; }
+/* API Key 的语义二选一：先选「填 Key 还是填变量名」，再填内容。
+   以前只有一个框、语义写在小字提示里，用户粘了 Key 却被当成变量名（真实缺陷）。 */
+.cred-kind { margin-bottom: 8px; }
+.cred-kind :deep(.el-radio-button__inner) { font-size: 12px; padding: 5px 14px; }
 
 .empty { border: 1px dashed var(--line); border-radius: var(--r-box); padding: 28px 20px; text-align: center; margin-bottom: 16px; }
 .empty-title { margin: 0 0 6px; font-size: 14px; font-weight: 600; }

@@ -5,6 +5,18 @@ import { api } from '../api.js'
 
 const list = ref([])
 const err = ref('')
+// Provider 内部 id → 名字：发现项只带回 adoptedProviderId（数字），直接渲染会显示
+// 「已由 Provider「3」接管」——用户不认识数字，得映射回他起的名字。
+const providerNames = ref(new Map())
+async function loadProviderNames() {
+  try {
+    const ps = await api.providers()
+    providerNames.value = new Map(ps.map(p => [p.providerId, p.name]))
+  } catch { providerNames.value = new Map() }
+}
+function adoptedName(id) {
+  return providerNames.value.get(id) || `#${id}`
+}
 const scanning = ref(false)
 const adopting = ref('')
 const scannedAt = ref('')
@@ -180,14 +192,11 @@ onMounted(loadSidecar)
 
 // 导入共存登录态进账号池：token 由服务端读取落盘（不经过前端）。
 const importing = ref('')
-// 注意：credFileOf 恒为空（历史残留），实际恒走 `config/credentials/${id}-jwt` 分支。
-const credFileOf = {} // 建议 id → API Key 文件路径（与展示顺序一致）
-
 async function importAccount(f, a) {
   // id 取池子里下一个空闲编号（恒为 wb-N 形态；非 workbuddy 源的后端惯例是 ${key}-N，
   // 见 discover_api.ts shortAccountPrefix，前后端此处口径不一致，改动时注意）。
   const id = nextAccountId()
-  const credFile = credFileOf[a.tokenPath] || `config/credentials/${id}-jwt`
+  const credFile = `config/credentials/${id}-jwt`
   importing.value = a.tokenPath
   try {
     const acct = await api.importDiscoveredAccount({
@@ -210,6 +219,7 @@ async function loadPool() {
   } catch { /* 忽略 */ }
 }
 onMounted(loadPool)
+onMounted(loadProviderNames)
 
 function imported(a) {
   return pool.value.some(x => x.displayName === a.nickname)
@@ -332,7 +342,7 @@ function gotoProviders() {
       <div class="finding-main">
         <div class="finding-title">{{ f.harness }} <span class="dim">（{{ statusText[f.status] || f.status }}）</span></div>
         <div v-if="f.adoptedProviderId" class="adopted-note">
-          已由 Provider「{{ f.adoptedProviderId }}」接管
+          已由 Provider「{{ adoptedName(f.adoptedProviderId) }}」接管
           <button class="linklike" @click="gotoProviders">去 Provider 页查看/删除</button>
         </div>
         <div class="finding-detail">{{ f.detail }}</div>
@@ -357,7 +367,7 @@ function gotoProviders() {
         v-if="groupOf(f) === 'ready'"
         class="btn primary"
         :disabled="adopting === f.key"
-        :title="f.adoptedProviderId ? `已由「${f.adoptedProviderId}」接管，点此跳到 Provider 页` : ''"
+        :title="f.adoptedProviderId ? `已由「${adoptedName(f.adoptedProviderId)}」接管，点此跳到 Provider 页` : ''"
         @click="f.adoptedProviderId ? gotoProviders() : adopt(f)">
         {{ f.adoptedProviderId ? '去查看' : adopting === f.key ? '采用中…' : '采用' }}
       </button>

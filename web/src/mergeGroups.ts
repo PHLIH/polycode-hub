@@ -3,8 +3,9 @@
 // TPS/TTFT 按 sampled 加权平均。
 
 export interface MergeRow {
-  providerId: string
-  sourceId: string
+  // 展示归因用 Provider 名（不是内部 id）——名字是用户的心智单位，
+  // 删除后重建同名不该在归因表里裂成两行。
+  providerName: string
   modelId: string
   requests?: number
   inputTokens?: number
@@ -23,11 +24,11 @@ export interface MergeRow {
 export interface MergeGroup {
   id: string // group-开头的本地 id
   name: string // 用户起的组名
-  keys: string[] // providerId/modelId 组合键
+  keys: string[] // providerName/modelId 组合键
 }
 
-export const rowKey = (r: Pick<MergeRow, 'providerId' | 'modelId'>): string =>
-  `${r.providerId}/${r.modelId}`
+export const rowKey = (r: Pick<MergeRow, 'providerName' | 'modelId'>): string =>
+  `${r.providerName}/${r.modelId}`
 
 /** 反推一行的输入侧分母（命中数 / 命中率；率为 0 或 null 时分母为 0）。 */
 export function denomOf(r: Pick<MergeRow, 'cacheReadTokens' | 'cacheHitRate'>): number {
@@ -41,7 +42,7 @@ const NUM_FIELDS = ['requests', 'inputTokens', 'outputTokens', 'cacheReadTokens'
 /** 多行合成一行：数字相加，命中率按总命中/总输入，TPS 按 sampled 加权。 */
 export function mergeRows(rows: MergeRow[], name: string): MergeRow {
   const acc: MergeRow = {
-    providerId: name, sourceId: '', modelId: '',
+    providerName: name, modelId: '',
     requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
     cacheCreationTokens: 0, reasoningTokens: 0, totalTokens: 0, errors: 0,
     cacheHitRate: null, avgTps: null, avgTtftMs: null, sampled: 0,

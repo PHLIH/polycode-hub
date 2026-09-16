@@ -90,11 +90,14 @@ export const api = {
   },
   providers: async () => unwrapList(await req('GET', '/admin/api/providers'), 'providers'),
   createProvider: (p) => req('POST', '/admin/api/providers', p),
-  updateProvider: (id, patch) => req('PATCH', `/admin/api/providers/${encodeURIComponent(id)}`, patch),
-  deleteProvider: (id) => req('DELETE', `/admin/api/providers/${encodeURIComponent(id)}`),
-  testProvider: (id) => req('POST', `/admin/api/providers/${encodeURIComponent(id)}/test`),
-  fetchProviderModels: async (id) => {
-    const data = await req('GET', `/admin/api/providers/${encodeURIComponent(id)}/models`)
+  // 路径参数是 Provider 的内部 id（数字）；name 可改，id 不变。
+  updateProvider: (pid, patch) => req('PATCH', `/admin/api/providers/${encodeURIComponent(pid)}`, patch),
+  deleteProvider: (pid) => req('DELETE', `/admin/api/providers/${encodeURIComponent(pid)}`),
+  // 凭证明文按需查看（列表只下发引用，明文走这个显式端点）。
+  providerCredential: (pid) => req('GET', `/admin/api/providers/${encodeURIComponent(pid)}/credential`),
+  testProvider: (pid) => req('POST', `/admin/api/providers/${encodeURIComponent(pid)}/test`),
+  fetchProviderModels: async (pid) => {
+    const data = await req('GET', `/admin/api/providers/${encodeURIComponent(pid)}/models`)
     if (Array.isArray(data)) return { models: data, source: '', protocols: {}, caps: {}, free: [] }
     return {
       models: (data && data.models) || [],
@@ -105,23 +108,23 @@ export const api = {
     }
   },
   // 改单个模型的协议（空字符串 = 继承 Provider 默认）
-  updateProviderModelProtocol: (id, modelId, protocol) =>
-    req('PUT', `/admin/api/providers/${encodeURIComponent(id)}/models/${encodeURIComponent(modelId)}/protocol`, { protocol }),
+  updateProviderModelProtocol: (pid, modelId, protocol) =>
+    req('PUT', `/admin/api/providers/${encodeURIComponent(pid)}/models/${encodeURIComponent(modelId)}/protocol`, { protocol }),
   // 账号权重：PATCH /admin/api/accounts/:id {weight}（正整数，默认 1）
   updateAccountWeight: (id, weight) =>
     req('PATCH', `/admin/api/accounts/${encodeURIComponent(id)}`, { weight }),
   // 改单个模型的出口代理（空字符串 = 继承 Provider 默认）
-  updateProviderModelEgress: (id, modelId, egress) =>
-    req('PUT', `/admin/api/providers/${encodeURIComponent(id)}/models/${encodeURIComponent(modelId)}/egress`, { egress }),
+  updateProviderModelEgress: (pid, modelId, egress) =>
+    req('PUT', `/admin/api/providers/${encodeURIComponent(pid)}/models/${encodeURIComponent(modelId)}/egress`, { egress }),
   // 开关单个模型：对外暴露（/v1/models）、路由、测试候选都以它为准
-  updateProviderModelEnabled: (id, modelId, enabled) =>
-    req('PUT', `/admin/api/providers/${encodeURIComponent(id)}/models/${encodeURIComponent(modelId)}/enabled`, { enabled }),
+  updateProviderModelEnabled: (pid, modelId, enabled) =>
+    req('PUT', `/admin/api/providers/${encodeURIComponent(pid)}/models/${encodeURIComponent(modelId)}/enabled`, { enabled }),
   // 删单个模型（手填错的/上游下架的）。PATCH models 只增不减，删除只能走这里。
-  deleteProviderModel: (id, modelId) =>
-    req('DELETE', `/admin/api/providers/${encodeURIComponent(id)}/models/${encodeURIComponent(modelId)}`),
+  deleteProviderModel: (pid, modelId) =>
+    req('DELETE', `/admin/api/providers/${encodeURIComponent(pid)}/models/${encodeURIComponent(modelId)}`),
   // 模型备注：一句话运维知识（如「23 点后才免费」）。空串 = 清掉。
-  updateProviderModelNote: (id, modelId, note) =>
-    req('PUT', `/admin/api/providers/${encodeURIComponent(id)}/models/${encodeURIComponent(modelId)}/note`, { note }),
+  updateProviderModelNote: (pid, modelId, note) =>
+    req('PUT', `/admin/api/providers/${encodeURIComponent(pid)}/models/${encodeURIComponent(modelId)}/note`, { note }),
   // 出口代理 CRUD（顶层定义，Provider/模型的 egress 引用这里的 id）
   putEgress: (id, kind, addr) =>
     req('PUT', `/admin/api/egresses/${encodeURIComponent(id)}`, { kind, addr }),
@@ -131,9 +134,9 @@ export const api = {
     const data = await req('GET', '/admin/api/egresses')
     return (data && data.egresses) || []
   },
-  scanProviderModels: async (id, models, opts = {}) => {
+  scanProviderModels: async (pid, models, opts = {}) => {
     // 识别/扫描会真的打上游，慢是正常的——给足超时，但要能取消（opts.signal）。
-    const data = await req('POST', `/admin/api/providers/${encodeURIComponent(id)}/scan`,
+    const data = await req('POST', `/admin/api/providers/${encodeURIComponent(pid)}/scan`,
       { models: models || [] }, { timeoutMs: 120000, ...opts })
     return (data && data.results) || []
   },
@@ -147,6 +150,8 @@ export const api = {
   sidecarEndpoint: (body) => req('POST', '/admin/api/sidecar/endpoint', body),
   updateAccount: (id, patch) => req('PATCH', `/admin/api/accounts/${encodeURIComponent(id)}`, patch),
   deleteAccount: (id) => req('DELETE', `/admin/api/accounts/${encodeURIComponent(id)}`),
+  // 账号凭证明文按需查看（与 Provider 同口径）。
+  accountCredential: (id) => req('GET', `/admin/api/accounts/${encodeURIComponent(id)}/credential`),
   // 账号测试：用该账号凭据打一次真实请求；model 空 = 由后端挑默认模型。
   testAccount: (id, model) => req('POST', `/admin/api/accounts/${encodeURIComponent(id)}/test`, { model: model || '' }),
   // 重置惩罚（零上游成本）：只清连败与冷却，不探活。

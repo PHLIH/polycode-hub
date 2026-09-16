@@ -151,7 +151,7 @@ const testModel = ref({}) // accountId → 选中的模型（缺省取该源第�
 function modelOptions(a) {
   const ids = new Set()
   for (const p of providers.value) {
-    if (p.sourceId !== a.sourceId) continue
+    if (p.providerId !== a.providerId) continue
     for (const m of p.models || []) if (m.enabled !== false) ids.add(m.id)
   }
   return [...ids].sort()
@@ -182,7 +182,9 @@ async function reset(a) {
 }
 
 const form = reactive({
-  id: '', sourceId: '', displayName: '', credentialEnv: ''
+  id: '', providerName: '', displayName: '', credentialEnv: '',
+  // 与 Provider 页同口径：'key' = 粘 Key 本体（后端落凭据文件）；'env' = 环境变量名。
+  credentialKind: 'key'
 })
 
 async function load() {
@@ -190,7 +192,9 @@ async function load() {
     const [as, ps] = await Promise.all([api.accounts(), api.providers().catch(() => [])])
     list.value = as
     providers.value = ps
-    sourceOptions.value = [...new Set(ps.map(p => p.sourceId).filter(Boolean))]
+    // 归属下拉 = Provider id 列表（账号就是挂在某个 Provider 名下的）。
+    // 以前列的是去重后的抽象「源」，还可能出现 default 这种名字，根本不知道挂给了谁。
+    sourceOptions.value = ps.map(p => p.name).filter(Boolean).sort()
     err.value = ''
   }
   catch (e) { err.value = e.message }
@@ -198,11 +202,11 @@ async function load() {
 }
 onMounted(load)
 
-// 按归属源分组是本页的结构：账号永远挂在它绑定的源下面；
-// 每组自带的「添加账号」直接预绑定 sourceId。组内按失败率降序（运维第一眼：哪个号在出问题）。
+// 按归属 Provider 分组是本页的结构：账号永远挂在它绑定的 Provider 下面；
+// 每组自带的「添加账号」直接预绑定 providerId。组内按失败率降序（运维第一眼：哪个号在出问题）。
 const groups = computed(() => {
   const bySource = {}
-  for (const a of list.value) (bySource[a.sourceId] ||= []).push(a)
+  for (const a of list.value) (bySource[String(a.providerId)] ||= []).push(a)
   const ids = [...new Set([...sourceOptions.value, ...Object.keys(bySource)])]
   const cmp = (a, b) =>
     ((hOf(b) || {}).errorRate || 0) - ((hOf(a) || {}).errorRate || 0) ||
@@ -212,20 +216,45 @@ const groups = computed(() => {
   return gs.filter(g => g.accounts.length).concat(gs.filter(g => !g.accounts.length))
 })
 
+// 当前表单选中的源下面有哪些 Provider：用来提示「账号凭据会接管该源鉴权」。
+// 账号与 Provider 同源即互相影响（proxy.ts:203 转发、probe.ts:214 探测都取
+// 「同源第一个可用账号」的凭据覆盖 Provider 凭据），所以这个提示不能省：
+// 用户在 default 源下随手加个测试账号，就能把已配好的 Provider Key 顶掉。
+// Provider 名 → 内部 id：分组键用 id（改名不影响账号归属），显示用名。
+const idByName = computed(() => {
+  const m = new Map()
+  for (const p of providers.value) m.set(p.name, p.providerId)
+  return m
+})
+// 反向：内部 id → 名字（分组头展示）。
+const nameById = computed(() => {
+  const m = new Map()
+  for (const p of providers.value) m.set(String(p.providerId), p.name)
+  return m
+})
+const siblingProviders = computed(() => (form.providerName ? [form.providerName] : []))
+
+// 模板用：该分组对应的 Provider 是否存在（分组键就是 Provider id）。
+function providersOf(groupKey) {
+  const n = nameById.value.get(String(groupKey))
+  return n ? [n] : []
+}
+
 // 展开查看健康详情（自绘深色，替代 el-table 的白色展开行）
 const expanded = ref('')
 function toggleExpand(id) { expanded.value = expanded.value === id ? '' : id }
 
-function openCreate(sourceId) {
-  Object.assign(form, { id: '', sourceId, displayName: '', credentialEnv: '' })
+function openCreate(providerName) {
+  Object.assign(form, { id: '', providerName, displayName: '', credentialEnv: '', credentialKind: 'key' })
   editing.value = null
   dialog.value = true
 }
 
 function openEdit(a) {
   Object.assign(form, {
-    id: a.id, sourceId: a.sourceId, displayName: a.displayName || '',
-    credentialEnv: (a.credential && a.credential.apiKeyEnv) || ''
+    id: a.id, providerName: nameById.value.get(String(a.providerId)) || '', displayName: a.displayName || '',
+    credentialEnv: (a.credential && a.credential.apiKeyEnv) || '',
+    credentialKind: 'key'
   })
   editing.value = a
   dialog.value = true
@@ -233,14 +262,25 @@ function openEdit(a) {
 
 async function save() {
   if (!form.id) { ElMessage.warning('账号 ID 必填'); return }
-  if (!form.sourceId) { ElMessage.warning('sourceId 必填（归属的上游源）'); return }
+  if (!form.providerName) { ElMessage.warning('归属 Provider 必填（选择这个账号挂给谁）'); return }
+  // 重名直接拦在本地：后端也会拒（409），但本地提示能立刻指出是哪个名字撞了，
+  // 不用等一次往返。
+  if (!editing.value && list.value.some(a => a.id === form.id.trim())) {
+    ElMessage.warning(`账号 ID「${form.id.trim()}」已存在，换一个名字`)
+    return
+  }
   try {
+    // 凭据输入交给后端按语义处理：'key' 落凭据文件，'env' 存变量名引用。
+    // 空 = 不改动现有凭据（编辑时不清掉已配的 Key）。
+    const cred = form.credentialEnv.trim()
+      ? { credentialInput: form.credentialEnv.trim(), credentialKind: form.credentialKind }
+      : {}
     if (editing.value) {
-      await api.updateAccount(form.id, { displayName: form.displayName })
+      await api.updateAccount(form.id, { displayName: form.displayName, ...cred })
     } else {
       await api.createAccount({
-        id: form.id, sourceId: form.sourceId, displayName: form.displayName,
-        credential: form.credentialEnv ? { apiKeyEnv: form.credentialEnv } : {}
+        id: form.id, providerName: form.providerName, displayName: form.displayName,
+        credential: {}, ...cred
       })
     }
     dialog.value = false
@@ -326,11 +366,18 @@ async function setWeight(a, v) {
     还没有可挂账号的上游源。先到「Provider」页添加上游源，再回到这里往源下面加账号。
   </p>
 
-  <!-- 账号按归属源分组：加账号 = 往某个源下面加，sourceId 预绑定 -->
+  <!-- 账号按归属 Provider 分组：加账号 = 往某个 Provider 下面加，providerId 预绑定 -->
   <section v-for="g in groups" :key="g.id" class="src">
     <header class="src-head">
-      <h3>{{ g.id }}</h3>
+      <h3>{{ providersOf(g.id)[0] || g.id }}</h3>
+      <span v-if="nameById.get(String(g.id))" class="mono pid-h">#{{ g.id }}</span>
       <span class="src-count num">{{ g.accounts.length }} 个账号</span>
+      <!-- 名下账号接管该 Provider 鉴权（见 siblingProviders 注释）：有账号时必须说清楚，
+           否则用户看到「Provider 配了 Key 却用这个号的钱」完全摸不着头脑。 -->
+      <span v-if="g.accounts.length && providersOf(g.id).length" class="src-takeover"
+        :title="`名下有可用账号时，账号凭据会覆盖 Provider 自己配的凭据（真实转发与测试走同一条规则）`">
+        接管 {{ providersOf(g.id).join('、') }} 的鉴权
+      </span>
       <span class="grow"></span>
       <button class="btn" @click="openCreate(g.id)">＋ 添加账号</button>
     </header>
@@ -417,16 +464,42 @@ async function setWeight(a, v) {
   <el-dialog v-model="dialog" :title="editing ? '编辑账号' : '添加账号'" width="480px">
     <el-form label-width="110px">
       <el-form-item label="ID"><el-input v-model="form.id" :disabled="!!editing" placeholder="如 zcode-1" /></el-form-item>
-      <el-form-item label="归属源">
-        <el-select v-model="form.sourceId" :disabled="!!editing || !!form.sourceId" style="width:100%"
-          :placeholder="sourceOptions.length ? '选择上游源' : '先到 Provider 页添加上游源'">
+      <el-form-item label="归属 Provider">
+        <el-select v-model="form.providerName" :disabled="!!editing || !!form.providerName" style="width:100%"
+          filterable :placeholder="sourceOptions.length ? '选择这个账号挂给哪个 Provider' : '先到 Provider 页添加上游'">
           <el-option v-for="s in sourceOptions" :key="s" :label="s" :value="s" />
         </el-select>
+        <div class="field-hint">
+          账号就是「某个 Provider 的一组可轮换凭据」。归到谁名下，就在谁请求时被轮询用到。
+        </div>
       </el-form-item>
       <el-form-item label="显示名"><el-input v-model="form.displayName" /></el-form-item>
-      <el-form-item label="API Key env">
-        <el-input v-model="form.credentialEnv" :disabled="!!editing" class="mono"
-          placeholder="环境变量名，如 ZCODE_JWT" />
+      <el-form-item label="API Key">
+        <!-- 与 Provider 页同口径：显式选语义，避免把 Key 本体误存成环境变量名。 -->
+        <el-radio-group v-model="form.credentialKind" size="small" class="cred-kind">
+          <el-radio-button value="key">直接填 Key</el-radio-button>
+          <el-radio-button value="env">用环境变量</el-radio-button>
+        </el-radio-group>
+        <el-input v-model="form.credentialEnv" :disabled="!!editing && form.credentialKind === 'env'"
+          class="mono" type="password" show-password
+          :placeholder="form.credentialKind === 'key'
+            ? '粘贴 API Key（保存后落到 config/credentials/）'
+            : '环境变量名，如 ZCODE_JWT'" />
+        <div class="field-hint">
+          <template v-if="form.credentialKind === 'key'">
+            粘进来即可用：写入 <span class="mono">config/credentials/</span>（0600），不在列表回显明文。
+          </template>
+          <template v-else>只存变量名引用；改值需重启网关。</template>
+          留空 = 不改动现有凭据。
+        </div>
+        <!-- 真实踩坑：同源有可用账号时，账号凭据会覆盖该源 Provider 自己的凭据
+             （proxy.ts:203 真实转发、probe.ts:214 探测，同一条规则）。往「default」
+             这类已配了 Key 的源下面加账号，会让那个 Provider 改用新账号的 Key。 -->
+        <div v-if="siblingProviders.length" class="cred-warn">
+          该源下已有 Provider（<span class="mono">{{ siblingProviders.join('、') }}</span>）：
+          这个账号一旦可用，它的 Key 会**接管**该源所有 Provider 的鉴权——Provider 自己配的 Key 会被绕过。
+          只想给某个 Provider 单独配 Key，就别往它的源下面挂账号。
+        </div>
       </el-form-item>
     </el-form>
     <template #footer>
@@ -491,6 +564,10 @@ async function setWeight(a, v) {
 .btn.ghost { background: transparent; color: var(--dim); border: 1px solid var(--line); }
 /* .linklike 基础样式已上收 styles.css */
 .dim { color: var(--dim); }
+/* API Key 的语义二选一（与 Provider 页同口径，见 Providers.vue） */
+.cred-kind { margin-bottom: 8px; }
+.cred-kind :deep(.el-radio-button__inner) { font-size: 12px; padding: 5px 14px; }
+.field-hint { color: var(--dim); font-size: 11px; line-height: 1.5; padding-top: 2px; }
 .err { color: var(--bad); }
 .empty { color: var(--dim); border: 1px dashed var(--line); border-radius: 10px; padding: 40px 24px; text-align: center; }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--dim); flex: none; }
@@ -507,6 +584,20 @@ async function setWeight(a, v) {
 .src-head { display: flex; align-items: center; gap: 10px; padding: 11px 16px; }
 .src-head h3 { margin: 0; font-size: 15px; font-family: var(--mono); }
 .src-count { color: var(--dim); font-size: 12px; }
+/* 「接管鉴权」提示：账号与 Provider 同源时的真实影响，不是装饰 */
+.pid-h { color: var(--dim); opacity: .7; font-size: 11px; margin-left: 4px; }
+.src-takeover {
+  font-size: 11px; color: var(--warn); cursor: help;
+  border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent);
+  border-radius: var(--r-chip); padding: 1px 8px; white-space: nowrap;
+}
+/* 账号弹窗里的接管警告：与字段提示区分开，避免被当说明文字略过 */
+.cred-warn {
+  margin-top: 6px; padding: 7px 10px; font-size: 11px; line-height: 1.6;
+  color: var(--warn); border-radius: var(--r-ctl);
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+  border-left: 2px solid var(--warn);
+}
 .grow { flex: 1; }
 .src-empty { color: var(--dim); font-size: 13px; padding: 0 16px 12px; margin: 0; }
 
