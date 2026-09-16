@@ -4,7 +4,7 @@
 
 import { randomBytes } from 'node:crypto'
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, join, resolve, sep } from 'node:path'
 
 // Service 是项目内一个可启动的服务（如前端、后端）。
 export interface Service {
@@ -45,8 +45,23 @@ export class Store {
     this.dir = dir
   }
 
+  // 日志文件路径。projectID/service 都会拼进文件名，**必须**先收敛：
+  // 这两个值一个来自 URL 路径参数、一个来自 query（projects_app.ts handleLogs），
+  // 未净化时 `service=../../../../etc/passwd` 会让 join 直接跳出 logs/ 目录，
+  // 落到 /etc/passwd.log——GET 可读任意 .log，DELETE 更会把它 truncate 成 0 字节。
+  // 收敛口径与 newID() 一致（只留 [A-Za-z0-9._-]），并把连续点折成单点，
+  // 避免 ".." 这类看着像上级目录的名字（同 adminapi/credentialPathFor 的做法）。
+  // 收敛后仍做一次「必须留在 logs/ 内」的断言，防将来有人改坏上面的字符集。
   logPath(projectID: string, service: string): string {
-    return join(this.dir, 'logs', `${projectID}-${service}.log`)
+    const safe = (s: string): string =>
+      s.replace(/[^a-zA-Z0-9._-]/g, '-').replace(/\.{2,}/g, '.').replace(/^\.+|\.+$/g, '')
+    const logsDir = resolve(this.dir, 'logs')
+    const file = resolve(logsDir, `${safe(projectID)}-${safe(service)}.log`)
+    // 兜底断言：收敛逻辑若被改坏，这里宁可报错也不要读/删到目录外的文件。
+    if (!file.startsWith(logsDir + sep)) {
+      throw new Error(`projects: 非法日志路径 id=${projectID} service=${service}`)
+    }
+    return file
   }
 
   // load 读定义。文件缺失 → 空表（不报错）；损坏 → 报错

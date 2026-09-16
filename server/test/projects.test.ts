@@ -4,7 +4,7 @@
 import { afterAll, describe, expect, test, vi } from 'vitest'
 import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join, sep } from 'node:path'
 import { createServer, type AddressInfo } from 'node:net'
 import { spawn } from 'node:child_process'
 import { Store, newID, type Project, type Service } from '../src/projects/store.ts'
@@ -129,6 +129,33 @@ describe('Store 定义/状态持久化', () => {
     expect(id.length).toBe('p-'.length + 16)
     expect(id.startsWith('p-')).toBe(true)
     expect(newID()).not.toBe(id)
+  })
+
+  // 回归锚点：logPath 的 projectID/service 一个来自 URL 路径参数、一个来自 query。
+  // 未净化时 `service=../../../../etc/passwd` 让 join 跳出 logs/ 目录，
+  // 落到 /etc/passwd.log —— GET /logs 可读任意 .log 全文，
+  // DELETE /logs 更会把它 truncate 成 0 字节（破坏性写）。这是安全缺陷，不是体验问题。
+  test('logPath 收敛路径穿越：恶意 id/service 不得逃出 logs/ 目录', () => {
+    const s = new Store(makeTemp('polycode-ptrav-'))
+    const logsDir = join(s.dir, 'logs')
+    const evil = [
+      ['p-1', '../../../../../../etc/passwd'],
+      ['p-1', '..'],
+      ['../../../../etc/passwd', 'x'],
+      ['a/../../../../etc/passwd', 'y'],
+      ['p-1', 'a/../../b'],
+      ['p-1', '....//....//etc/passwd'],
+      ['p-1', '/etc/passwd'],
+    ] as const
+    for (const [id, svc] of evil) {
+      const p = s.logPath(id, svc)
+      // 必须仍落在 <dir>/logs/ 内，且文件名里不含路径分隔符
+      expect(p.startsWith(logsDir + sep)).toBe(true)
+      expect(basename(p).includes('/')).toBe(false)
+      expect(basename(p).includes('..')).toBe(false)
+    }
+    // 正常输入不受影响（不能为了安全把合法名字也改了）
+    expect(s.logPath('p-1', 'backend')).toBe(join(logsDir, 'p-1-backend.log'))
   })
 })
 
@@ -256,6 +283,22 @@ describe('端口探测', () => {
     } finally {
       server.close()
     }
+  })
+
+  // 回归锚点：portBusy 对非法端口曾 **reject**（net.connect 同步抛 ERR_SOCKET_BAD_PORT，
+  // Promise 构造器里的同步抛错变成 rejection），而调用方全都没 catch
+  // （manager.viewOf / startService / freePort / killPort）——
+  // projects.json 里一个 port:70000 就能让整个项目列表 500。
+  // 字符串 '8080' 更阴险：不抛错，却静默被当成端口 0，端口冲突检测彻底失效。
+  test('portBusy 对非法端口一律 resolve(false)，绝不 reject', async () => {
+    const bad = [0, -1, 65536, 70000, 1.5, NaN, Infinity, '8080', null, undefined]
+    for (const p of bad) {
+      // 不该抛：整个项目列表的可达路径
+      const r = await portBusy(p as number)
+      expect(r).toBe(false)
+    }
+    // 端口 0 语义：非网络服务，视为不忙
+    expect(await portBusy(0)).toBe(false)
   })
 
   test('PortOwner 找到监听者（lsof）', async () => {

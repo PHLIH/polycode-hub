@@ -132,9 +132,24 @@ export async function killTree(pid: number, graceMs = 5000): Promise<void> {
 }
 
 // portBusy 探测 127.0.0.1:port 是否被监听。
+//
+// 非法端口必须先挡掉：net.connect 对 <0 / >65535 / 小数 / NaN 会同步抛
+// ERR_SOCKET_BAD_PORT，而 Promise 构造器里的同步抛错会变成 **rejection**。
+// 而调用方全都没有 catch（manager.viewOf / startService / freePort / killPort），
+// 于是 projects.json 里一个 port:70000 就能让整个项目列表 500。
+// 字符串 '8080' 更阴险：不抛错，但 net.connect 把它当 0 处理 → 静默返回 false，
+// 端口冲突检测完全失效（服务被判为「端口未就绪」且检测不到占用）。
+// 这里统一按「非法端口 = 不是可用端口 = 不忙」处理，并保证只 resolve 不 reject。
 export function portBusy(port: number): Promise<boolean> {
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return Promise.resolve(false)
   return new Promise((resolve) => {
-    const socket = net.connect({ host: '127.0.0.1', port })
+    let socket: net.Socket
+    try {
+      socket = net.connect({ host: '127.0.0.1', port })
+    } catch {
+      resolve(false) // 兜底：任何同步抛错都不许逃逸成 rejection
+      return
+    }
     const done = (busy: boolean): void => {
       socket.destroy()
       resolve(busy)
