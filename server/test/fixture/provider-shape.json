@@ -1,6 +1,7 @@
 {
-  "id": "demo",
-  "sourceId": "src",
+  "providerId": 1,
+  "name": "demo",
+  "state": "active",
   "displayName": "Demo",
   "accessKind": "official",
   "risk": "low",
@@ -13,13 +14,11 @@
   "headers": {
     "X-Title": "t"
   },
-  "enabled": true,
   "priority": 0,
   "streamOnly": true,
   "models": [
     {
       "id": "m1",
-      "providerId": "demo",
       "input": [
         "text"
       ],

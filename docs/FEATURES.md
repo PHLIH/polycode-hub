@@ -21,7 +21,7 @@
 | POST | `/v1/chat/completions` | OpenAI Chat Completions 入站 |
 | POST | `/v1/responses` | OpenAI Responses 入站 |
 | POST | `/chat/completions`、`/responses` | 裸路径别名（Base URL 填到端口根的客户端用，`proxy.ts:128-130`） |
-| GET | `/v1/models`、`/models` | 模型目录，OpenAI `{"data":[{id}]}` 形态，id 为限定名 `sourceId/modelId`（`proxy.ts:144-158`）；受 `gateway_key` 校验（`proxy.ts:146-149`，失败 401） |
+| GET | `/v1/models`、`/models` | 模型目录，OpenAI `{"data":[{id}]}` 形态，id 为限定名 `name/modelId`（`proxy.ts:144-158`）；受 `gateway_key` 校验（`proxy.ts:146-149`，失败 401） |
 | GET | `/health` | 健康检查，返回 `{ok:true, apps:N}`，N = 启用中的 Provider 数（`proxy.ts:139-142`）；**不鉴权**（注释 `proxy.ts:133-135`） |
 
 - **流式 / 非流式**：都支持。非流式走整体 JSON（`proxy.ts:353-378`）；流式走 SSE（`Content-Type: text/event-stream`，`proxy.ts:540-547`）。
@@ -47,7 +47,7 @@
 1. 过滤：只留 `enabled` 且风险在 `riskMax` 内的 Provider（`scheduler.ts:10-16`，`riskAllowed` 见 `model/index.ts:19-21`）。
 2. 排序：按 `priority` 升序稳定排序；同 priority 段内按计数器轮转（`pickOrderPublic:66-79`）。
 3. 模型匹配（`matchModel:36-45`）：Provider 未声明 models = 透明代理，接受任意模型；否则模型 id 精确相等**且** `enabled` 才接受。
-4. 限定名：`sourceId/modelId` 形态，仅当前缀是已知 sourceId 时才视为限定（`splitModelRef:18-26`）；上游只认裸模型名，网关在转发前剥前缀（`proxy.ts:185-187`）。
+4. 限定名：`name/modelId` 形态，仅当前缀是已知 Provider 名时才视为限定（`splitModelRef:18-28`）；上游只认裸模型名，网关在转发前剥前缀（`proxy.ts:185-187`）。
 5. 上下文预检（默认关，`precheck_context: false`）：开启后，用 `len/4` 粗估（`estimateRequestTokens:119-121`）超 `context_window` 的候选被跳过——拒绝 + 换源，**绝不截断**（`pickOrder:84-101`，注释 `:82`）。`context_window` 未知（0/缺省）= 放行。
 6. 非流式请求跳过 `stream_only` 的源（`pickOrder:94`，如 WorkBuddy 只走流式）。
 
@@ -85,9 +85,15 @@
 
 - **配置文件**：`config/apps.yaml`（本机正式配置，git 忽略）；模板 `config/apps.example.yaml`（171 行，v0.4 口径）。`POLYCODE_CONFIG` 可覆盖路径（`cli.ts:72`）；文件不存在 → 全默认零配置启动（`config/index.ts:50-54`）。
 - **gateway 真实字段**（`config/index.ts:18-31`）：`host`（缺省 `127.0.0.1`）、`port`（缺省 3000）、`admin_key`、`gateway_key`（空=不校验）、`default_model`、`risk_max`（low/medium/high，缺省 high=不过滤）、`precheck_context`、`first_byte_timeout_ms`、`stream_idle_timeout_ms`。启动参数 `--port` 可覆盖端口（`cli.ts:73-80`）。
-- **Provider 真实字段**（`config/index.ts`）：`id`（只允许小写字母/数字/连字符，永久不可改，`model/index.ts:150-152`）、`source_id`、`display_name`、`access_kind`（official/session-reuse/simulated-login/reverse）、`risk` + `risk_note`（medium/high 必填，`model/index.ts:157-159`）、`stability`、`api`（空=自动探测）、`base_url`（anthropic-messages 停域名根由网关拼 `/v1/messages`，openai 两种停 `/v1`，`upstream.ts:392-405` 有去重 `/v1` 逻辑）、`credential`、`headers`、`dynamic_headers`（绝对路径命令，不走 shell，缺省超时 8000ms）、`enabled`、`priority`、`stream_only`、`tags`、`models`、`probe_model`、`egress`。
+- **Provider 真实字段**（`config/index.ts`）：`id`（只允许小写字母/数字/连字符，永久不可改，`model/index.ts:150-152`）、`display_name`、`access_kind`（official/session-reuse/simulated-login/reverse）、`risk` + `risk_note`（medium/high 必填，`model/index.ts:157-159`）、`stability`、`api`（空=自动探测）、`base_url`（anthropic-messages 停域名根由网关拼 `/v1/messages`，openai 两种停 `/v1`，`upstream.ts:392-405` 有去重 `/v1` 逻辑）、`credential`、`headers`、`dynamic_headers`（绝对路径命令，不走 shell，缺省超时 8000ms）、`enabled`、`priority`、`stream_only`、`tags`、`models`、`probe_model`、`egress`。
 - **严格模式**：未知字段直接抛错拒绝启动（`config/index.ts:173-184 strictMap`，含 jwt/token 等明文凭据字段亦拒，注释 `:1-2`）；跨实体校验 source 引用 / egress 引用 / 重复 id / 端口范围（`:281-315`）。示例文件本身有测试保证可解析。
 - **凭据不落明文**：只存引用 `api_key_env`（环境变量，改值需重启）或 `api_key_file`（`config/credentials/` 下文件，**改内容即热轮换**，每次请求现读，`model/index.ts:34-47`）；无凭据返回 `['', true]` 即公开端点。管理面写凭据文件限定在 `config/credentials/` 下（`adminapi/discover_api.ts:40-42`）。
+- **管理面凭据输入（credentialInput / credentialKind）**：界面「API Key」框支持两种语义，由前端显式声明、后端按语义落盘（`adminapi/api.ts` `resolveCredentialInput` / `parseCredentialKind`）：
+  - `credentialKind: "key"` → 当作 Key 本体，写入 `config/credentials/{provider|account}-{id}-key`（0600；id 非法字符收敛、`..` 折成 `.` 防误读），DB 只存文件引用；
+  - `credentialKind: "env"`（**未声明时的回落值**）→ 维持历史语义，存环境变量名；
+  - 空串 = 不改动现有凭据（编辑表单不清掉文件型 Key）；同请求同时带 `credential` 时，`credentialInput` **覆盖**它，保证粘进来的新 Key 生效。
+
+  > 为什么必须显式声明而非自动判别：`atr_EXAMPLE0000000000000000000000abcd` 这类 Key（36 位、全为 `[A-Za-z0-9_]`）与环境变量名**字符集完全重合**，形状判别必然误判。真实缺陷即为此：Key 被存进 `apiKeyEnv`，网关当变量名找不到，请求不带 `Authorization`，用户看到「环境变量 atr_xxx 未设置」而一头雾水。
 - **存储语义**：YAML 只在**空库时播种一次**（`seedProvidersIfEmpty / seedAccountsIfEmpty`，`adminapi/store.ts:196-204`），之后 `admin.db` 是唯一真相源，界面增删改重启不丢，YAML 后续改动不再生效；但配置文件里的 Provider / egress 定义在库里缺失时会被补回（删了重启回来，`cli.ts:90-92,124-129`），内置 Provider 不可删（`builtinIDs:cli.ts:171`，删除返回 403）。
 - **对外监听保护**：`admin_key` 为空合法（零配置启动）；但监听地址非回环（非 `localhost / 127.* / ::1`）且未配 `admin_key` 时**拒绝启动**（`ensureAdminKey`，`cli.ts:50-58`）。管理面鉴权：`X-Admin-Key` 或 `Bearer`，恒时比较（`adminapi/api.ts:64-72 safeEqual`，`129-141 withAuth`）。
 
@@ -122,7 +128,7 @@
 
 - egresses：`GET /admin/api/egresses`，`PUT /admin/api/egresses/:id`（body `{kind:http|https, addr}`），`DELETE`（`api.ts:146-170`）。
 - providers：`GET` 列表，`POST` 新建（`parse.ts` 收敛解析 + `providerValidate`，冲突 409），`PATCH /:id`（白名单 `enabled/priority/streamOnly/displayName/riskNote/credential/models/probeModel/egress`，models 只增不减），`DELETE /:id`（builtin 禁删 403，成功 204）。
-- accounts：`GET /admin/api/accounts`（DB + 池内冷却/连败合并，过期冷却复位），`POST` 新建（id/sourceId 必填，新建只许 available/disabled），`PATCH /:id`（白名单 status/displayName/credential/weight），`DELETE /:id`，`POST /:id/recheck`（零上游成本，只清惩罚），`POST /:id/test`（真实请求，可传 `{model}`，成功清冷却归零）。
+- accounts：`GET /admin/api/accounts`（DB + 池内冷却/连败合并，过期冷却复位），`POST` 新建（id/providerId 必填，归属 Provider 必须存在；重名 409；新建只许 available/disabled），`PATCH /:id`（白名单 status/displayName/credential/weight），`DELETE /:id`，`POST /:id/recheck`（零上游成本，只清惩罚），`POST /:id/test`（真实请求，可传 `{model}`，成功清冷却归零）。
 - 模型：`POST /providers/:id/test`（最小真实请求），`POST /providers/:id/scan`（探到协议写回），`PUT /providers/:id/models/:model/{protocol,egress,note,enabled}`（note 限 200 字，空串删字段），`DELETE /providers/:id/models/:model`（PATCH 删不掉故独立端点），`GET /providers/:id/models`（lister 报错转 502）。
 - stats：`GET /admin/api/stats`（全量），`GET /admin/api/breakdown?days|since|until&account_id`（默认 365 天），`GET /admin/api/usage/accounts`（账号维度）。
 - discover（`discover_api.ts`）：`GET /admin/api/discover`（未接线返回空列表），`POST /discover/adopt {key,id?}`（须 ready 否则 400，幂等），`POST /discover/import-account`（必填 key/tokenPath/accountId/credentialFile，服务端 0600 落盘，token 不经前端），`POST /discover/quick-import {key}`（全量导入存活登录态）。
@@ -193,7 +199,9 @@ npm run typecheck  # tsc --noEmit
 - **上下文预检**：只拒绝 + 换源，绝不截断（`router/scheduler.ts:82`）。
 - **凭据不落明文**：只引环境变量名或 `config/credentials/` 下的文件（`config/index.ts:1-2`）。
 - **许可证边界**：本项目 MIT，不得混入 AGPL/GPL 系代码（NOTICE.md §二·补）；`zcode2api`（AGPL-3.0）只读不抄。
-- **Provider ID 永久不可改**（改名 = 新建 + 删旧）；baseURL 停在操作路径之前；一个 Provider 只说一种协议（`config/apps.example.yaml:4-11` 硬规则）。
+- **Provider 身份拆成两半**：`providerId`（自增数字，永不变，账号归属与用量归因按它走）+ `name`（对外名 = 模型 ID 前缀，可改）。改名只动 name，旧前缀立即失效但报错明确（`unknownProviderMessage`）。
+- **Provider 三态**：`active`（参与路由）/ `paused`（开关关掉，仍占名）/ `deleted`（软删，名字释放可复用，历史用量仍可回溯）。新增时空缺名只允许复用 `deleted` 的名字。
+- baseURL 停在操作路径之前；一个 Provider 只说一种协议（`config/apps.example.yaml:4-11` 硬规则）。
 - **未声明 models 的 Provider 视为透明代理**，接受任意模型（`scheduler.ts:36-40`）。
 - **手填模型默认纯文本**：`input` 缺省 `['text']`（`config/index.ts:271`）；支持图片须显式声明，未声明时发出请求前拒绝并点名。
 - **失败账**：全部候选失败记一笔 tokens 为 0 的失败账，这是流式失败唯一的落账点（`proxy.ts:246-258`）。

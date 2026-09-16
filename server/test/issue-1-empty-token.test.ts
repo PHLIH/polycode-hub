@@ -34,14 +34,15 @@ async function apisixLikeServer(): Promise<{ base: string; hits: string[]; close
   return { base, hits, close: () => new Promise<void>((r) => server.close(() => r())) }
 }
 
+// 身份已拆成「数字 providerId + 可变 name」：id 给固定正数（0 = 由存储层分配）。
 const wbProvider = (baseUrl: string): Provider => ({
-  id: 'wb-auto', sourceId: 'workbuddy', displayName: 'WorkBuddy（自动发现）',
+  providerId: 1, name: 'wb-auto', state: 'active', displayName: 'WorkBuddy（自动发现）',
   accessKind: 'session-reuse', risk: 'medium', riskNote: '复用本机桌面登录态',
   stability: 'beta', api: 'openai-completions', baseUrl,
   credential: { apiKeyEnv: 'WB_TOKEN' }, // 采纳草稿原样：只有环境变量引用，没有 token
   headers: { 'X-Product': 'SaaS' },
-  enabled: true, priority: 1,
-  models: [{ id: 'hy3-preview', providerId: 'wb-auto', manual: false, enabled: true }],
+  priority: 1,
+  models: [{ id: 'hy3-preview', manual: false, enabled: true }],
 })
 
 describe('issue #1 复现：空 WB_TOKEN 不该打到上游', () => {
@@ -55,7 +56,8 @@ describe('issue #1 复现：空 WB_TOKEN 不该打到上游', () => {
         new Upstream({ credLookup: (n) => (n === 'WB_TOKEN' ? ['', false] : ['', false]) }),
         null,
       )
-      const r = await probe.probeProvider('wb-auto')
+      // 路径参数是 providerId（数字），不再是 Provider 名。
+      const r = await probe.probeProvider(p.providerId)
       expect(r.ok).toBe(false)
       // 关键：不该把 APISIX 的 HTML 401 当「上游鉴权失败」上报
       expect(r.error).not.toContain('openresty')

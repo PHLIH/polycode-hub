@@ -42,10 +42,10 @@ async function onlyResponsesServer(): Promise<string> {
 }
 
 const mkProv = (baseUrl: string, over: Partial<Provider> = {}): Provider => ({
-  id: 'zen', sourceId: 'opencode', displayName: 'zen', accessKind: 'reverse', risk: 'high',
+  providerId: 1, name: 'zen', displayName: 'zen', accessKind: 'reverse', risk: 'high',
   riskNote: 'x', stability: 'beta', api: 'openai-completions', baseUrl,
-  credential: {}, headers: {}, enabled: true, priority: 1,
-  models: [{ id: 'muse-spark-1.3-contributor-free', providerId: 'zen', manual: false, enabled: true }],
+  credential: {}, headers: {}, state: 'active', priority: 1,
+  models: [{ id: 'muse-spark-1.3-contributor-free', manual: false, enabled: true }],
   ...over,
 })
 
@@ -63,7 +63,7 @@ describe('探测协议回退：404 必须换协议继续试', () => {
     const base = await onlyResponsesServer()
     const p = mkProv(base)
     const probe = new Probe(new Scheduler([p], 'high'), new Upstream({ credLookup: () => ['', false] }), null)
-    const r = await probe.probeProvider('zen')
+    const r = await probe.probeProvider(1)
     expect(r.ok).toBe(true)
     expect(r.error ?? '').not.toContain('http 404')
     expect(r.error ?? '').not.toContain('<!DOCTYPE')

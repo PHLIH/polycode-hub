@@ -23,9 +23,11 @@ function stubSidecar(over: Record<string, unknown> = {}) {
   }
 }
 
-function sidecarHarness(svc = stubSidecar(), providers?: { get: (id: string) => unknown; put: (p: unknown) => void }) {
+// sidecar 只关心 zcode-plan-local 这一个 Provider，按对外名查（见 SidecarStoreAdapter）。
+function sidecarHarness(svc = stubSidecar(), providers?: { getByName: (name: string) => unknown; put: (p: unknown) => void }) {
   const store = providers ?? {
-    get: (id: string) => id === 'zcode-plan-local' ? { id, baseUrl: 'http://127.0.0.1:8080' } : undefined,
+    getByName: (name: string) => name === 'zcode-plan-local'
+      ? { providerId: 1, name, baseUrl: 'http://127.0.0.1:8080' } : undefined,
     put: () => {},
   }
   const app = new Hono()
@@ -63,7 +65,7 @@ describe('sidecar 适配器（对齐 Go adminapi/sidecar_api.go）', () => {
   test('POST port：非法 400；改端口同步 zcode-plan-local baseUrl', async () => {
     let put: unknown
     const app = sidecarHarness(stubSidecar(), {
-      get: () => ({ id: 'zcode-plan-local', baseUrl: 'http://127.0.0.1:8080' }),
+      getByName: (name) => ({ providerId: 1, name, baseUrl: 'http://127.0.0.1:8080' }),
       put: (p) => { put = p },
     })
     expect((await app.request('/admin/api/sidecar/port', {

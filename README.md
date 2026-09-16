@@ -70,15 +70,11 @@ npm start
 
 **零配置启动**后直接进管理台，全部在界面上点：
 
-**接一个官方 API Key 源**（最常规）：Providers 页 → 新建 Provider → 填 `base_url`、协议（留空即自动探测）、接入方式保持 `official` → 凭据填环境变量名或凭据文件路径 → 拉模型列表 → 勾选采用。配置文件等价写法（`source_id` 需先在 `sources` 登记）：
+**接一个官方 API Key 源**（最常规）：Providers 页 → 新建 Provider → 填「名称」（它同时是模型 ID 前缀，如 `acme` → `acme/gpt-x`）、`base_url`、协议（留空即自动探测）、接入方式保持 `official` → API Key 选「直接填 Key」粘进去（或选「用环境变量」填变量名）→ 拉模型列表 → 勾选采用。配置文件等价写法：
 
 ```yaml
-sources:
-  - id: "mine"
-
 providers:
-  - id: "my-upstream"
-    source_id: "mine"
+  - name: "my-upstream"
     base_url: "https://api.example.com"    # 任意兼容源；anthropic 协议不含 /v1，openai 系含
     api: "anthropic-messages"              # 可留空 = 自动探测
     access_kind: "official"                # 可省略，默认即 official
@@ -90,31 +86,31 @@ providers:
 
 1. **Discover 页 → 一键导入**：自动发现本机装过并登录过的 harness（WorkBuddy / OpenCode Zen 等），点一下就完成「采用 Provider + 账号入池」。
 2. **ZCode 免费额度**：面板里点「一键安装 / 一键启动」拉起本地 sidecar。要 OAuth 登录时到命令行跑 `npx tsx server/src/cli.ts zcode login`（JWT 只打印一次，不保存）。
-3. **Providers 页 → 模型**：拉上游模型列表 → 「扫描可用性」自动识别每个模型的协议并记住 → 勾选采用。**勾选 = 对外暴露**：只有勾中的模型会出现在 `/v1/models`（id 为 `sourceId/modelId` 限定名）、参与路由、进入测试下拉。
+3. **Providers 页 → 模型**：拉上游模型列表 → 「扫描可用性」自动识别每个模型的协议并记住 → 勾选采用。**勾选 = 对外暴露**：只有勾中的模型会出现在 `/v1/models`（id 为 `name/modelId` 限定名）、参与路由、进入测试下拉。
 4. **Providers 页 → 测试**：打一次最小真实请求，确认打通。
 
 ---
 
 ## 对接方式
 
-网关说三种协议，请求里带 `model` 字段即可（`GET /v1/models` 查可用 id，形态为 `sourceId/modelId`）；不带则用 `gateway.default_model` 兜底。
+网关说三种协议，请求里带 `model` 字段即可（`GET /v1/models` 查可用 id，形态为 `name/modelId`）；不带则用 `gateway.default_model` 兜底。
 
 ```bash
 # Anthropic Messages（Claude Code / Cline 用这种）
 export ANTHROPIC_BASE_URL=http://localhost:3000
 curl -N http://127.0.0.1:3000/v1/messages \
   -H 'Content-Type: application/json' \
-  -d '{"model":"<sourceId>/<modelId>","max_tokens":256,"messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"<providerId>/<modelId>","max_tokens":256,"messages":[{"role":"user","content":"hi"}]}'
 
 # OpenAI Chat Completions
 curl -N http://127.0.0.1:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"<sourceId>/<modelId>","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+  -d '{"model":"<providerId>/<modelId>","stream":true,"messages":[{"role":"user","content":"hi"}]}'
 
 # OpenAI Responses
 curl -N http://127.0.0.1:3000/v1/responses \
   -H 'Content-Type: application/json' \
-  -d '{"model":"<sourceId>/<modelId>","input":"hi"}'
+  -d '{"model":"<providerId>/<modelId>","input":"hi"}'
 ```
 
 网关默认**只监听 `127.0.0.1`** 且**免鉴权**（回环地址安全）。要对局域网/公网暴露，必须在配置文件里设 `gateway.admin_key`，否则拒绝启动。转发面另有 `gateway_key`（非空则 client 须带 `Authorization: Bearer <key>`）。
@@ -137,8 +133,7 @@ gateway:
   admin_key: "..."      # 管理台口令；对非回环监听时必填
   gateway_key: ""       # client 侧 Bearer 校验；留空不校验
 providers:
-  - id: "company-anthropic"
-    source_id: "company"
+  - name: "company-anthropic"
     api: "anthropic-messages"   # 留空 = 自动识别（推荐）
     base_url: "https://gw.example.com"
     credential:
@@ -229,7 +224,7 @@ web/src/              # Vue 3 + Element Plus + ECharts 管理台
 - **协议自动识别**：Provider `api` 是默认协议，`models[].api` 可覆盖（扫描实测写入）；留空即自动探测
 - **许可证边界**：本项目 MIT，**不得混入具有传染性的开源许可证代码**
 - **凭据不落明文**：只引环境变量名或 `config/credentials/` 下的文件
-- **Provider ID 永久不可改**；一个 Provider 只说一种协议；baseURL 停在操作路径之前
+- **Provider 名可改**（模型 ID 前缀跟着变，旧前缀立即失效并给出明确报错）；内部 `providerId` 永不变，账号归属与用量归因按它走；一个 Provider 只说一种协议；baseURL 停在操作路径之前
 
 ---
 

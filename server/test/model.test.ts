@@ -23,10 +23,11 @@ import {
   type Stability,
 } from '../src/model/index.ts'
 
+// Provider 身份已拆成「数字 providerId + 可变 name」：夹具给固定正数 id（0 = 待分配哨兵）。
 const p = (over: Partial<Provider>): Provider => ({
-  id: 'demo', sourceId: 'src', displayName: 'Demo', accessKind: 'official',
+  providerId: 1, name: 'demo', state: 'active', displayName: 'Demo', accessKind: 'official',
   risk: 'low', riskNote: '', stability: 'stable', api: '', baseUrl: 'https://x.example',
-  credential: {}, headers: {}, enabled: true, priority: 0,
+  credential: {}, headers: {}, priority: 0,
   streamOnly: false, models: [], probeModel: '', ...over,
 })
 
@@ -35,9 +36,9 @@ describe('Provider 校验（对齐 Go provider.go Validate）', () => {
     expect(providerValidate(p({}))).toBeUndefined()
   })
 
-  test('id 非空 + 字符白名单（小写/数字/连字符）', () => {
-    expect(providerValidate(p({ id: '' }))).toMatch(/id 不能为空/)
-    expect(providerValidate(p({ id: 'Bad_ID' }))).toMatch(/只允许小写字母\/数字\/连字符/)
+  test('name 非空 + 字符白名单（小写/数字/连字符）', () => {
+    expect(providerValidate(p({ name: '' }))).toMatch(/name 不能为空/)
+    expect(providerValidate(p({ name: 'Bad_ID' }))).toMatch(/只允许小写字母\/数字\/连字符/)
   })
 
   test('risk 非法 / medium+high 必须带 risk_note', () => {
@@ -93,7 +94,7 @@ describe('CredentialRef：凭据不落明文（文件热轮换语义）', () => 
 
 describe('Model 目录条目', () => {
   const m = (over: Partial<Model>): Model => ({
-    id: 'm1', providerId: 'demo', displayName: '', contextWindow: 0,
+    id: 'm1', displayName: '', contextWindow: 0,
     maxOutputTokens: 0, input: [], api: '', manual: false, enabled: true, ...over,
   })
 
@@ -134,7 +135,7 @@ describe('免费档启发式（独立词段才算）', () => {
 
 describe('账号池成员状态（冷却到期自动复位）', () => {
   const acct = (over: Partial<Account>): Account => ({
-    id: 'a1', sourceId: 'src', displayName: '', credential: {},
+    id: 'a1', providerId: 1, displayName: '', credential: {},
     status: 'available', fails: 0, cooldownUntil: new Date(0), lastUsed: new Date(0),
     ...over,
   })
@@ -188,7 +189,7 @@ describe('JSON 字段形状锚点', () => {
       credential: { apiKeyEnv: 'K' },
       headers: { 'X-Title': 't' },
       streamOnly: true,
-      models: [{ id: 'm1', providerId: 'demo', input: ['text'], manual: false, enabled: true }],
+      models: [{ id: 'm1', input: ['text'], manual: false, enabled: true }],
     }) as unknown as Record<string, unknown>
     for (const [k, v] of Object.entries(fixture)) {
       expect(JSON.stringify(got[k as keyof typeof got])).toBe(JSON.stringify(v))

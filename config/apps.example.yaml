@@ -22,18 +22,9 @@ gateway:
 data_dir: "data"               # SQLite 用量与状态落盘目录
 
 # 上游服务 / harness（ZCode、OpenCode、公司自建……）
-sources:
-  - id: "company"
-    display_name: "公司自建网关"
-    enabled: true
-  - id: "zcode"
-    display_name: "ZCode"
-    enabled: true
-
 # 接入方式实例（一个 Source 可有多个 Provider；风险是一等调度维度，UI 必须显示徽章与说明）
 providers:
-  - id: "company-anthropic"
-    source_id: "company"
+  - name: "company-anthropic"
     display_name: "公司 Anthropic 兼容网关"
     access_kind: "official"      # official | session-reuse | simulated-login | reverse
     risk: "low"
@@ -42,7 +33,6 @@ providers:
     base_url: "https://gw.example.com"   # anthropic-messages: 不含 /v1，由网关拼 /v1/messages
     credential:
       api_key_env: "COMPANY_GW_KEY"      # 密钥放环境变量，配置不落明文
-    enabled: true
     priority: 1
     # 同源多账号按 weight 加权轮询（账号页可调，默认 1）；关/失效的账号权重自动失效。
     models:                       # 模型目录：可探测补全，也可手动添加（manual: true）
@@ -55,7 +45,6 @@ providers:
 
   # 同一上游若还讲 openai-completions 协议，另建一个 Provider（base_url 含 /v1）：
   # - id: "company-openai"
-  #   source_id: "company"
   #   api: "openai-completions"
   #   base_url: "https://gw.example.com/v1"   # openai 系: 含 /v1，网关拼 chat/completions
   #   credential: { api_key_env: "COMPANY_GW_KEY" }
@@ -63,7 +52,6 @@ providers:
 # 账号池（同一上游源多账号轮换；凭据只存引用，文件优先、环境变量备选）
 accounts: []
 #  - id: "zcode-1"
-#    source_id: "zcode"
 #    display_name: "主号"
 #    credential:
 #      api_key_file: "config/credentials/zcode-jwt"  # 推荐：本目录文件（已 gitignore），改内容即热轮换
@@ -72,7 +60,6 @@ accounts: []
 # ZCode 接入示例（Anthropic 原生，直通；多账号轮换靠上方的 accounts）：
 # providers:
 #   - id: "zcode-official"
-#     source_id: "zcode"
 #     display_name: "ZCode 免费额度"
 #     access_kind: "session-reuse" # 手动填 JWT（风险中，见 NOTICE.md 登记）
 #     risk: "medium"
@@ -98,7 +85,6 @@ accounts: []
 # 2026-09-12 已用本机桌面登录态实测打通 hy3-preview）：
 # providers:
 #   - id: "workbuddy-direct"
-#     source_id: "workbuddy"
 #     display_name: "WorkBuddy直连"
 #     access_kind: "session-reuse"   # 复用桌面登录态（风险中，见 NOTICE.md 登记）
 #     risk: "medium"
@@ -122,7 +108,6 @@ accounts: []
 # 用法：export ZEN_KEY=public，client 模型填 opencode/<模型>）：
 # providers:
 #   - id: "zen-free"
-#     source_id: "opencode"
 #     display_name: "Zen免费档"
 #     access_kind: "reverse"          # 逆向私有协议头（风险高，见 NOTICE.md 登记）
 #     risk: "high"
@@ -154,7 +139,6 @@ accounts: []
 # 2) 本网关侧：如下建 Provider（无需凭据、无需 dynamic_headers），client 用 zcode/GLM-5.3-Flash
 # providers:
 #   - id: "zcode-plan-local"
-#     source_id: "zcode"
 #     display_name: "ZCode计划(本地sidecar)"
 #     access_kind: "reverse"
 #     risk: "high"

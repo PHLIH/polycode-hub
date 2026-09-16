@@ -46,10 +46,11 @@ beforeAll(async () => {
 })
 afterAll(() => new Promise<void>((r) => server.close(() => r())))
 
+// 固定正数 providerId：模型挂在 Provider 下，两边数值必须一致。
 const prov = (over: Partial<Provider>): Provider => ({
-  id: 'demo', sourceId: 'src', displayName: '', accessKind: 'official', risk: 'low',
+  providerId: 1, name: 'demo', displayName: '', accessKind: 'official', risk: 'low',
   stability: 'stable', api: '', baseUrl: base, credential: {}, headers: {},
-  enabled: true, priority: 0, models: [], ...over,
+  state: 'active', priority: 0, models: [], ...over,
 })
 
 describe('URL 拼接（坑位 #2）', () => {
@@ -64,15 +65,15 @@ describe('URL 拼接（坑位 #2）', () => {
 describe('协议解析与探测（对齐 upstream.go）', () => {
   test('resolveProtocol 优先级：模型级声明 > 探测事实 > Provider 默认', () => {
     const p = prov({
-      id: 'rp', api: 'openai-completions',
-      models: [{ id: 'm1', providerId: 'rp', api: 'openai-responses', manual: false, enabled: true }],
+      name: 'rp', api: 'openai-completions',
+      models: [{ id: 'm1', api: 'openai-responses', manual: false, enabled: true }],
     })
     expect(resolveProtocol(p, 'm1')).toEqual(['openai-responses', true])
     expect(resolveProtocol(p, 'm2')).toEqual(['openai-completions', true])
     forgetProtocol('rp', 'm2') // 清事实再验证探测优先于默认
     rememberProtocol('rp', 'm2', 'anthropic-messages')
     expect(resolveProtocol(p, 'm2')).toEqual(['anthropic-messages', true])
-    const noApi = prov({ id: 'rp2', api: '' })
+    const noApi = prov({ name: 'rp2', api: '' })
     expect(resolveProtocol(noApi, 'm3')).toEqual(['', false])
   })
 
@@ -117,7 +118,7 @@ describe('换源闸门（硬约束）', () => {
     // 这里验证：openai-completions（探测顺序第一个）先试 → 打到 404 路径
     // （本测试服务器只有 /v1/messages /models），404 属 bad_request → 换下一协议。
     const u = new Upstream({ credLookup: () => ['', false] })
-    const p = prov({ id: 'probe-demo', api: '' })
+    const p = prov({ name: 'probe-demo', api: '' })
     forgetProtocol('probe-demo', 'm')
     await expect(u.stream(p, { model: 'm', messages: [], stream: true } as never))
       .rejects.toBeInstanceOf(Error)

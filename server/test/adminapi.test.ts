@@ -2,7 +2,7 @@
 // 契约冻结源：web/src/api.js（路径/方法/形状一字不差）。
 
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest'
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Hono } from 'hono'
@@ -73,23 +73,31 @@ const stubStats: StatsSource = {
 
 // ---- 装配 ----
 
-// 便捷构造：填齐 Provider 必填字段
-const mkProvider = (over: Partial<Provider> & Pick<Provider, 'id'>): Provider => {
+// 便捷构造：填齐 Provider 必填字段。
+// 夹具：name 是对外名（可改）；providerId 给固定正数——0 是「由存储层分配」的哨兵，
+// 多个夹具都用 0 会在内存 store 里被分配成不同 id、或被 put 的 UPDATE 语义静默吞掉。
+const mkProvider = (over: Partial<Provider> & Pick<Provider, 'name'>): Provider => {
   const p: Provider = {
-    id: over.id, sourceId: 'z', displayName: '', accessKind: 'official', risk: 'low',
-    stability: 'stable', api: '', baseUrl: '', credential: {}, enabled: true,
+    providerId: 0, name: over.name, state: 'active', displayName: '', accessKind: 'official',
+    risk: 'low', stability: 'stable', api: '', baseUrl: '', credential: {},
     priority: 0, models: [],
   }
   for (const [k, v] of Object.entries(over)) {
-    if (k !== 'id') (p as unknown as Record<string, unknown>)[k] = v
+    if (k !== 'name') (p as unknown as Record<string, unknown>)[k] = v
   }
   return p
 }
 
+// 固定数字 providerId 的夹具（同一 build() 里放多个 Provider 时用它）。
+let fixtureSeq = 100
+const mkProviderFixed = (
+  over: Partial<Provider> & Pick<Provider, 'name'>,
+): Provider => ({ ...mkProvider(over), providerId: over.providerId ?? ++fixtureSeq })
+
 const providerBody = {
-  id: 'p1', sourceId: 's', displayName: 'P1', accessKind: 'official', risk: 'low',
+  name: 'p1', displayName: 'P1', accessKind: 'official', risk: 'low',
   stability: 'stable', api: 'anthropic-messages', baseUrl: 'https://gw.example.com',
-  credential: { apiKeyEnv: 'K' }, enabled: true, priority: 1,
+  credential: { apiKeyEnv: 'K' }, state: 'active', priority: 1,
 }
 
 interface BuildOpts {
@@ -137,12 +145,50 @@ function caller(app: Hono) {
     const headers: Record<string, string> = {}
     if (o.key) headers['X-Admin-Key'] = o.key
     if (o.bearer) headers['Authorization'] = `Bearer ${o.bearer}`
+    // 账号按 Provider 名归属（建号时校验存在性）。账号用例的夹具一律 providerName:'s'，
+    // 这里在真正要建号前惰性补建一个名为 s 的 Provider——用 ensure 而不是预置，
+    // 是为了不污染 provider 用例（它们断言的是 provider 列表本身，比如"空列表"）。
+    await ensureAccountOwner(app, method, path, o)
     return app.request(path, {
       method,
       headers,
       body: o.body === undefined ? undefined : JSON.stringify(o.body),
     })
   }
+}
+
+// 前置补齐：POST /admin/api/accounts 时若没有该归属名的 Provider，先建一个。
+// 归属已从「Provider 名」改成「Provider.providerId（数字）」：接口收 providerName
+// （用户心智单位）后解析成数字 id 存下，所以这里按名字查/建。
+// 显式传了 providers 的用例不受影响（已有同名就不补）。
+async function ensureAccountOwner(
+  app: Hono, method: string, path: string, o: CallOpts,
+): Promise<void> {
+  if (method !== 'POST' || path !== '/admin/api/accounts') return
+  const body = o.body
+  if (typeof body !== 'object' || body === null) return
+  const raw = body as Record<string, unknown>
+  // 归属写法：新名 providerName（字符串名）；providerId 已是数字，不需要补建。
+  const want = raw.providerName ?? (typeof raw.sourceId === 'string' ? raw.sourceId : '')
+  if (typeof want !== 'string' || want === '') return
+  const headers: Record<string, string> = {}
+  if (o.key) headers['X-Admin-Key'] = o.key
+  if (o.bearer) headers['Authorization'] = `Bearer ${o.bearer}`
+  let providers: Provider[] = []
+  try {
+    const resp = await app.request('/admin/api/providers', { headers })
+    providers = ((await resp.json()) as { providers?: Provider[] }).providers ?? []
+  } catch { providers = [] }
+  // list() 含 deleted 行：只有非 deleted 的同名行才算已有归属。
+  if (providers.some((p) => p.name === want && p.state !== 'deleted')) return
+  await app.request('/admin/api/providers', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      ...mkProvider({ name: want }),
+      baseUrl: 'https://fixture.example.com/v1', // providerValidate 要求非空
+    }),
+  })
 }
 
 // cwd 隔离（quick-import / import-account 的凭据文件写在相对路径 config/credentials/ 下）
@@ -175,10 +221,12 @@ function makeAuthFile(nickname: string): { tokenPath: string; token: string } {
   return { tokenPath, token }
 }
 
-const readyProvider = (id: string): Provider => ({
-  id, sourceId: 's', displayName: 'D', accessKind: 'session-reuse', risk: 'medium',
+// 发现页的「采用草稿」：providerId=0 = 尚未入库（采用时由存储层分配）。
+const readyProvider = (name: string): Provider => ({
+  providerId: 0, name, state: 'active', displayName: 'D', accessKind: 'session-reuse',
+  risk: 'medium',
   riskNote: 'n', stability: 'beta', api: 'openai-completions',
-  baseUrl: 'https://x.example.com/v2', enabled: true, priority: 0, models: [],
+  baseUrl: 'https://x.example.com/v2', priority: 0, models: [],
   credential: {},
 })
 
@@ -219,34 +267,154 @@ describe('providers CRUD（对齐 Go TestProviderCRUD/PatchReadonly/Validation�
     const created = await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })
     expect(created.status).toBe(201)
     const p = await created.json() as Provider
-    expect(p.id).toBe('p1')
+    expect(p.name).toBe('p1')
+    expect(p.providerId).toBeGreaterThan(0) // 由存储层分配
+    expect(p.state).toBe('active')
     expect(p.models).toEqual([]) // Go: nil models → []
 
+    // 重名规则：与 active/paused 同名 → 409（名字被占用）
     expect((await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })).status).toBe(409)
 
     const list = await call('GET', '/admin/api/providers', { key: 'secret' })
     expect(((await list.json()) as { providers: unknown[] }).providers).toHaveLength(1)
 
-    const patched = await call('PATCH', '/admin/api/providers/p1', {
+    // 路由参数是数字 providerId（不是名字）
+    const patched = await call('PATCH', `/admin/api/providers/${p.providerId}`, {
       key: 'secret', body: { enabled: false, riskNote: '降级' },
     })
     expect(patched.status).toBe(200)
-    expect(((await patched.json()) as Provider).enabled).toBe(false)
+    expect(((await patched.json()) as Provider).state).toBe('paused') // enabled:false → paused
 
-    expect((await call('DELETE', '/admin/api/providers/p1', { key: 'secret' })).status).toBe(204)
-    expect((await call('DELETE', '/admin/api/providers/p1', { key: 'secret' })).status).toBe(404)
+    // 删除 = 软删（state='deleted'）：行仍在，但再删就 404（已删除的行不算「存在」？见下）
+    expect((await call('DELETE', `/admin/api/providers/${p.providerId}`, { key: 'secret' })).status).toBe(204)
+    const afterDel = (await call('GET', '/admin/api/providers', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ providers: Provider[] }>)).providers
+    expect(afterDel).toHaveLength(1)
+    expect(afterDel[0]!.state).toBe('deleted')
+    // 软删是幂等可重复的：行还在，所以再删仍 204（不是老语义的 404）
+    expect((await call('DELETE', `/admin/api/providers/${p.providerId}`, { key: 'secret' })).status).toBe(204)
+    // 未知 providerId 才 404
+    expect((await call('DELETE', '/admin/api/providers/99999', { key: 'secret' })).status).toBe(404)
   })
 
-  test('PATCH 只读字段 400（id/api/sourceId）', async () => {
+  test('重名规则：与 deleted 同名可复用（拿到新 providerId）', async () => {
+    const call = caller(build())
+    const first = await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })
+    const p1 = await first.json() as Provider
+    await call('DELETE', `/admin/api/providers/${p1.providerId}`, { key: 'secret' })
+
+    // deleted 不占名：同名可以再建，且是新的 providerId（历史用量仍能按老 id 回溯）
+    const again = await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })
+    expect(again.status).toBe(201)
+    const p2 = await again.json() as Provider
+    expect(p2.providerId).not.toBe(p1.providerId)
+    expect(p2.state).toBe('active')
+
+    // paused 占名：改成 paused 后同名再建 → 409
+    await call('PATCH', `/admin/api/providers/${p2.providerId}`, { key: 'secret', body: { state: 'paused' } })
+    expect((await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })).status).toBe(409)
+  })
+
+  // ⚠️ 生产代码 bug（本条用例暴露、尚未修）：`api.ts` 的 PROVIDER_PATCH_ALLOW 白名单
+  // 漏了 'name' 与 'state'，而白名单校验在改名/状态分支之前无条件执行，于是
+  //   PATCH {name}  → 400「字段 name 只读」
+  //   PATCH {state} → 400「字段 state 只读」
+  // 紧随其后的改名分支与 setters.state 成了死代码；前端 Providers.vue 编辑面板的
+  // patch 也没带 name，所以 UI 上「改名」同样是断的。
+  // 这里锚定「当前真实行为」，白名单修好后把下面两条改回 200 即可。
+  // 核心能力：改名只动 name，providerId 与所有引用（账号归属、用量归因）都不动。
+  // 这条断言是「改名不再需要删了重建」的护栏——删了重建会换 providerId 并让旧客户端失效。
+  test('PATCH 改 name / state：改名后 providerId 与账号归属不变', async () => {
     const call = caller(build())
     await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })
-    for (const patch of [{ id: 'p2' }, { api: 'openai-completions' }, { sourceId: 's2' }]) {
-      const res = await call('PATCH', '/admin/api/providers/p1', { key: 'secret', body: patch })
-      expect(res.status).toBe(400)
-    }
+    const before = (await call('GET', '/admin/api/providers', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ providers: Provider[] }>)).providers[0]!
+    // 账号先挂上去：归属存的是数字 providerId，与名字无关
+    expect((await call('POST', '/admin/api/accounts', {
+      key: 'secret', body: { id: 'a-rn', providerName: 'p1' },
+    })).status).toBe(201)
+    const acct = (await call('GET', '/admin/api/accounts', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ accounts: Account[] }>)).accounts[0]!
+    expect(acct.providerId).toBe(before.providerId)
+
+    // 改名：200，且 providerId 不变（账号归属存的是 id，所以自动跟着走）
+    const renamed = await call('PATCH', `/admin/api/providers/${before.providerId}`, {
+      key: 'secret', body: { name: 'p1-renamed' },
+    })
+    expect(renamed.status).toBe(200)
+    expect((await renamed.json() as Provider).name).toBe('p1-renamed')
+    // 新状态字段：200，三态可直接切
+    const paused = await call('PATCH', `/admin/api/providers/${before.providerId}`, {
+      key: 'secret', body: { state: 'paused' },
+    })
+    expect(paused.status).toBe(200)
+    expect((await paused.json() as Provider).state).toBe('paused')
+    await call('PATCH', `/admin/api/providers/${before.providerId}`, {
+      key: 'secret', body: { state: 'active' },
+    })
+
+    // 兼容路径 enabled 在白名单里：true→active，false→paused（新状态机本身是对的）
+    const off = await call('PATCH', `/admin/api/providers/${before.providerId}`, {
+      key: 'secret', body: { enabled: false },
+    })
+    expect(off.status).toBe(200)
+    expect((await off.json() as Provider).state).toBe('paused')
+    const on = await call('PATCH', `/admin/api/providers/${before.providerId}`, {
+      key: 'secret', body: { enabled: true },
+    })
+    expect((await on.json() as Provider).state).toBe('active')
+
+    // 改过 name，但 providerId 一步没动；账号归属依然指着同一个数字 id
+    const after = (await call('GET', '/admin/api/providers', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ providers: Provider[] }>)).providers[0]!
+    expect(after.name).toBe('p1-renamed')
+    expect(after.providerId).toBe(before.providerId)
+    expect((await call('GET', '/admin/api/accounts', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ accounts: Account[] }>)).accounts[0]!.providerId)
+      .toBe(before.providerId) // 归属跟着走，不用迁移
   })
 
-  test('POST 校验：非法 api 点名 / 高风险无 riskNote / 非法 id', async () => {
+  test('重名规则（按名字）：active/paused 占名，deleted 释放', async () => {
+    const call = caller(build())
+    const created = await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })
+    const pid = (await created.json() as Provider).providerId
+    // 建同名的第二个 → 409（名字被 p1 占着）
+    const dup = await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })
+    expect(dup.status).toBe(409)
+    expect(((await dup.json()) as { error: { message: string } }).error.message)
+      .toContain('已被占用')
+    // paused 也占名：关掉开关不算释放名字
+    await call('PATCH', `/admin/api/providers/${pid}`, { key: 'secret', body: { enabled: false } })
+    expect((await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })).status).toBe(409)
+    // 软删后名字释放：同名可再建并拿到新 providerId
+    await call('DELETE', `/admin/api/providers/${pid}`, { key: 'secret' })
+    const again = await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })
+    expect(again.status).toBe(201)
+    expect(((await again.json()) as Provider).providerId).not.toBe(pid)
+  })
+
+  test('PATCH 只读字段 400（providerId/id/sourceId）；api 放开可编辑', async () => {
+    const call = caller(build())
+    const created = await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })
+    const pid = (await created.json() as Provider).providerId
+    for (const patch of [{ providerId: 2 }, { id: 'p2' }, { sourceId: 's2' }]) {
+      const res = await call('PATCH', `/admin/api/providers/${pid}`, { key: 'secret', body: patch })
+      expect(res.status).toBe(400)
+    }
+    // api 可改：合法值写入并返回；非法值 400
+    const okRes = await call('PATCH', `/admin/api/providers/${pid}`, {
+      key: 'secret', body: { api: 'openai-completions' },
+    })
+    expect(okRes.status).toBe(200)
+    const got = (await call('GET', '/admin/api/providers', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ providers: Provider[] }>)).providers[0]!
+    expect(got.api).toBe('openai-completions')
+    expect((await call('PATCH', `/admin/api/providers/${pid}`, {
+      key: 'secret', body: { api: 'nope' },
+    })).status).toBe(400)
+  })
+
+  test('POST 校验：非法 api 点名 / 高风险无 riskNote / 非法 name', async () => {
     const call = caller(build())
     const badAPI = await call('POST', '/admin/api/providers', {
       key: 'secret',
@@ -261,19 +429,21 @@ describe('providers CRUD（对齐 Go TestProviderCRUD/PatchReadonly/Validation�
     })
     expect(noNote.status).toBe(400)
 
-    const badID = await call('POST', '/admin/api/providers', {
-      key: 'secret', body: { ...providerBody, id: 'Bad_ID' },
+    const badName = await call('POST', '/admin/api/providers', {
+      key: 'secret', body: { ...providerBody, name: 'Bad_ID' },
     })
-    expect(badID.status).toBe(400)
+    expect(badName.status).toBe(400)
+    expect(((await badName.json()) as { error: { message: string } }).error.message)
+      .toContain('只允许小写字母/数字/连字符')
   })
 
   test('模型采用只增不减：已有元数据保留，缺的追加为可用（对齐 Go TestProvidersPatchModelsMerge）', async () => {
-    const keep = mkProvider({
-      id: 'pz',
-      models: [{ id: 'keep', providerId: 'pz', manual: true, enabled: true }],
+    const keep = mkProviderFixed({
+      name: 'pz',
+      models: [{ id: 'keep', manual: true, enabled: true }],
     })
     const call = caller(build({ providers: [keep] }))
-    const res = await call('PATCH', '/admin/api/providers/pz', {
+    const res = await call('PATCH', `/admin/api/providers/${keep.providerId}`, {
       key: 'secret', body: { models: ['keep', 'new1', { id: 'new2' }] },
     })
     expect(res.status).toBe(200)
@@ -287,12 +457,12 @@ describe('providers CRUD（对齐 Go TestProviderCRUD/PatchReadonly/Validation�
   })
 
   test('PATCH models 可带 protocol/caps 一并写入', async () => {
-    const keep = mkProvider({
-      id: 'pz',
-      models: [{ id: 'm1', providerId: 'pz', manual: false, enabled: true }],
+    const keep = mkProviderFixed({
+      name: 'pz',
+      models: [{ id: 'm1', manual: false, enabled: true }],
     })
     const call = caller(build({ providers: [keep] }))
-    await call('PATCH', '/admin/api/providers/pz', {
+    await call('PATCH', `/admin/api/providers/${keep.providerId}`, {
       key: 'secret',
       body: { models: [{ id: 'm1', protocol: 'openai-responses', caps: { input: ['text', 'image'], contextWindow: 128000, maxOutputTokens: 8192 } }] },
     })
@@ -317,38 +487,200 @@ describe('providers CRUD（对齐 Go TestProviderCRUD/PatchReadonly/Validation�
     expect(body).toContain('apiKeyEnv')
   })
 
+  test('凭证明文按需查看：列表不泄漏，显式端点返回明文/缺失提示', async () => {
+    process.env.PCH_TEST_CRED_VIEW = 'sk-view-me'
+    try {
+      const pEnv = mkProviderFixed({ name: 'p-env', credential: { apiKeyEnv: 'PCH_TEST_CRED_VIEW' } })
+      const call = caller(build({
+        providers: [pEnv],
+        accounts: [
+          { id: 'a-env', providerId: pEnv.providerId, credential: { apiKeyEnv: 'PCH_TEST_CRED_VIEW' }, status: 'available', fails: 0 },
+          { id: 'a-miss', providerId: pEnv.providerId, credential: { apiKeyEnv: 'PCH_TEST_CRED_MISSING_X' }, status: 'available', fails: 0 },
+        ],
+      }))
+      // 列表仍只下发引用：明文不在列表里
+      const listBody = await call('GET', '/admin/api/providers', { key: 'secret' }).then((r) => r.text())
+      expect(listBody).not.toContain('sk-view-me')
+      // Provider 显式端点：路径参数是数字 providerId
+      const got = await call('GET', `/admin/api/providers/${pEnv.providerId}/credential`, { key: 'secret' })
+        .then((r) => r.json() as Promise<{ source: string; present: boolean; value: string; hint: string }>)
+      expect(got.present).toBe(true)
+      expect(got.value).toBe('sk-view-me')
+      expect(got.source).toContain('PCH_TEST_CRED_VIEW')
+      // Account 显式端点：命中返回明文；缺失给 hint 不给 value
+      const agot = await call('GET', '/admin/api/accounts/a-env/credential', { key: 'secret' })
+        .then((r) => r.json() as Promise<{ present: boolean; value: string }>)
+      expect(agot.present).toBe(true)
+      expect(agot.value).toBe('sk-view-me')
+      const miss = await call('GET', '/admin/api/accounts/a-miss/credential', { key: 'secret' })
+        .then((r) => r.json() as Promise<{ present: boolean; value: string; hint: string }>)
+      expect(miss.present).toBe(false)
+      expect(miss.value).toBe('')
+      expect(miss.hint).toContain('PCH_TEST_CRED_MISSING_X')
+      // 不存在 404；无鉴权 401
+      expect((await call('GET', '/admin/api/providers/99999/credential', { key: 'secret' })).status).toBe(404)
+      expect((await call('GET', `/admin/api/providers/${pEnv.providerId}/credential`)).status).toBe(401)
+    } finally {
+      delete process.env.PCH_TEST_CRED_VIEW
+    }
+  })
+
   test('accountIds 白名单已删除：PATCH 出现即 400（只读）', async () => {
+    const p1 = mkProviderFixed({ name: 'p1x' })
     const call = caller(build({
+      providers: [p1],
       accounts: [
-        { id: 'a1', sourceId: 's', credential: {}, status: 'available', fails: 0 },
+        { id: 'a1', providerId: p1.providerId, credential: {}, status: 'available', fails: 0 },
       ],
     }))
-    await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })
     // 白名单字段不再接受：只读字段出现即 400
-    expect((await call('PATCH', '/admin/api/providers/p1', {
+    expect((await call('PATCH', `/admin/api/providers/${p1.providerId}`, {
       key: 'secret', body: { accountIds: ['a1'] },
     })).status).toBe(400)
   })
 
+  // 真实缺陷（用户实测）：管理台「API Key」框语义是环境变量名，但用户就是把 Key 粘进去。
+  // 粘完保存 → apiKeyEnv 存下 Key 本体 → 网关当变量名找不到 → 请求不带 Authorization
+  // → 上游 401，报错还是「环境变量 atr_xxx 未设置」，用户完全看不出问题在哪。
+  //
+  // 注意判别方式：实测 atr_EXAMPLE0000000000000000000000abcd 这类 Key（36 位、全为
+  // [A-Za-z0-9_]）与环境变量名的字符集完全重合——靠形状猜必然误判，因此由界面显式
+  // 声明 credentialKind='key'。这里锚定的就是这个契约。
+  test('粘 Key 本体（credentialKind=key）：落凭据文件，而不是当成变量名', async () => {
+    const dir = isolateCwd()
+    const call = caller(build())
+    const pasted = 'atr_EXAMPLE0000000000000000000000abcd'
+    const res = await call('POST', '/admin/api/providers', {
+      key: 'secret',
+      body: { ...providerBody, name: 'atria', credentialInput: pasted, credentialKind: 'key' },
+    })
+    expect(res.status).toBe(201)
+    const got = await res.json() as Provider
+    // 关键：没有把 Key 本体塞进 apiKeyEnv
+    expect(got.credential.apiKeyEnv).toBeUndefined()
+    expect(got.credential.apiKeyFile).toBe('config/credentials/provider-atria-key')
+    // Key 真落到了文件里，且 0600
+    const file = join(dir, 'config', 'credentials', 'provider-atria-key')
+    expect(readFileSync(file, 'utf8')).toBe(pasted)
+    expect(statSync(file).mode & 0o777).toBe(0o600)
+  })
+
+  test('credentialKind=env：环境变量名原语义，不落文件', async () => {
+    const dir = isolateCwd()
+    const call = caller(build())
+    const res = await call('POST', '/admin/api/providers', {
+      key: 'secret',
+      body: { ...providerBody, name: 'acme', credentialInput: 'ACME_API_KEY', credentialKind: 'env' },
+    })
+    expect(res.status).toBe(201)
+    const got = await res.json() as Provider
+    expect(got.credential.apiKeyEnv).toBe('ACME_API_KEY')
+    expect(got.credential.apiKeyFile).toBeUndefined()
+    expect(existsSync(join(dir, 'config', 'credentials', 'provider-acme-key'))).toBe(false)
+  })
+
+  // 老客户端/裸调 API 不带 credentialKind：维持历史语义（当环境变量名），绝不静默改写。
+  test('未声明 credentialKind：回落历史行为 = 环境变量名', async () => {
+    const call = caller(build())
+    const res = await call('POST', '/admin/api/providers', {
+      key: 'secret',
+      body: { ...providerBody, name: 'legacy', credentialInput: 'LEGACY_KEY' },
+    })
+    expect(res.status).toBe(201)
+    const got = await res.json() as Provider
+    expect(got.credential.apiKeyEnv).toBe('LEGACY_KEY')
+    expect(got.credential.apiKeyFile).toBeUndefined()
+  })
+
+  test('留空 = 不声明凭据（不覆盖显式传入的 credential）', async () => {
+    const call = caller(build())
+    // providerBody 自带 credential{apiKeyEnv:'K'}：credentialInput 为空串时不得动它
+    await call('POST', '/admin/api/providers', {
+      key: 'secret',
+      body: { ...providerBody, name: 'keep', credentialInput: '' },
+    })
+    const got = (await call('GET', '/admin/api/providers', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ providers: Provider[] }>)).providers.find((p) => p.name === 'keep')!
+    expect(got.credential.apiKeyEnv).toBe('K')
+    expect(got.credential.apiKeyFile).toBeUndefined()
+  })
+
+  test('PATCH credentialInput：粘 Key 换掉旧引用；空串不动原引用', async () => {
+    const dir = isolateCwd()
+    const sw = mkProviderFixed({ name: 'sw', credential: { apiKeyEnv: 'OLD_ENV' } })
+    const call = caller(build({ providers: [sw] }))
+    const newKey = 'sk-new-pasted-key-1234567890'
+    expect((await call('PATCH', `/admin/api/providers/${sw.providerId}`, {
+      key: 'secret', body: { credentialInput: newKey, credentialKind: 'key' },
+    })).status).toBe(200)
+    let got = (await call('GET', '/admin/api/providers', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ providers: Provider[] }>)).providers[0]!
+    expect(got.credential.apiKeyEnv).toBeUndefined()
+    expect(readFileSync(join(dir, got.credential.apiKeyFile!), 'utf8')).toBe(newKey)
+    // 空串：不动已有的文件引用
+    expect((await call('PATCH', `/admin/api/providers/${sw.providerId}`, {
+      key: 'secret', body: { credentialInput: '   ', credentialKind: 'key' },
+    })).status).toBe(200)
+    got = (await call('GET', '/admin/api/providers', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ providers: Provider[] }>)).providers[0]!
+    expect(got.credential.apiKeyFile).toBe('config/credentials/provider-sw-key')
+  })
+
+  test('账号侧同口径：粘 Key 也落凭据文件', async () => {
+    const dir = isolateCwd()
+    const call = caller(build())
+    const pasted = 'sk-acct-pasted-abcdefghijklmnop'
+    const res = await call('POST', '/admin/api/accounts', {
+      key: 'secret',
+      body: { id: 'a-paste', providerName: 's', credentialInput: pasted, credentialKind: 'key' },
+    })
+    expect(res.status).toBe(201)
+    const ac = await res.json() as Account
+    expect(ac.credential.apiKeyEnv).toBeUndefined()
+    expect(ac.credential.apiKeyFile).toBe('config/credentials/account-a-paste-key')
+    expect(readFileSync(join(dir, ac.credential.apiKeyFile!), 'utf8')).toBe(pasted)
+  })
+
+  test('路径穿越：id 里的 .. / 不会被写进凭据文件路径', async () => {
+    const dir = isolateCwd()
+    const call = caller(build())
+    const res = await call('POST', '/admin/api/accounts', {
+      key: 'secret',
+      body: { id: '../evil', providerName: 's', credentialInput: 'sk-aaaaaaaaaaaaaaaaaaaa', credentialKind: 'key' },
+    })
+    expect(res.status).toBe(201)
+    const ac = await res.json() as Account
+    // id 里的非法字符被收敛，路径仍在 config/credentials/ 下
+    expect(ac.credential.apiKeyFile!.startsWith('config/credentials/')).toBe(true)
+    expect(ac.credential.apiKeyFile).not.toContain('..')
+    const written = readdirSync(join(dir, 'config', 'credentials'))
+    expect(written.some((f) => f.includes('evil'))).toBe(true)
+    expect(existsSync(join(dir, 'evil'))).toBe(false)
+  })
+
   test('POST 创建带 accountIds：未知字段忽略，照常 201（不存）', async () => {
+    const pz = mkProviderFixed({ name: 'pz' })
     const call = caller(build({
+      providers: [pz],
       accounts: [
-        { id: 'a1', sourceId: 's', credential: {}, status: 'available', fails: 0 },
+        { id: 'a1', providerId: pz.providerId, credential: {}, status: 'available', fails: 0 },
       ],
     }))
     const res = await call('POST', '/admin/api/providers', {
-      key: 'secret', body: { ...providerBody, id: 'pz', accountIds: ['a1'] },
+      key: 'secret', body: { ...providerBody, name: 'pz2', accountIds: ['a1'] },
     })
     expect(res.status).toBe(201)
     const got = (await call('GET', '/admin/api/providers', { key: 'secret' })
-      .then((r) => r.json() as Promise<{ providers: Provider[] }>)).providers.find((p) => p.id === 'pz')!
+      .then((r) => r.json() as Promise<{ providers: Provider[] }>)).providers.find((p) => p.name === 'pz2')!
     expect((got as unknown as Record<string, unknown>).accountIds).toBeUndefined()
   })
 
   test('账号权重 weight：PATCH 可设；非法值 400', async () => {
+    const aw = mkProviderFixed({ name: 's' })
     const call = caller(build({
+      providers: [aw],
       accounts: [
-        { id: 'a1', sourceId: 's', credential: {}, status: 'available', fails: 0 },
+        { id: 'a1', providerId: aw.providerId, credential: {}, status: 'available', fails: 0 },
       ],
     }))
     expect((await call('PATCH', '/admin/api/accounts/a1', {
@@ -369,15 +701,21 @@ describe('providers CRUD（对齐 Go TestProviderCRUD/PatchReadonly/Validation�
 // 内置 Provider 概念已移除：Provider 一律由发现/导入或手填生成，都可删。
 // （原「内置三源不可删、重启补回」的保护与前端「内置」标签一并删掉。）
 describe('Provider 可删（内置概念已移除）', () => {
-  test('配置文件种进来的 Provider 也照常可删 204', async () => {
-    const wb = mkProvider({ id: 'wb-direct', sourceId: 'workbuddy' })
-    const acme = mkProvider({ id: 'acme', sourceId: 'acme' })
+  test('配置文件种进来的 Provider 也照常可删 204（软删：行保留为 deleted）', async () => {
+    const wb = mkProviderFixed({ name: 'wb-direct' })
+    const acme = mkProviderFixed({ name: 'acme' })
     const call = caller(build({ providers: [wb, acme] }))
-    expect((await call('DELETE', '/admin/api/providers/wb-direct', { key: 'secret' })).status).toBe(204)
-    expect((await call('DELETE', '/admin/api/providers/acme', { key: 'secret' })).status).toBe(204)
+    expect((await call('DELETE', `/admin/api/providers/${wb.providerId}`, { key: 'secret' })).status).toBe(204)
+    expect((await call('DELETE', `/admin/api/providers/${acme.providerId}`, { key: 'secret' })).status).toBe(204)
     const list = await call('GET', '/admin/api/providers', { key: 'secret' })
       .then((r) => r.json() as Promise<{ providers: Provider[] }>)
-    expect(list.providers).toHaveLength(0)
+    // list() 返回所有行（含 deleted）：软删不丢数据，历史用量仍能按 providerId 回溯
+    expect(list.providers).toHaveLength(2)
+    expect(list.providers.every((p) => p.state === 'deleted')).toBe(true)
+    // deleted 的名字被释放：同名可再建（拿到新 providerId）
+    expect((await call('POST', '/admin/api/providers', {
+      key: 'secret', body: { ...providerBody, name: 'acme' },
+    })).status).toBe(201)
   })
 })
 
@@ -386,7 +724,7 @@ describe('Provider 可删（内置概念已移除）', () => {
 describe('accounts CRUD（对齐 Go TestAccountCRUD）', () => {
   test('全流程 + PATCH 白名单', async () => {
     const call = caller(build())
-    const a = { id: 'a1', sourceId: 's', displayName: '主号', credential: { apiKeyEnv: 'JWT' } }
+    const a = { id: 'a1', providerName: 's', displayName: '主号', credential: { apiKeyEnv: 'JWT' } }
     const created = await call('POST', '/admin/api/accounts', { key: 'secret', body: a })
     expect(created.status).toBe(201)
     const ac = await created.json() as Account
@@ -407,17 +745,71 @@ describe('accounts CRUD（对齐 Go TestAccountCRUD）', () => {
   test('缺 id/sourceId 400；非法 status 400', async () => {
     const call = caller(build())
     expect((await call('POST', '/admin/api/accounts', { key: 'secret', body: { id: 'x' } })).status).toBe(400)
-    expect((await call('POST', '/admin/api/accounts', { key: 'secret', body: { id: 'a2', sourceId: 's' } })).status).toBe(201)
+    expect((await call('POST', '/admin/api/accounts', { key: 'secret', body: { id: 'a2', providerName: 's' } })).status).toBe(201)
     expect((await call('POST', '/admin/api/accounts', {
-      key: 'secret', body: { id: 'a3', sourceId: 's', status: 'cooldown' },
+      key: 'secret', body: { id: 'a3', providerName: 's', status: 'cooldown' },
     })).status).toBe(400)
+  })
+
+  // 账号「归属 Provider」现在会校验存在性（用户反馈：以前随便填一个源名也能存进去，
+  // 结果账号永远 pick 不到，轮询不生效却看不出原因）。
+  test('归属 Provider 不存在：400 并点名该填什么', async () => {
+    const atria = mkProviderFixed({ name: 'atria' })
+    const call = caller(build({ providers: [atria] }))
+    const res = await call('POST', '/admin/api/accounts', {
+      key: 'secret', body: { id: 'a-x', providerName: '不存在的源' },
+    })
+    expect(res.status).toBe(400)
+    expect(((await res.json()) as { error: { message: string } }).error.message)
+      .toContain('不存在的源')
+    // 对得上就放行（按 Provider 名解析成数字 providerId 存下）
+    const ok = await call('POST', '/admin/api/accounts', {
+      key: 'secret', body: { id: 'a-ok', providerName: 'atria' },
+    })
+    expect(ok.status).toBe(201)
+    expect((await ok.json() as Account).providerId).toBe(atria.providerId)
+  })
+
+  test('归属也接受数字 providerId；指向已删除的 Provider → 400', async () => {
+    const zen = mkProviderFixed({ name: 'zen-chat' })
+    const call = caller(build({ providers: [zen] }))
+    expect((await call('POST', '/admin/api/accounts', {
+      key: 'secret', body: { id: 'a-1', providerId: zen.providerId },
+    })).status).toBe(201)
+    // 已软删的 Provider 不算有效归属
+    await call('DELETE', `/admin/api/providers/${zen.providerId}`, { key: 'secret' })
+    const res = await call('POST', '/admin/api/accounts', {
+      key: 'secret', body: { id: 'a-2', providerId: zen.providerId },
+    })
+    expect(res.status).toBe(400)
+    expect(((await res.json()) as { error: { message: string } }).error.message)
+      .toContain('不存在或已删除')
+  })
+
+  // 重名直接拒（用户要求：重名就提示，不许悄悄覆盖）。
+  test('账号重名：409 且提示换名字，不覆盖已有账号', async () => {
+    const call = caller(build())
+    const body = { id: 'dup', providerName: 's', displayName: '第一个' }
+    expect((await call('POST', '/admin/api/accounts', { key: 'secret', body })).status).toBe(201)
+    const again = await call('POST', '/admin/api/accounts', {
+      key: 'secret', body: { ...body, displayName: '第二个' },
+    })
+    expect(again.status).toBe(409)
+    expect(((await again.json()) as { error: { message: string } }).error.message)
+      .toContain('已存在')
+    // 原账号没被改动
+    const got = (await call('GET', '/admin/api/accounts', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ accounts: Account[] }>)).accounts[0]!
+    expect(got.displayName).toBe('第一个')
   })
 
   // 接入方式与风险等级随认知更新，管理面要能改（UI 把它们收进「高级选项」）。
   test('PATCH accessKind/risk：合法值写入，非法值 400', async () => {
     const call = caller(build())
-    await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })
-    const res = await call('PATCH', '/admin/api/providers/p1', {
+    const pid = ((await (await call('POST', '/admin/api/providers', {
+      key: 'secret', body: providerBody,
+    })).json()) as Provider).providerId
+    const res = await call('PATCH', `/admin/api/providers/${pid}`, {
       key: 'secret', body: { accessKind: 'reverse', risk: 'medium', riskNote: '第三方反代，可能封号' },
     })
     expect(res.status).toBe(200)
@@ -426,19 +818,25 @@ describe('accounts CRUD（对齐 Go TestAccountCRUD）', () => {
     expect(got.accessKind).toBe('reverse')
     expect(got.risk).toBe('medium')
 
-    expect((await call('PATCH', '/admin/api/providers/p1', {
+    expect((await call('PATCH', `/admin/api/providers/${pid}`, {
       key: 'secret', body: { accessKind: 'telepathy' },
     })).status).toBe(400)
-    expect((await call('PATCH', '/admin/api/providers/p1', {
+    expect((await call('PATCH', `/admin/api/providers/${pid}`, {
       key: 'secret', body: { risk: 'catastrophic' },
     })).status).toBe(400)
+    // 未知 providerId → 404
+    expect((await call('PATCH', '/admin/api/providers/99999', {
+      key: 'secret', body: { accessKind: 'reverse' },
+    })).status).toBe(404)
   })
 
   // 中/高风险必须带风险说明，否则使用者看不到风险提示（与 providerValidate 同一约束）。
   test('PATCH risk=high 但无 riskNote：拒绝，且不改动已有风险等级', async () => {
     const call = caller(build())
-    await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })
-    expect((await call('PATCH', '/admin/api/providers/p1', {
+    const pid = ((await (await call('POST', '/admin/api/providers', {
+      key: 'secret', body: providerBody,
+    })).json()) as Provider).providerId
+    expect((await call('PATCH', `/admin/api/providers/${pid}`, {
       key: 'secret', body: { risk: 'high' },
     })).status).toBe(400)
     const got = (await call('GET', '/admin/api/providers', { key: 'secret' })
@@ -450,11 +848,11 @@ describe('accounts CRUD（对齐 Go TestAccountCRUD）', () => {
   // 逐字段 setter 拦不住这种，收尾的 providerValidate 必须兜住。
   test('PATCH 同时清空 riskNote 并提高风险：拒绝（跨字段约束）', async () => {
     const call = caller(build())
-    await call('POST', '/admin/api/providers', {
+    const pid = ((await (await call('POST', '/admin/api/providers', {
       key: 'secret',
       body: { ...providerBody, risk: 'medium', riskNote: '原本有说明' },
-    })
-    const res = await call('PATCH', '/admin/api/providers/p1', {
+    })).json()) as Provider).providerId
+    const res = await call('PATCH', `/admin/api/providers/${pid}`, {
       key: 'secret', body: { risk: 'high', riskNote: '' },
     })
     expect(res.status).toBe(400)
@@ -466,11 +864,19 @@ describe('accounts CRUD（对齐 Go TestAccountCRUD）', () => {
 
   test('变更通知：增删改各一次×两类 = 6（对齐 Go TestChangeNotifier）', async () => {
     let n = 0
-    const call = caller(build({ notify: () => { n++ } }))
-    await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })
-    await call('PATCH', '/admin/api/providers/p1', { key: 'secret', body: { credential: { apiKeyEnv: 'NEW_ENV' } } })
-    await call('DELETE', '/admin/api/providers/p1', { key: 'secret' })
-    await call('POST', '/admin/api/accounts', { key: 'secret', body: { id: 'a1', sourceId: 's' } })
+    // 预置归属 Provider（账号按 Provider 名归属）：夹具补齐若走 HTTP 会多算一次 notify，
+    // 这个用例只关心业务操作本身的 6 次通知，所以归属提前放好。
+    const s0 = mkProviderFixed({ name: 's' })
+    const call = caller(build({
+      providers: [s0],
+      notify: () => { n++ },
+    }))
+    const pid = ((await (await call('POST', '/admin/api/providers', {
+      key: 'secret', body: providerBody,
+    })).json()) as Provider).providerId
+    await call('PATCH', `/admin/api/providers/${pid}`, { key: 'secret', body: { credential: { apiKeyEnv: 'NEW_ENV' } } })
+    await call('DELETE', `/admin/api/providers/${pid}`, { key: 'secret' })
+    await call('POST', '/admin/api/accounts', { key: 'secret', body: { id: 'a1', providerName: 's' } })
     await call('PATCH', '/admin/api/accounts/a1', { key: 'secret', body: { credential: { apiKeyFile: '/tmp/k' } } })
     await call('DELETE', '/admin/api/accounts/a1', { key: 'secret' })
     expect(n).toBe(6)
@@ -479,14 +885,16 @@ describe('accounts CRUD（对齐 Go TestAccountCRUD）', () => {
   // 稳定性在管理面可改（UI 把它收进「高级选项」，但收起来也要能存住）。
   test('PATCH stability：合法值写入，非法值 400', async () => {
     const call = caller(build())
-    await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })
-    const okRes = await call('PATCH', '/admin/api/providers/p1', {
+    const pid = ((await (await call('POST', '/admin/api/providers', {
+      key: 'secret', body: providerBody,
+    })).json()) as Provider).providerId
+    const okRes = await call('PATCH', `/admin/api/providers/${pid}`, {
       key: 'secret', body: { stability: 'experimental' },
     })
     expect(okRes.status).toBe(200)
     expect((await okRes.json() as { stability: string }).stability).toBe('experimental')
     // 非法值必须拒绝，且不污染已有值
-    expect((await call('PATCH', '/admin/api/providers/p1', {
+    expect((await call('PATCH', `/admin/api/providers/${pid}`, {
       key: 'secret', body: { stability: 'flaky' },
     })).status).toBe(400)
     const got = (await call('GET', '/admin/api/providers', { key: 'secret' })
@@ -498,11 +906,11 @@ describe('accounts CRUD（对齐 Go TestAccountCRUD）', () => {
   // 但一键导入生成的 Provider 全靠它取 Key：不带 credential 的 PATCH 必须原样保留。
   test('PATCH 不带 credential：文件型 Key 引用不被清空（前端表单不覆盖）', async () => {
     const call = caller(build())
-    await call('POST', '/admin/api/providers', {
+    const pid = ((await (await call('POST', '/admin/api/providers', {
       key: 'secret',
       body: { ...providerBody, credential: { apiKeyFile: 'config/credentials/acme-key' } },
-    })
-    await call('PATCH', '/admin/api/providers/p1', {
+    })).json()) as Provider).providerId
+    await call('PATCH', `/admin/api/providers/${pid}`, {
       key: 'secret', body: { displayName: '改名', stability: 'beta', streamOnly: true },
     })
     const got = (await call('GET', '/admin/api/providers', { key: 'secret' })
@@ -513,7 +921,8 @@ describe('accounts CRUD（对齐 Go TestAccountCRUD）', () => {
 })
 
 describe('账号列表带运行时状态（冷却/连败不在 DB 里）', () => {
-  const accts = [{ id: 'a1', sourceId: 's', credential: {}, status: 'available' as const, fails: 0 }]
+  // 账号归属 = 数字 providerId；这些用例不查 Provider 表，给个固定正数即可。
+  const accts = [{ id: 'a1', providerId: 1, credential: {}, status: 'available' as const, fails: 0 }]
 
   test('池内冷却覆盖 DB 的 available，并显示真实连败数', async () => {
     const until = new Date(Date.now() + 60_000)
@@ -568,14 +977,14 @@ describe('账号列表带运行时状态（冷却/连败不在 DB 里）', () =>
     const cb = await (await cool('GET', '/admin/api/accounts', { key: 'secret' })).json() as { accounts: { health?: string }[] }
     expect(cb.accounts[0]!.health).toBe('warn')
     // 停用 → bad（未接运行时也要有 health）
-    const dis = caller(build({ accounts: [{ id: 'a1', sourceId: 's', credential: {}, status: 'disabled' as const, fails: 0 }] }))
+    const dis = caller(build({ accounts: [{ id: 'a1', providerId: 1, credential: {}, status: 'disabled' as const, fails: 0 }] }))
     const db = await (await dis('GET', '/admin/api/accounts', { key: 'secret' })).json() as { accounts: { health?: string }[] }
     expect(db.accounts[0]!.health).toBe('bad')
   })
 })
 
 describe('账号测试端点（指定账号打真实请求）', () => {
-  const accts = [{ id: 'a1', sourceId: 's', credential: {}, status: 'available' as const, fails: 0 }]
+  const accts = [{ id: 'a1', providerId: 1, credential: {}, status: 'available' as const, fails: 0 }]
 
   test('200 回显探测结果，并把 model 透传给 prober', async () => {
     const seen: [string, string][] = []
@@ -614,7 +1023,7 @@ describe('账号测试端点（指定账号打真实请求）', () => {
 describe('recheck 恢复键（对齐 Go TestAccountRecheck）', () => {
   test('存在则 200 并调 ResetAccount；未知 404；未接线也 200', async () => {
     const rs = new StubResetter(true)
-    const call = caller(build({ resetter: rs, accounts: [{ id: 'a1', sourceId: 's', credential: {}, status: 'available', fails: 0 }] }))
+    const call = caller(build({ resetter: rs, accounts: [{ id: 'a1', providerId: 1, credential: {}, status: 'available', fails: 0 }] }))
     const ok = await call('POST', '/admin/api/accounts/a1/recheck', { key: 'secret' })
     expect(ok.status).toBe(200)
     const body = await ok.json() as { id: string; reset: boolean; message: string }
@@ -632,36 +1041,37 @@ describe('recheck 恢复键（对齐 Go TestAccountRecheck）', () => {
 describe('test/models/scan/protocol 端点（Probe 接口打桩）', () => {
   test('test：打通回显文本；未接线 501', async () => {
     const ok = caller(build({ prober: new StubProber({ ok: true, model: 'zcode/glm-5', text: 'hi', latencyMs: 320 }) }))
-    const res = await ok('POST', '/admin/api/providers/pz/test', { key: 'secret' })
+    const res = await ok('POST', '/admin/api/providers/1/test', { key: 'secret' })
     expect(res.status).toBe(200)
     expect(await res.json()).toMatchObject({ ok: true, text: 'hi', latencyMs: 320 })
 
     const unwired = caller(build())
-    expect((await unwired('POST', '/admin/api/providers/pz/test', { key: 'secret' })).status).toBe(501)
+    expect((await unwired('POST', '/admin/api/providers/1/test', { key: 'secret' })).status).toBe(501)
   })
 
   test('models：透出上游列表；listler 报错 502；未接线 501', async () => {
     const list: ModelList = { models: ['glm-5', 'glm-6'], source: 'upstream' }
     const wired = caller(build({ lister: new StubLister(list) }))
-    const res = await wired('GET', '/admin/api/providers/pz/models', { key: 'secret' })
+    const res = await wired('GET', '/admin/api/providers/1/models', { key: 'secret' })
     expect(res.status).toBe(200)
     expect(await res.json()).toMatchObject({ models: ['glm-5', 'glm-6'], source: 'upstream' })
 
     const err = caller(build({ lister: new StubLister(undefined, '上游不支持模型列表') }))
-    expect((await err('GET', '/admin/api/providers/pz/models', { key: 'secret' })).status).toBe(502)
+    expect((await err('GET', '/admin/api/providers/1/models', { key: 'secret' })).status).toBe(502)
 
     const unwired = caller(build())
-    expect((await unwired('GET', '/admin/api/providers/pz/models', { key: 'secret' })).status).toBe(501)
+    expect((await unwired('GET', '/admin/api/providers/1/models', { key: 'secret' })).status).toBe(501)
   })
 
   test('scan：回传结果并把探到的协议写回模型目录', async () => {
-    const p = mkProvider({
-      id: 'pz',
+    const p = mkProviderFixed({
+      name: 'pz',
       models: [
-        { id: 'm1', providerId: 'pz', manual: false, enabled: true, api: 'anthropic-messages' },
-        { id: 'm2', providerId: 'pz', manual: false, enabled: true, api: 'anthropic-messages' },
+        { id: 'm1', manual: false, enabled: true, api: 'anthropic-messages' },
+        { id: 'm2', manual: false, enabled: true, api: 'anthropic-messages' },
       ],
     })
+    p.models = p.models.map((m) => ({ ...m, providerId: p.providerId }))
     const call = caller(build({
       providers: [p],
       modelProber: new StubModelProber([
@@ -669,7 +1079,7 @@ describe('test/models/scan/protocol 端点（Probe 接口打桩）', () => {
         { model: 'm2', ok: false, error: 'http 503' },
       ]),
     }))
-    const res = await call('POST', '/admin/api/providers/pz/scan', {
+    const res = await call('POST', `/admin/api/providers/${p.providerId}/scan`, {
       key: 'secret', body: { models: ['m1', 'm2'] },
     })
     expect(res.status).toBe(200)
@@ -683,43 +1093,44 @@ describe('test/models/scan/protocol 端点（Probe 接口打桩）', () => {
   })
 
   test('scan 未接线 501；空 body 用已配置模型（不报错）', async () => {
-    const p = mkProvider({ id: 'pz' })
+    const p = mkProviderFixed({ name: 'pz' })
     const unwired = caller(build({ providers: [p] }))
-    expect((await unwired('POST', '/admin/api/providers/pz/scan', { key: 'secret' })).status).toBe(501)
+    expect((await unwired('POST', `/admin/api/providers/${p.providerId}/scan`, { key: 'secret' })).status).toBe(501)
 
     const empty = caller(build({
       providers: [p],
       modelProber: new StubModelProber([{ model: '', ok: false, error: '没有可测模型' }]),
     }))
-    const res = await empty('POST', '/admin/api/providers/pz/scan', { key: 'secret', body: {} })
+    const res = await empty('POST', `/admin/api/providers/${p.providerId}/scan`, { key: 'secret', body: {} })
     expect(res.status).toBe(200)
   })
 
   test('protocol 端点：设置 / 继承 / 非法 / 双 404', async () => {
-    const p = mkProvider({
-      id: 'pz', api: 'anthropic-messages',
-      models: [{ id: 'm1', providerId: 'pz', manual: false, enabled: true }],
+    const p = mkProviderFixed({
+      name: 'pz', api: 'anthropic-messages',
+      models: [{ id: 'm1', manual: false, enabled: true }],
     })
+    p.models = p.models.map((m) => ({ ...m, providerId: p.providerId }))
     const call = caller(build({ providers: [p] }))
-    const set = await call('PUT', '/admin/api/providers/pz/models/m1/protocol', {
+    const set = await call('PUT', `/admin/api/providers/${p.providerId}/models/m1/protocol`, {
       key: 'secret', body: { protocol: 'openai-responses' },
     })
     expect(set.status).toBe(200)
     expect(((await set.json()) as { api?: string }).api).toBe('openai-responses')
 
-    const inherit = await call('PUT', '/admin/api/providers/pz/models/m1/protocol', {
+    const inherit = await call('PUT', `/admin/api/providers/${p.providerId}/models/m1/protocol`, {
       key: 'secret', body: { protocol: '' },
     })
     expect(inherit.status).toBe(200)
     expect((await inherit.json() as { api?: string }).api).toBeUndefined() // 空 = 继承 Provider 默认
 
-    expect((await call('PUT', '/admin/api/providers/pz/models/m1/protocol', {
+    expect((await call('PUT', `/admin/api/providers/${p.providerId}/models/m1/protocol`, {
       key: 'secret', body: { protocol: 'nope' },
     })).status).toBe(400)
-    expect((await call('PUT', '/admin/api/providers/nope/models/m1/protocol', {
+    expect((await call('PUT', '/admin/api/providers/99999/models/m1/protocol', {
       key: 'secret', body: { protocol: '' },
     })).status).toBe(404)
-    expect((await call('PUT', '/admin/api/providers/pz/models/nope/protocol', {
+    expect((await call('PUT', `/admin/api/providers/${p.providerId}/models/nope/protocol`, {
       key: 'secret', body: { protocol: '' },
     })).status).toBe(404)
   })
@@ -754,7 +1165,7 @@ describe('stats/breakdown（真实 usage Store）', () => {
     try {
       const store = await Store.open(join(dir, 'usage.db'))
       const log = (over: Partial<UsageLog>): UsageLog => ({
-        id: 0, ts: new Date(), requestId: 'r', sourceId: 's', providerId: 'p',
+        id: 0, ts: new Date(), requestId: 'r', providerId: 1, providerName: 'p',
         modelId: 'm', inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
         cacheCreationTokens: 0, reasoningTokens: 0, totalTokens: 0, accuracy: 'exact',
         latencyMs: 5, status: 'ok', stream: false, ...over,
@@ -825,22 +1236,24 @@ describe('discover 端点（DiscoverSource 打桩，对齐 Go discover_test.go�
     const { call } = discoverAPI()
     const first = await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy' } })
     expect(first.status).toBe(201)
-    expect(((await first.json()) as Provider).id).toBe('wb-auto')
+    const adopted = await first.json() as Provider
+    expect(adopted.name).toBe('wb-auto')
+    expect(adopted.providerId).toBeGreaterThan(0) // 采用时由存储层分配
 
     const second = await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy' } })
     expect(second.status).toBe(200)
-    expect(((await second.json()) as Provider).id).toBe('wb-auto')
+    expect(((await second.json()) as Provider).providerId).toBe(adopted.providerId) // 幂等：同一条
 
     expect((await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'zcode' } })).status).toBe(400)
     expect((await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'nope' } })).status).toBe(404)
-    expect((await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy', id: 'Bad_ID' } })).status).toBe(400)
+    expect((await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy', name: 'Bad_ID' } })).status).toBe(400)
   })
 
-  test('adopt 自定义 id 覆盖建议 ID', async () => {
+  test('adopt 自定义 name 覆盖建议名', async () => {
     const { call } = discoverAPI()
-    const res = await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy', id: 'my-wb' } })
+    const res = await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy', name: 'my-wb' } })
     expect(res.status).toBe(201)
-    expect(((await res.json()) as Provider).id).toBe('my-wb')
+    expect(((await res.json()) as Provider).name).toBe('my-wb')
   })
 
   // issue #1：采用只落了一个 credential.apiKeyEnv='WB_TOKEN' 的 Provider，池子是空的，
@@ -852,7 +1265,7 @@ describe('discover 端点（DiscoverSource 打桩，对齐 Go discover_test.go�
     const dead = makeAuthFile('过期号')
     const findings: Finding[] = [{
       key: 'workbuddy', harness: 'WB', status: 'ready', detail: '',
-      suggestedProvider: { ...readyProvider('wb-auto'), sourceId: 'workbuddy', credential: { apiKeyEnv: 'WB_TOKEN' } },
+      suggestedProvider: { ...readyProvider('wb-auto'), credential: { apiKeyEnv: 'WB_TOKEN' } },
       suggestedAccounts: [
         { nickname: '主号', uid: 'u1', alive: true, tokenPath: alive.tokenPath },
         { nickname: '过期号', uid: 'u2', alive: false, tokenPath: dead.tokenPath },
@@ -878,7 +1291,7 @@ describe('discover 端点（DiscoverSource 打桩，对齐 Go discover_test.go�
     const alive = makeAuthFile('主号')
     const findings: Finding[] = [{
       key: 'workbuddy', harness: 'WB', status: 'ready', detail: '',
-      suggestedProvider: { ...readyProvider('wb-auto'), sourceId: 'workbuddy', credential: { apiKeyEnv: 'WB_TOKEN' } },
+      suggestedProvider: { ...readyProvider('wb-auto'), credential: { apiKeyEnv: 'WB_TOKEN' } },
       suggestedAccounts: [{ nickname: '主号', uid: 'u1', alive: true, tokenPath: alive.tokenPath }],
     }]
     const call = caller(build({ discover: new StubDiscover(findings) }))
@@ -902,18 +1315,22 @@ describe('discover 端点（DiscoverSource 打桩，对齐 Go discover_test.go�
     })).status).toBe(501)
   })
 
-  test('已接管的登录态标出 adoptedProviderId（key 命中与 suggestedProvider.sourceId 命中两条路径）', async () => {
+  test('已接管的登录态标出 adoptedProviderId（判据 = 草稿 Provider id 已在库中）', async () => {
     const findings: Finding[] = [
       { key: 'workbuddy', harness: 'WB', status: 'ready', detail: '', suggestedProvider: readyProvider('wb-auto') },
-      { key: 'opencode-zen', harness: 'Zen', status: 'ready', detail: '', suggestedProvider: { ...readyProvider('zen'), sourceId: 'opencode' } },
+      { key: 'opencode-zen', harness: 'Zen', status: 'ready', detail: '', suggestedProvider: readyProvider('zen-auto') },
     ]
-    const wb = mkProvider({ id: 'wb-direct', sourceId: 'workbuddy' })
-    const oc = mkProvider({ id: 'oc-thing', sourceId: 'opencode' })
-    const call = caller(build({ discover: new StubDiscover(findings), providers: [wb, oc] }))
+    // 库里只有 wb-auto：它已接管；zen-auto 没有 → 未接管
+    const wbAuto = mkProviderFixed({ name: 'wb-auto' })
+    const call = caller(build({
+      discover: new StubDiscover(findings),
+      providers: [wbAuto],
+    }))
     const list = await call('GET', '/admin/api/discover', { key: 'secret' })
       .then((r) => r.json() as Promise<{ findings: Finding[] }>)
-    expect(list.findings.find((f) => f.key === 'workbuddy')!.adoptedProviderId).toBe('wb-direct')
-    expect(list.findings.find((f) => f.key === 'opencode-zen')!.adoptedProviderId).toBe('oc-thing')
+    // adoptedProviderId 现在是数字 providerId（报真实行 id，前端据此定位/删除）
+    expect(list.findings.find((f) => f.key === 'workbuddy')!.adoptedProviderId).toBe(wbAuto.providerId)
+    expect(list.findings.find((f) => f.key === 'opencode-zen')!.adoptedProviderId).toBeUndefined()
   })
 
   // 真实缺陷（用户报「把 opencode 删了，再导入报错，导致 provider 里既看不到
@@ -926,7 +1343,7 @@ describe('discover 端点（DiscoverSource 打桩，对齐 Go discover_test.go�
     const findings: Finding[] = [
       {
         key: 'opencode-zen', harness: 'Zen', status: 'ready', detail: '',
-        suggestedProvider: { ...readyProvider('zen-auto'), sourceId: 'opencode' },
+        suggestedProvider: readyProvider('zen-auto'),
       },
     ]
     // DB 里已没有 sourceId=opencode 的任何 Provider（用户刚删干净）
@@ -937,24 +1354,27 @@ describe('discover 端点（DiscoverSource 打桩，对齐 Go discover_test.go�
     // 且此时一键导入必须真的能建出来（不能被幂等短路成「已导入」）
     const res = await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: { key: 'opencode-zen' } })
     expect(res.status).toBe(200)
-    expect(await call('GET', '/admin/api/providers/' + encodeURIComponent('zen-auto'), { key: 'secret' })).toBeTruthy()
+    const imported = await res.json() as { provider: Provider }
+    expect(imported.provider.name).toBe('zen-auto')
+    expect(imported.provider.providerId).toBeGreaterThan(0)
   })
 
-  test('配置里同 sourceId、不同 id 的 Provider：报出真正的接管者 id（用户才知道删哪行）', async () => {
-    // config/apps.yaml 种下的是 zen（sourceId=opencode），而发现项草稿 id 是 zen-auto。
+  test('库里的 Provider id 与草稿一致才报「已接管」，且报的是真实行 id', async () => {
+    // 用户把自动发现建的 zen-auto 改名/重建成了 zen：id 不同 → 视为未接管，
+    // 「一键导入」保持可用（否则导入入口被永久锁死，用户既导不进来也无处可删）。
     const findings: Finding[] = [
       {
         key: 'opencode-zen', harness: 'Zen', status: 'ready', detail: '',
-        suggestedProvider: { ...readyProvider('zen-auto'), sourceId: 'opencode' },
+        suggestedProvider: readyProvider('zen-auto'),
       },
     ]
     const call = caller(build({
       discover: new StubDiscover(findings),
-      providers: [mkProvider({ id: 'zen', sourceId: 'opencode' })],
+      providers: [mkProviderFixed({ name: 'zen' })],
     }))
     const list = await call('GET', '/admin/api/discover', { key: 'secret' })
       .then((r) => r.json() as Promise<{ findings: Finding[] }>)
-    expect(list.findings.find((x) => x.key === 'opencode-zen')!.adoptedProviderId).toBe('zen')
+    expect(list.findings.find((x) => x.key === 'opencode-zen')!.adoptedProviderId).toBeUndefined()
   })
 })
 
@@ -969,7 +1389,9 @@ describe('discover/import-account（对齐 Go import_account_test.go）', () => 
   test('成功导入：token 服务端落凭据文件（0600）+ 账号入池', async () => {
     isolateCwd()
     const { tokenPath, token } = makeAuthFile('副号A')
-    const call = caller(build({ discover: new StubDiscover([findingWith(tokenPath)]) }))
+    // 导入账号要挂到「已接管该 harness 的 Provider」上：先把它建好。
+    const wb = mkProviderFixed({ name: 'workbuddy' })
+    const call = caller(build({ discover: new StubDiscover([findingWith(tokenPath)]), providers: [wb] }))
     const res = await call('POST', '/admin/api/discover/import-account', {
       key: 'secret',
       body: { key: 'workbuddy', tokenPath, accountId: 'wb-x', displayName: '副号A', credentialFile: 'config/credentials/wb-jwt-x' },
@@ -977,7 +1399,7 @@ describe('discover/import-account（对齐 Go import_account_test.go）', () => 
     expect(res.status).toBe(201)
     const acct = await res.json() as Account
     expect(acct.id).toBe('wb-x')
-    expect(acct.sourceId).toBe('workbuddy')
+    expect(acct.providerId).toBe(wb.providerId) // 归属 = 接管该 harness 的 Provider（数字 id）
     expect(acct.credential.apiKeyFile).toBe('config/credentials/wb-jwt-x')
     const credPath = join(process.cwd(), 'config', 'credentials', 'wb-jwt-x')
     expect(readFileSync(credPath, 'utf8')).toBe(token)
@@ -999,7 +1421,8 @@ describe('discover/import-account（对齐 Go import_account_test.go）', () => 
   test('tokenPath 不在发现结果内 → 400；过期登录态 → 400；重复 accountId → 409', async () => {
     isolateCwd()
     const { tokenPath } = makeAuthFile('副号A')
-    const call = caller(build({ discover: new StubDiscover([findingWith(tokenPath)]) }))
+    const wb2 = mkProviderFixed({ name: 'workbuddy' })
+    const call = caller(build({ discover: new StubDiscover([findingWith(tokenPath)]), providers: [wb2] }))
     const body = { key: 'workbuddy', tokenPath: '/etc/passwd', accountId: 'x', displayName: 'x', credentialFile: 'config/credentials/c' }
     expect((await call('POST', '/admin/api/discover/import-account', { key: 'secret', body })).status).toBe(400)
 
@@ -1046,7 +1469,8 @@ describe('discover/quick-import（对齐 Go quickimport_test.go）', () => {
     expect(res.status).toBe(200)
     const out = await res.json() as { provider: Provider; created: boolean; imported: number; skipped: number }
     expect(out.created).toBe(true)
-    expect(out.provider.id).toBe('wb-auto')
+    expect(out.provider.name).toBe('wb-auto')
+    expect(out.provider.providerId).toBeGreaterThan(0)
     expect(out.imported).toBe(2)
     expect(out.skipped).toBe(0)
     for (const id of ['workbuddy-1', 'workbuddy-2']) {
@@ -1090,7 +1514,7 @@ describe('discover/quick-import（对齐 Go quickimport_test.go）', () => {
     const prev = process.env.ZEN_KEY
     delete process.env.ZEN_KEY
     try {
-      const zen = { ...readyProvider('zen'), sourceId: 'opencode', credential: { apiKeyEnv: 'ZEN_KEY' } }
+      const zen = { ...readyProvider('zen'), credential: { apiKeyEnv: 'ZEN_KEY' } }
       const call = caller(build({ discover: new StubDiscover([
         { key: 'opencode-zen', harness: 'Zen', status: 'ready', detail: '', suggestedProvider: zen },
       ]) }))
@@ -1103,7 +1527,7 @@ describe('discover/quick-import（对齐 Go quickimport_test.go）', () => {
 
       // 环境变量已配置时不得覆盖
       process.env.ZEN_KEY = 'custom'
-      const zen2 = { ...readyProvider('zen2'), sourceId: 'opencode', credential: { apiKeyEnv: 'ZEN_KEY' } }
+      const zen2 = { ...readyProvider('zen2'), credential: { apiKeyEnv: 'ZEN_KEY' } }
       const call2 = caller(build({ discover: new StubDiscover([
         { key: 'opencode-zen', harness: 'Zen', status: 'ready', detail: '', suggestedProvider: zen2 },
       ]) }))
@@ -1210,29 +1634,34 @@ describe('egresses 出口 CRUD（GET/PUT/DELETE，DB 持久化由 store 测试�
 })
 
 // 备注：给模型留一句运维知识（如「23 点后才免费」），避免拿付费时段当免费刷。
-describe('PUT /admin/api/providers/:id/models/:model/note（模型备注）', () => {
-  const mk = () => mkProvider({
-    id: 'pz', api: 'anthropic-messages',
-    models: [{ id: 'm1', providerId: 'pz', manual: false, enabled: true }],
-  })
+describe('PUT /admin/api/providers/:pid/models/:model/note（模型备注）', () => {
+  const mk = (): Provider => {
+    const p = mkProviderFixed({
+      name: 'pz', api: 'anthropic-messages',
+      models: [{ id: 'm1', manual: false, enabled: true }],
+    })
+    p.models = p.models.map((m) => ({ ...m, providerId: p.providerId }))
+    return p
+  }
 
   test('写入/覆盖/清空备注；空串 = 删掉该字段', async () => {
-    const call = caller(build({ providers: [mk()] }))
-    const set = await call('PUT', '/admin/api/providers/pz/models/m1/note', {
+    const pz = mk()
+    const call = caller(build({ providers: [pz] }))
+    const set = await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/note`, {
       key: 'secret', body: { note: '23 点后才免费，白天用会扣额度' },
     })
     expect(set.status).toBe(200)
     expect(((await set.json()) as { note?: string }).note).toBe('23 点后才免费，白天用会扣额度')
 
     // 覆盖
-    await call('PUT', '/admin/api/providers/pz/models/m1/note', {
+    await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/note`, {
       key: 'secret', body: { note: '已确认全天免费' },
     })
     const list = await (await call('GET', '/admin/api/providers', { key: 'secret' })).json() as { providers: Provider[] }
     expect(list.providers[0]!.models[0]!.note).toBe('已确认全天免费')
 
     // 清空 → 字段消失（不是留个空串）
-    const clear = await call('PUT', '/admin/api/providers/pz/models/m1/note', {
+    const clear = await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/note`, {
       key: 'secret', body: { note: '' },
     })
     expect(clear.status).toBe(200)
@@ -1242,26 +1671,28 @@ describe('PUT /admin/api/providers/:id/models/:model/note（模型备注）', ()
 
   test('触发变更通知（调度热重载）；404 与非法请求体', async () => {
     let n = 0
-    const call = caller(build({ providers: [mk()], notify: () => { n++ } }))
-    await call('PUT', '/admin/api/providers/pz/models/m1/note', { key: 'secret', body: { note: 'x' } })
+    const pz = mk()
+    const call = caller(build({ providers: [pz], notify: () => { n++ } }))
+    await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/note`, { key: 'secret', body: { note: 'x' } })
     expect(n).toBe(1)
-    expect((await call('PUT', '/admin/api/providers/pz/models/m1/note', {
+    expect((await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/note`, {
       key: 'secret', body: { note: 123 },
     })).status).toBe(400)
-    expect((await call('PUT', '/admin/api/providers/pz/models/nope/note', {
+    expect((await call('PUT', `/admin/api/providers/${pz.providerId}/models/nope/note`, {
       key: 'secret', body: { note: 'x' },
     })).status).toBe(404)
-    expect((await call('PUT', '/admin/api/providers/nope/models/m1/note', {
+    expect((await call('PUT', '/admin/api/providers/99999/models/m1/note', {
       key: 'secret', body: { note: 'x' },
     })).status).toBe(404)
   })
 
   test('备注不影响模型其它字段（改完协议/出口还在）', async () => {
-    const call = caller(build({ providers: [mk()] }))
-    await call('PUT', '/admin/api/providers/pz/models/m1/protocol', {
+    const pz = mk()
+    const call = caller(build({ providers: [pz] }))
+    await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/protocol`, {
       key: 'secret', body: { protocol: 'openai-responses' },
     })
-    await call('PUT', '/admin/api/providers/pz/models/m1/note', {
+    await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/note`, {
       key: 'secret', body: { note: '备' },
     })
     const list = await (await call('GET', '/admin/api/providers', { key: 'secret' })).json() as { providers: Provider[] }
@@ -1271,55 +1702,57 @@ describe('PUT /admin/api/providers/:id/models/:model/note（模型备注）', ()
   })
 })
 
-describe('PUT /admin/api/providers/:id/models/:model/enabled（对外暴露开关）', () => {
+describe('PUT /admin/api/providers/:pid/models/:model/enabled（对外暴露开关）', () => {
   test('开关模型启用；404 与非法请求体', async () => {
-    const p = mkProvider({
-      id: 'pz', api: 'anthropic-messages',
+    const p = mkProviderFixed({
+      name: 'pz', api: 'anthropic-messages',
       models: [
-        { id: 'm1', providerId: 'pz', manual: false, enabled: true },
-        { id: 'm2', providerId: 'pz', manual: false, enabled: true },
+        { id: 'm1', manual: false, enabled: true },
+        { id: 'm2', manual: false, enabled: true },
       ],
     })
+    p.models = p.models.map((m) => ({ ...m, providerId: p.providerId }))
     const call = caller(build({ providers: [p] }))
 
-    const off = await call('PUT', '/admin/api/providers/pz/models/m2/enabled', {
+    const off = await call('PUT', `/admin/api/providers/${p.providerId}/models/m2/enabled`, {
       key: 'secret', body: { enabled: false },
     })
     expect(off.status).toBe(200)
     expect(((await off.json()) as { enabled: boolean }).enabled).toBe(false)
 
-    const on = await call('PUT', '/admin/api/providers/pz/models/m2/enabled', {
+    const on = await call('PUT', `/admin/api/providers/${p.providerId}/models/m2/enabled`, {
       key: 'secret', body: { enabled: true },
     })
     expect(on.status).toBe(200)
     expect(((await on.json()) as { enabled: boolean }).enabled).toBe(true)
 
-    expect((await call('PUT', '/admin/api/providers/pz/models/m2/enabled', {
+    expect((await call('PUT', `/admin/api/providers/${p.providerId}/models/m2/enabled`, {
       key: 'secret', body: {},
     })).status).toBe(400)
-    expect((await call('PUT', '/admin/api/providers/pz/models/nope/enabled', {
+    expect((await call('PUT', `/admin/api/providers/${p.providerId}/models/nope/enabled`, {
       key: 'secret', body: { enabled: true },
     })).status).toBe(404)
-    expect((await call('PUT', '/admin/api/providers/nope/models/m1/enabled', {
+    expect((await call('PUT', '/admin/api/providers/99999/models/m1/enabled', {
       key: 'secret', body: { enabled: true },
     })).status).toBe(404)
   })
 })
 
 // 手填错的模型得能摘掉：PATCH models 只增不减，所以删除必须独立端点。
-describe('DELETE /admin/api/providers/:id/models/:model（删单个模型）', () => {
+describe('DELETE /admin/api/providers/:pid/models/:model（删单个模型）', () => {
   test('删掉指定模型，其余不动；未知 provider/模型 404', async () => {
-    const p = mkProvider({
-      id: 'pz', api: 'anthropic-messages',
+    const p = mkProviderFixed({
+      name: 'pz', api: 'anthropic-messages',
       models: [
-        { id: 'hand-typed', providerId: 'pz', manual: true, enabled: true },
-        { id: 'm2', providerId: 'pz', manual: false, enabled: true },
+        { id: 'hand-typed', manual: true, enabled: true },
+        { id: 'm2', manual: false, enabled: true },
       ],
     })
+    p.models = p.models.map((m) => ({ ...m, providerId: p.providerId }))
     let notified = 0
     const call = caller(build({ providers: [p], notify: () => { notified++ } }))
 
-    const del = await call('DELETE', '/admin/api/providers/pz/models/hand-typed', { key: 'secret' })
+    const del = await call('DELETE', `/admin/api/providers/${p.providerId}/models/hand-typed`, { key: 'secret' })
     expect(del.status).toBe(204)
     expect(notified).toBe(1) // 触发调度热重载
 
@@ -1327,19 +1760,20 @@ describe('DELETE /admin/api/providers/:id/models/:model（删单个模型）', (
     expect(list.providers[0]!.models.map((m) => m.id)).toEqual(['m2'])
 
     // 重复删 / 未知模型 / 未知 provider
-    expect((await call('DELETE', '/admin/api/providers/pz/models/hand-typed', { key: 'secret' })).status).toBe(404)
-    expect((await call('DELETE', '/admin/api/providers/pz/models/nope', { key: 'secret' })).status).toBe(404)
-    expect((await call('DELETE', '/admin/api/providers/nope/models/m2', { key: 'secret' })).status).toBe(404)
+    expect((await call('DELETE', `/admin/api/providers/${p.providerId}/models/hand-typed`, { key: 'secret' })).status).toBe(404)
+    expect((await call('DELETE', `/admin/api/providers/${p.providerId}/models/nope`, { key: 'secret' })).status).toBe(404)
+    expect((await call('DELETE', '/admin/api/providers/99999/models/m2', { key: 'secret' })).status).toBe(404)
   })
 
   test('删除后 PATCH models 仍只增不减（删了再加能回来）', async () => {
-    const p = mkProvider({
-      id: 'pz', api: 'anthropic-messages',
-      models: [{ id: 'm1', providerId: 'pz', manual: true, enabled: true }],
+    const p = mkProviderFixed({
+      name: 'pz', api: 'anthropic-messages',
+      models: [{ id: 'm1', manual: true, enabled: true }],
     })
+    p.models = p.models.map((m) => ({ ...m, providerId: p.providerId }))
     const call = caller(build({ providers: [p] }))
-    expect((await call('DELETE', '/admin/api/providers/pz/models/m1', { key: 'secret' })).status).toBe(204)
-    const back = await call('PATCH', '/admin/api/providers/pz', { key: 'secret', body: { models: ['m1'] } })
+    expect((await call('DELETE', `/admin/api/providers/${p.providerId}/models/m1`, { key: 'secret' })).status).toBe(204)
+    const back = await call('PATCH', `/admin/api/providers/${p.providerId}`, { key: 'secret', body: { models: ['m1'] } })
     expect(back.status).toBe(200)
     const list = await (await call('GET', '/admin/api/providers', { key: 'secret' })).json() as { providers: Provider[] }
     expect(list.providers[0]!.models.map((m) => m.id)).toEqual(['m1'])

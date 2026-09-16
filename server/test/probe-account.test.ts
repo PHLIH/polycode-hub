@@ -46,17 +46,21 @@ function chatServer(mode: 'ok' | 'auth'): Promise<string> {
   })
 }
 
+// 账号归属 Provider（providerId 必须与 mkProbe 造的 Provider.providerId 一致，否则 pick 不到）。
+// 这是数字内部 id：改名不会让账号掉队。
+const PROV_ID = 1
+
 const acct = (over: Partial<Account> & { id: string }): Account => ({
-  sourceId: 'src', credential: {}, status: 'available', fails: 0, ...over,
+  providerId: PROV_ID, credential: {}, status: 'available', fails: 0, ...over,
 })
 
 // 凭据解析：把 apiKeyEnv 当密钥本身（测试里够用，probe 只管塞进 Authorization）。
 function mkProbe(baseUrl: string, accounts: Account[]): { probe: Probe; pool: AccountPool } {
   const p: Provider = {
-    id: 'prov', sourceId: 'src', displayName: 'd', accessKind: 'official', risk: 'low',
+    providerId: PROV_ID, name: 'prov', displayName: 'd', accessKind: 'official', risk: 'low',
     riskNote: '', stability: 'stable', api: 'openai-completions', baseUrl,
-    credential: {}, headers: {}, enabled: true, priority: 1, streamOnly: false,
-    models: [{ id: 'm1', providerId: 'prov', input: ['text'], manual: false, enabled: true }],
+    credential: {}, headers: {}, state: 'active', priority: 1, streamOnly: false,
+    models: [{ id: 'm1', input: ['text'], manual: false, enabled: true }],
   }
   const pool = new AccountPool(accounts)
   // 凭据解析：apiKeyEnv 直接当密钥（测试里够用，probe 只管塞进 Authorization）。
@@ -68,8 +72,8 @@ describe('账号测试：钉账号 + 状态计入', () => {
   test('用该账号的凭据，不是 Provider 级凭据', async () => {
     const base = await chatServer('ok')
     const { probe } = mkProbe(base, [
-      acct({ id: 'wb-1', credential: { apiKeyEnv: 'KEY_OF_WB1' } }),
-      acct({ id: 'wb-2', credential: { apiKeyEnv: 'KEY_OF_WB2' } }),
+      acct({ id: 'wb-1', providerId: 1, credential: { apiKeyEnv: 'KEY_OF_WB1' } }),
+      acct({ id: 'wb-2', providerId: 1, credential: { apiKeyEnv: 'KEY_OF_WB2' } }),
     ])
     const r = await probe.probeAccount('wb-2', 'm1')
     expect(r.ok).toBe(true)
@@ -107,9 +111,9 @@ describe('账号测试：钉账号 + 状态计入', () => {
 
   test('账号不存在 / 无 Provider：如实报错，不抛异常', async () => {
     const base = await chatServer('ok')
-    const { probe } = mkProbe(base, [acct({ id: 'a', sourceId: 'other' })])
+    const { probe } = mkProbe(base, [acct({ id: 'a', providerId: 999 })])
     expect((await probe.probeAccount('nope', 'm1')).error).toMatch(/不存在/)
-    // 源对不上 → 找不到 Provider
-    expect((await probe.probeAccount('a', 'm1')).error).toMatch(/没有可用的 Provider/)
+    // 归属 Provider 不存在 → 如实报错
+    expect((await probe.probeAccount('a', 'm1')).error).toMatch(/不存在/)
   })
 })

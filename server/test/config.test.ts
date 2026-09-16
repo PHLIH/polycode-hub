@@ -38,10 +38,8 @@ describe('严格解析（对齐 Go KnownFields(true)：未知字段报错）', (
 
   test('provider 嵌套未知字段拒绝（防拼错 + 强制凭据不落明文）', () => {
     const path = write('unknown-provider.yaml', `
-sources: [{ id: s1 }]
 providers:
-  - id: p1
-    source_id: s1
+  - name: p1
     access_kind: official
     risk: low
     stability: stable
@@ -64,11 +62,9 @@ describe('默认值与跨实体校验', () => {
   test('provider/account 缺省值补齐', () => {
     const path = write('defaults.yaml', `
 providers:
-  - id: p1
-    source_id: s1
+  - name: p1
     base_url: https://x.example
-sources: [{ id: s1 }]
-accounts: [{ id: a1, source_id: s1 }]
+accounts: [{ id: a1, provider: p1 }]
 `)
     const cfg = loadConfig(path)
     const prov = cfg.providers[0]!
@@ -79,34 +75,32 @@ accounts: [{ id: a1, source_id: s1 }]
     expect(cfg.accounts[0]!.status).toBe('available')
   })
 
-  test('校验失败：risk_max 非法 / 端口越界 / source 重复 / provider 引用缺失 source / provider id 重复', () => {
+  test('校验失败：risk_max 非法 / 端口越界 / provider name 重复', () => {
     const bad = (body: string) => write('bad.yaml', body)
-    expect(() => loadConfig(bad('gateway: {risk_max: extreme}\nsources: [{id: s1}]\nproviders: []\n')))
+    expect(() => loadConfig(bad('gateway: {risk_max: extreme}\nproviders: []\n')))
       .toThrow(/risk_max/)
-    expect(() => loadConfig(bad('gateway: {port: 99999}\nsources: [{id: s1}]\nproviders: []\n')))
+    expect(() => loadConfig(bad('gateway: {port: 99999}\nproviders: []\n')))
       .toThrow(/port/)
-    expect(() => loadConfig(bad('sources: [{id: s1}, {id: s1}]\nproviders: []\n')))
-      .toThrow(/重复/)
-    expect(() => loadConfig(bad('sources: [{id: s1}]\nproviders:\n  - id: p1\n    source_id: other\n    access_kind: official\n    risk: low\n    stability: stable\n    base_url: https://x\n')))
-      .toThrow(/不存在的 source/)
-    expect(() => loadConfig(bad('sources: [{id: s1}]\nproviders:\n  - id: p1\n    source_id: s1\n    access_kind: official\n    risk: low\n    stability: stable\n    base_url: https://x\n    models: []\n  - id: p1\n    source_id: s1\n    access_kind: official\n    risk: low\n    stability: stable\n    base_url: https://y\n')))
+    // sources 段已废弃：不再被任何实体引用，providers 不再接受 source_id
+    expect(() => loadConfig(bad('providers:\n  - name: p1\n    source_id: s1\n    base_url: https://x\n')))
+      .toThrow(/未知字段.*source_id/)
+    expect(() => loadConfig(bad('providers:\n  - name: p1\n    access_kind: official\n    risk: low\n    stability: stable\n    base_url: https://x\n    models: []\n  - name: p1\n    access_kind: official\n    risk: low\n    stability: stable\n    base_url: https://y\n')))
       .toThrow(/重复/)
   })
+
 })
 
 describe('egress 出口代理（EGRESS-SPIKE 方案 A 落地）', () => {
   test('顶层 egresses 解析 + provider.egress 引用', () => {
-    const path = write('egress.yaml', `
+    const path = write('egress-provider.yaml', `
 egresses:
   - id: clash
     kind: http
     addr: 127.0.0.1:7897
 providers:
-  - id: zen
-    source_id: s1
+  - name: zen
     base_url: https://x.example
     egress: clash
-sources: [{ id: s1 }]
 `)
     const cfg = loadConfig(path)
     expect(cfg.egresses).toEqual([{ id: 'clash', kind: 'http', addr: '127.0.0.1:7897' }])
@@ -114,15 +108,31 @@ sources: [{ id: s1 }]
   })
 
   test('provider.egress 引用不存在的出口 → 报错', () => {
-    const path = write('egress-bad.yaml', `
+    const path = write('egress-provider-bad.yaml', `
 providers:
-  - id: zen
-    source_id: s1
+  - name: zen
     base_url: https://x.example
     egress: nope
-sources: [{ id: s1 }]
 `)
     expect(() => loadConfig(path)).toThrow(/egress/)
+  })
+
+  test('顶层 egresses 解析 + model.egress 引用', () => {
+    const path = write('egress.yaml', `
+egresses:
+  - id: clash
+    kind: http
+    addr: 127.0.0.1:7897
+providers:
+  - name: zen
+    base_url: https://x.example
+    models:
+      - id: muse-spark-1.3
+        egress: clash
+`)
+    const cfg = loadConfig(path)
+    expect(cfg.egresses).toEqual([{ id: 'clash', kind: 'http', addr: '127.0.0.1:7897' }])
+    expect(cfg.providers[0]!.models[0]!.egress).toBe('clash')
   })
 
   // 备注是运维知识（「23 点后才免费」），得能从配置文件写进库，不然每次重启就丢。
@@ -133,15 +143,13 @@ egresses:
     kind: http
     addr: 127.0.0.1:7897
 providers:
-  - id: wb
-    source_id: s1
+  - name: wb
     base_url: https://x.example
     models:
       - id: hy4-preview
         note: 23 点后才免费，白天用会扣额度
         egress: clash
       - id: plain
-sources: [{ id: s1 }]
 `)
     const cfg = loadConfig(path)
     const ms = cfg.providers[0]!.models
@@ -157,26 +165,22 @@ egresses:
     kind: http
     addr: 127.0.0.1:7897
 providers:
-  - id: zen
-    source_id: s1
+  - name: zen
     base_url: https://x.example
     models:
       - id: muse-spark-1.3
         egress: clash
-sources: [{ id: s1 }]
 `)
     const cfg = loadConfig(ok)
     expect(cfg.providers[0]!.models[0]!.egress).toBe('clash')
 
     const bad = write('egress-model-bad.yaml', `
 providers:
-  - id: zen
-    source_id: s1
+  - name: zen
     base_url: https://x.example
     models:
       - id: muse-spark-1.3
         egress: nope
-sources: [{ id: s1 }]
 `)
     expect(() => loadConfig(bad)).toThrow(/egress/)
   })

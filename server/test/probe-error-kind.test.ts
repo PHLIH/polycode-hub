@@ -44,10 +44,10 @@ async function quotaServer(): Promise<string> {
 }
 
 const mkProv = (baseUrl: string, over: Partial<Provider> = {}): Provider => ({
-  id: 'p', sourceId: 'src', displayName: 'd', accessKind: 'official', risk: 'low',
+  providerId: 1, name: 'p', displayName: 'd', accessKind: 'official', risk: 'low',
   riskNote: '', stability: 'stable', api: 'openai-completions', baseUrl,
-  credential: {}, headers: {}, enabled: true, priority: 1, streamOnly: false,
-  models: [{ id: 'm1', providerId: 'p', input: ['text'], manual: false, enabled: true }],
+  credential: {}, headers: {}, state: 'active', priority: 1, streamOnly: false,
+  models: [{ id: 'm1', input: ['text'], manual: false, enabled: true }],
   ...over,
 })
 
@@ -69,7 +69,7 @@ describe('探测失败：上报真病因而非最后的路径噪音', () => {
   test('Provider 测试入口同样报真病因', async () => {
     const base = await quotaServer()
     const probe = new Probe(new Scheduler([mkProv(base)], 'high'), new Upstream({ credLookup: () => ['', false] }), null)
-    const r = await probe.probeProvider('p')
+    const r = await probe.probeProvider(1)
     expect(r.ok).toBe(false)
     expect(r.error).toContain('http 429')
     expect(r.error).not.toContain('404 Route Not Found')

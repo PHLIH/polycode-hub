@@ -86,13 +86,15 @@ const cfg = (over?: Partial<Config['gateway']>): Config => ({
     streamIdleTimeoutMs: DEFAULT_STREAM_IDLE_TIMEOUT_MS,
     ...over,
   },
-  dataDir: 'data', egresses: [], sources: [], providers: [], accounts: [],
+  dataDir: 'data', egresses: [], providers: [], accounts: [],
 })
 
+// Provider 夹具：providerId 是内部数字 id（第一个 Provider 为 1，第二个为 2），
+// name 是对外名（模型 ID 前缀 name/modelId）。
 const provider = (over: Record<string, unknown>) => ({
-  id: 'p1', sourceId: 's1', displayName: '', accessKind: 'official', risk: 'low',
+  providerId: 1, name: 'p1', displayName: '', accessKind: 'official', risk: 'low',
   stability: 'stable', api: 'openai-completions', baseUrl: upBase, credential: {},
-  headers: {}, enabled: true, priority: 0, models: [], ...over,
+  headers: {}, state: 'active', priority: 0, models: [], ...over,
 } as never)
 
 const anthropicRequest = (over: Record<string, unknown> = {}) => ({
@@ -180,19 +182,20 @@ describe('POST /v1/messages 流式转发（anthropic 入站 × openai-completion
     expect(ul.errorKind).toBe('rate_limit')
   })
 
-  test('GET /v1/models 返回 sourceId/modelId 限定名目录', async () => {
-    const { app } = buildApp({ providers: [provider({ models: [{ id: 'glm-4.6', providerId: 'p1', manual: false, enabled: true }] })] })
+  test('GET /v1/models 返回 name/modelId 限定名目录', async () => {
+    const { app } = buildApp({ providers: [provider({ models: [{ id: 'glm-4.6', manual: false, enabled: true }] })] })
     const res = await app.request('/v1/models')
     expect(res.status).toBe(200)
     const body = (await res.json()) as { data: { id: string; object: string; owned_by: string }[] }
-    expect(body.data).toEqual([{ id: 's1/glm-4.6', object: 'model', owned_by: 's1' }])
+    // 前缀是 Provider 的 name（客户端从 /v1/models 拿到什么就填什么）
+    expect(body.data).toEqual([{ id: 'p1/glm-4.6', object: 'model', owned_by: 'p1' }])
   })
 })
 
 describe('换源闸门（端到端）', () => {
   test('首字节前失败（500）→ 自动换下一个候选 Provider', async () => {
     const { app, usage } = buildApp({
-      providers: [provider({ id: 'bad', headers: { 'x-mode': 'boom' } }), provider({ id: 'good', headers: { 'x-mode': 'sse' } })],
+      providers: [provider({ name: 'bad', headers: { 'x-mode': 'boom' } }), provider({ name: 'good', providerId: 2, headers: { 'x-mode': 'sse' } })],
     })
     const res = await app.request('/v1/messages', {
       method: 'POST',
@@ -200,12 +203,12 @@ describe('换源闸门（端到端）', () => {
     })
     expect(res.status).toBe(200) // good 顶上
     expect((await res.text())).toContain('message_start')
-    // 失败 Provider 不记成功账；成功记账 provider=good
-    expect(usage.rows.map((r) => r.providerId)).toEqual(['good'])
+    // 失败 Provider 不记成功账；成功记账 providerId=2（good）
+    expect(usage.rows.map((r) => r.providerId)).toEqual([2])
   })
 
   test('全部候选失败 → 映射规范错误（429/401/529/500）+ 失败记账', async () => {
-    const { app, usage } = buildApp({ providers: [provider({ id: 'only', headers: { 'x-mode': 'boom' } })] })
+    const { app, usage } = buildApp({ providers: [provider({ name: 'only', headers: { 'x-mode': 'boom' } })] })
     const res = await app.request('/v1/messages', {
       method: 'POST', body: JSON.stringify(anthropicRequest({ model: 'only/glm-4.6' })),
     })
@@ -218,8 +221,8 @@ describe('换源闸门（端到端）', () => {
 
   test('账号池：同源多账号失败换号，冷却后跳过', async () => {
     const pool = new AccountPool([
-      { id: 'a-bad', sourceId: 's1', credential: {}, status: 'available', fails: 0 },
-      { id: 'a-good', sourceId: 's1', credential: {}, status: 'available', fails: 0 },
+      { id: 'a-bad', providerId: 1, credential: {}, status: 'available', fails: 0 },
+      { id: 'a-good', providerId: 1, credential: {}, status: 'available', fails: 0 },
     ])
     const { app, usage } = buildApp({
       pool,
@@ -240,8 +243,8 @@ describe('换源闸门（端到端）', () => {
   test('账号池全失败：兜底账归因到最后尝试的账号 + errorKind', async () => {
     upstreamMode.unauth = (_q, res) => { res.writeHead(401); res.end('nope') }
     const pool = new AccountPool([
-      { id: 'z1', sourceId: 's1', credential: {}, status: 'available', fails: 0 },
-      { id: 'z2', sourceId: 's1', credential: {}, status: 'available', fails: 0 },
+      { id: 'z1', providerId: 1, credential: {}, status: 'available', fails: 0 },
+      { id: 'z2', providerId: 1, credential: {}, status: 'available', fails: 0 },
     ])
     const { app, usage } = buildApp({
       providers: [provider({ headers: { 'x-mode': 'unauth' } })],
@@ -259,7 +262,7 @@ describe('换源闸门（端到端）', () => {
 
   test('限流错误冷却账号 1 分钟（cooldownFor）', async () => {
     upstreamMode.ratelimit = (_q, res) => { res.writeHead(429); res.end('{"error":"rate"}') }
-    const pool = new AccountPool([{ id: 'a1', sourceId: 's1', credential: {}, status: 'available', fails: 0 }])
+    const pool = new AccountPool([{ id: 'a1', providerId: 1, credential: {}, status: 'available', fails: 0 }])
     const { app, usage } = buildApp({
       providers: [provider({ headers: { 'x-mode': 'ratelimit' } })],
       pool,
@@ -278,8 +281,8 @@ describe('换源闸门（端到端）', () => {
 describe('指定账号头 x-polycode-account（不轮询、不回退）', () => {
   const pinnedProviders = () => [provider({ headers: { 'x-mode': 'sse' } })]
   const pinnedPool = () => new AccountPool([
-    { id: 'a1', sourceId: 's1', credential: {}, status: 'available', fails: 0 },
-    { id: 'a2', sourceId: 's1', credential: {}, status: 'available', fails: 0 },
+    { id: 'a1', providerId: 1, credential: {}, status: 'available', fails: 0 },
+    { id: 'a2', providerId: 1, credential: {}, status: 'available', fails: 0 },
   ])
   const pinnedBody = () => anthropicRequest()
 
@@ -308,15 +311,15 @@ describe('指定账号头 x-polycode-account（不轮询、不回退）', () => 
     expect(usage.rows.length).toBe(0)
   })
 
-  test('source 不匹配（a1 属 s1，模型限定 s2 源）→ 400', async () => {
+  test('归属不匹配（a1 属 #1，模型限定 p2）→ 400，不偷偷换号', async () => {
     const { app } = buildApp({
-      providers: [provider({ id: 'p1' }), provider({ id: 'p2', sourceId: 's2' })],
+      providers: [provider({ name: 'p1' }), provider({ name: 'p2', providerId: 2 })],
       pool: pinnedPool(),
     })
     const res = await app.request('/v1/messages', {
       method: 'POST',
       headers: { 'x-polycode-account': 'a1' },
-      body: JSON.stringify(anthropicRequest({ model: 's2/m' })),
+      body: JSON.stringify(anthropicRequest({ model: 'p2/m' })),
     })
     expect(res.status).toBe(400)
   })
@@ -431,7 +434,7 @@ describe('模型级 egress（EGRESS-SPIKE §7 粒度拍板：精确到模型）'
       providers: [provider({
         headers: { 'x-mode': 'sse' },
         egress: 'missing',
-        models: [{ id: 'glm-4.6', providerId: 'p1', manual: true, enabled: true, egress: 'ok' }],
+        models: [{ id: 'glm-4.6', manual: true, enabled: true, egress: 'ok' }],
       })],
     })
     const res = await app.request('/v1/messages', {
@@ -443,11 +446,11 @@ describe('模型级 egress（EGRESS-SPIKE §7 粒度拍板：精确到模型）'
 })
 
 describe('GET /health（technical-design §3.2 契约）', () => {
-  test('返回 {ok:true, apps:N} —— N 为启用中的上游数', async () => {
+  test('返回 {ok:true, apps:N} —— N 为参与路由中的上游数', async () => {
     const { app } = buildApp({
       providers: [
         provider({ headers: { 'x-mode': 'sse' } }),
-        provider({ headers: { 'x-mode': 'sse' }, sourceId: 'p2' }),
+        provider({ headers: { 'x-mode': 'sse' }, name: 'p2', providerId: 2 }),
       ],
     })
     const res = await app.request('/health')
@@ -457,9 +460,10 @@ describe('GET /health（technical-design §3.2 契约）', () => {
     expect(body.apps).toBe(2)
   })
 
-  test('禁用的 Provider 不计入 apps（监控看到的是真能用的数量）', async () => {
-    const disabled = provider({ headers: { 'x-mode': 'sse' }, sourceId: 'p2', enabled: false })
-    const { app } = buildApp({ providers: [provider({ headers: { 'x-mode': 'sse' } }), disabled] })
+  test('非 active 的 Provider 不计入 apps（监控看到的是真能用的数量）', async () => {
+    const paused = provider({ headers: { 'x-mode': 'sse' }, name: 'p2', providerId: 2, state: 'paused' })
+    const deleted = provider({ headers: { 'x-mode': 'sse' }, name: 'p3', providerId: 3, state: 'deleted' })
+    const { app } = buildApp({ providers: [provider({ headers: { 'x-mode': 'sse' } }), paused, deleted] })
     const body = await (await app.request('/health')).json() as { apps: number }
     expect(body.apps).toBe(1)
   })
