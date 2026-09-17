@@ -163,8 +163,10 @@ export const api = {
   // 重置惩罚（零上游成本）：只清连败与冷却，不探活。
   recheckAccount: (id) => req('POST', `/admin/api/accounts/${encodeURIComponent(id)}/recheck`),
   checkinAccount: (id) => req('POST', `/admin/api/accounts/${encodeURIComponent(id)}/checkin`, {}, { timeoutMs: 20000 }),
-  discover: async () => {
-    const data = await req('GET', '/admin/api/discover')
+  // refresh=true 强制实时探测（用户点「重新扫描」）；默认读后端缓存。
+  // zen 的联网验证上游固有 2~8 秒（响应头就慢），页面加载时干等体验很差。
+  discover: async (refresh = false) => {
+    const data = await req('GET', `/admin/api/discover${refresh ? '?refresh=1' : ''}`)
     return Array.isArray(data) ? data : (data && data.findings) || []
   },
   quickImport: (key) => req('POST', '/admin/api/discover/quick-import', { key }),

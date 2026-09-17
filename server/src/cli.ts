@@ -71,10 +71,11 @@ function ensureAdminKey(cfg: Config): void {
 class DiscoverSourceAdapter {
   private s: Scanner
   constructor(s: Scanner) { this.s = s }
-  scan(): Promise<Finding[]> {
+  scan(force = false): Promise<Finding[]> {
     // scan 是 async（zen 探针走 fetch）；管理面端点 await 消费。
     // discover.Finding 与 adminapi.Finding JSON 形状一致，直接透传。
-    return this.s.scan() as unknown as Promise<Finding[]>
+    // force 透传给 Scanner：绕过 TTL 缓存，用于用户显式「重新探测」。
+    return this.s.scan(force) as unknown as Promise<Finding[]>
   }
 }
 
@@ -266,11 +267,14 @@ export async function runServe(args: string[]): Promise<void> {
         model, stream: true, maxTokens: 8,
         messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
       }
+      // 拿到 2xx 响应即算可调用——**不等首块**。
+      //
+      // streamWithTimeout 的契约：非 2xx 抛 UpstreamError，2xx 才返回 stream。
+      // 所以「返回了」本身就证明上游接受了这个请求（指纹/鉴权/协议都对），
+      // 而首块要等模型真正开始生成——实测 mimo 出首块要 7.4s，白等这一下
+      // 就是用户感受到的「扫描好慢」。探针只验「没被拒」，不验生成速度。
       const stream = await probeUp.streamWithTimeout(p, req, AbortSignal.timeout(20_000))
-      // 读到首块即算可调用（不解析内容：探针只验「没被拒」）。
-      const reader = stream.getReader()
-      await reader.read()
-      await reader.cancel().catch(() => {})
+      await stream.cancel().catch(() => {})
       return { ok: true }
     } catch (e) {
       const err = e as { kind?: string; message?: string }

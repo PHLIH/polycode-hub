@@ -532,23 +532,22 @@ export async function checkZen(
     f.detail = `连通，但模型列表为空（${ids.length} 个），无法验证可调用性`
     return f
   }
-  let last: { ok: boolean; error?: string; kind?: string } = { ok: false }
-  let lastModel = cands[0]!
-  for (const m of cands) {
-    const r = await callProbe(m)
-    if (r.ok) {
-      f.status = 'ready'
-      f.detail = `连通，${ids.length} 个模型，实测 ${m} 可调用${fpNote}`
-      f.actions = ['export ZEN_KEY=public', '然后在发现页点「采用」']
-      return f
-    }
-    last = r
-    lastModel = m
-    // 指纹缺失是全 Provider 级别的（不是某个模型的事），继续试没意义。
-    if (r.kind === 'fingerprint' || /free tier can only be used/i.test(r.error ?? '')) break
+  // 并发探测：上游「响应头」本身就要 2~8 秒，串行试 3 个会把延迟叠加成 10s+。
+  // 并发后总耗时取决于最慢的那个（实测 14.4s → 6.3s）。
+  // 任一成功即 ready；全失败时按病因优先级挑最有信息量的一次上报
+  // （与 probe.ts 的 errorRank 同思路：指纹/地区是源头病因，网络抖动是噪音）。
+  const results = await Promise.all(cands.map(async (m) => ({ m, r: await callProbe(m) })))
+  const hit = results.find((x) => x.r.ok)
+  if (hit) {
+    f.status = 'ready'
+    f.detail = `连通，${ids.length} 个模型，实测 ${hit.m} 可调用${fpNote}`
+    f.actions = ['export ZEN_KEY=public', '然后在发现页点「采用」']
+    return f
   }
-  const r = last
-  const probeModel = lastModel
+  const rank = (k?: string) => k === 'fingerprint' ? 3 : k === 'region' ? 2 : k ? 1 : 0
+  const best = results.reduce((a, b) => (rank(b.r.kind) > rank(a.r.kind) ? b : a))
+  const r = best.r
+  const probeModel = best.m
   // 列表通但调用失败：不再冒充 ready。地区限制单独说（换出口可解，不是模型下线）。
   f.status = 'unreachable'
   if (r.kind === 'region' || /not available in your country/i.test(r.error ?? '')) {
@@ -892,10 +891,25 @@ export function defaultConfig(): ScanConfig {
 }
 
 // 聚合三探针（zen 探针自带超时，不卡死）。
+//
+// 关于耗时：本地三项（WORKBUDDY/ZCode/指纹识别）合计约 50ms，可忽略；
+// 慢的是 zen 的联网验证——上游「响应头」本身就要 2~8 秒（它先处理再回头，
+// 不是流式吐字慢）。这是上游固有延迟，客户端等不出更短的时间。
+//
+// 因此不能让每次页面刷新都实时打上游：
+//   · scan() 带 TTL 缓存，重复调用直接复用（发现页刷新、导入前后的校验都不再重打）
+//   · 过期后**先返回旧结果**（stale-while-revalidate），刷新在后台进行，界面不卡
+//   · 候选模型并发探测（不再一个失败才试下一个）
+// 用户手动点「重新探测」时传 force=true 绕过缓存，得到的一定是实时结果。
+const SCAN_TTL_MS = 60_000
+
 export class Scanner {
   private readonly cfg: ScanConfig
   private readonly wbDirs: string[]
   private readonly zenTimeoutMs: number
+  private cached: Finding[] | null = null
+  private cachedAt = 0
+  private inflight: Promise<Finding[]> | null = null
 
   constructor(cfg: ScanConfig) {
     this.cfg = cfg
@@ -905,7 +919,33 @@ export class Scanner {
       : workBuddyAuthDirsFromPaths(cfg.workBuddyPaths ?? [])
   }
 
-  async scan(): Promise<Finding[]> {
+  // force=true 绕缓存（用户显式「重新探测」）；否则新鲜则直接给，过期则「先给旧的 + 后台刷新」。
+  async scan(force = false): Promise<Finding[]> {
+    const fresh = this.cached !== null && Date.now() - this.cachedAt < SCAN_TTL_MS
+    if (!force && fresh) return this.cached!.map((f) => ({ ...f }))
+    if (!force && this.cached !== null) {
+      // stale-while-revalidate：立刻返回旧结果，后台更新供下次用。
+      // 注意必须 catch：后台失败不能变成 unhandled rejection（那会打崩进程）。
+      void this.refresh().catch(() => {})
+      return this.cached.map((f) => ({ ...f }))
+    }
+    return this.refresh()
+  }
+
+  // 真正执行一次扫描并写缓存。并发调用共享同一次执行（去重，避免同时打多轮上游）。
+  private async refresh(): Promise<Finding[]> {
+    if (this.inflight) return this.inflight
+    this.inflight = this.runScan()
+      .then((out) => {
+        this.cached = out
+        this.cachedAt = Date.now()
+        return out.map((f) => ({ ...f }))
+      })
+      .finally(() => { this.inflight = null })
+    return this.inflight
+  }
+
+  private async runScan(): Promise<Finding[]> {
     const out: Finding[] = []
     const { finding: wb, ok } = checkWorkBuddyWithAccounts(
       this.cfg.workBuddyPaths ?? [], this.wbDirs, this.cfg.workBuddyFallbackRoots ?? [])

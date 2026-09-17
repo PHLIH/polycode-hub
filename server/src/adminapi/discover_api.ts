@@ -71,7 +71,10 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
   // ---- GET /discover ----
   app.get('/admin/api/discover', async (c) => {
     if (!discover) return ok(c, 200, { findings: [] })
-    const findings = (await discover.scan()).map((f) => ({ ...f }))
+    // ?refresh=1 绕过缓存强制实时探测（用户点「重新探测」）；
+    // 默认走缓存 + 后台刷新：zen 的联网验证固有 2~8 秒，页面刷新不该干等。
+    const force = c.req.query('refresh') === '1'
+    const findings = (await discover.scan(force)).map((f) => ({ ...f }))
     // 已接管判定：发现项草稿的 Provider 名是否已有活跃行。
     // 只看未删除的行：删干净之后必须回到「未接管」，
     // 否则发现页永远显示「已导入」而「一键导入」被禁用 → 用户既导不进来也无处可删。

@@ -43,13 +43,15 @@ const groups = computed(() => {
   return g
 })
 
-async function rescan() {
+// 用户显式点「重新扫描」= 要实时结果，绕后端缓存；页面首次加载走缓存 + 后台刷新，
+// 不让人对着空白干等（zen 联网验证上游固有 2~8 秒，那是上游响应头就慢）。
+async function rescan(force = true) {
   if (scanning.value) return
   scanning.value = true
   err.value = ''
   const t0 = performance.now()
   try {
-    list.value = await api.discover()
+    list.value = await api.discover(force)
     elapsed.value = ((performance.now() - t0) / 1000).toFixed(1) + 's'
     scannedAt.value = new Date().toLocaleTimeString('zh-CN', { hour12: false })
     const n = list.value.filter(f => f.status === 'ready').length
@@ -187,7 +189,7 @@ const scHint = computed(() => {
   return '已安装已配置，未运行 —— 点「启动」'
 })
 
-onMounted(rescan)
+onMounted(() => rescan(false)) // 首次加载走缓存，秒出；点「重新扫描」才实时探测
 onMounted(loadSidecar)
 
 // 导入共存登录态进账号池：token 由服务端读取落盘（不经过前端）。

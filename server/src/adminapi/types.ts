@@ -106,7 +106,9 @@ export interface Finding {
 
 // DiscoverSource 提供本机 harness 发现。
 export interface DiscoverSource {
-  scan(): Finding[] | Promise<Finding[]>
+  // force=true 绕过缓存（用户显式「重新探测」）。默认走缓存/后台刷新，
+  // 因为 zen 的联网验证固有 2~8 秒（上游响应头慢），不能让页面刷新时干等。
+  scan(force?: boolean): Finding[] | Promise<Finding[]>
 }
 
 export type { ModelList, ModelProbe, ProbeResult }

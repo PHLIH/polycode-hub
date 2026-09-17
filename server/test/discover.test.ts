@@ -254,7 +254,7 @@ describe('checkZen', () => {
   // 单模型误判（2026-09-17 实测）：探针只试第一个模型就下结论，
   // 那个模型恰好不可用（下线/地区受限）时，整个 Provider 被误报成不可用——
   // 用户看到「这也不能用」，实际只是选错了探针模型。
-  test('首个模型失败但后续可用 → 仍判 ready（不因单模型下线误杀整源）', async () => {
+  test('部分模型失败但仍有可用 → 判 ready（不因单模型下线误杀整源）', async () => {
     const fetchMulti = (async () => new Response(
       JSON.stringify({ data: [{ id: 'a-free' }, { id: 'b-free' }, { id: 'c-free' }] }), { status: 200 },
     )) as typeof fetch
@@ -264,8 +264,11 @@ describe('checkZen', () => {
       return m === 'a-free' ? { ok: false, error: 'upstream server (http 500)' } : { ok: true }
     })
     expect(f.status).toBe('ready')
-    expect(tried).toEqual(['a-free', 'b-free'])
-    expect(f.detail).toContain('b-free')
+    // 并发探测：候选同时打（速度优先，上游响应头本身就慢），
+    // 不再「首个成功就停」——所以断言覆盖集合，不断言截断位置。
+    expect(tried).toContain('a-free')
+    expect(tried.some((m) => m !== 'a-free')).toBe(true) // 确实试了别的，没被首个失败带停
+    expect(f.detail).toMatch(/实测 (b-free|c-free) 可调用/)
   })
 
   // 同族扎堆：muse-spark 有 1.2/1.3 两代，若按原顺序取前 3 个，名额全被它占掉，
@@ -286,7 +289,10 @@ describe('checkZen', () => {
       return m.startsWith('muse-spark') ? { ok: false, kind: 'region', error: 'not available in your country' } : { ok: true }
     })
     expect(f.status).toBe('ready')
-    expect(tried).toEqual(['muse-spark-1.3-contributor-free', 'mimo-v2.5-free'])
+    // 跨族取样：同族的 1.2 不该占用名额（并发下断言集合，顺序不保证）
+    expect(tried).toContain('muse-spark-1.3-contributor-free')
+    expect(tried).not.toContain('muse-spark-1.2-contributor-free')
+    expect(tried.some((m) => m.startsWith('mimo') || m.startsWith('nemotron'))).toBe(true)
   })
 
   test('全族都不可用（地区限制）→ unreachable 且指引配 egress', async () => {
@@ -552,6 +558,63 @@ describe('Scanner 聚合', () => {
     const accts = byKey.get('workbuddy')?.suggestedAccounts
     expect(accts).toHaveLength(2)
     expect(byKey.get('workbuddy')?.detail).toContain('共存登录态')
+  })
+})
+
+// 扫描缓存（2026-09-17 用户反馈「扫描好慢」）：
+// zen 的联网验证上游固有 2~8 秒（响应头就慢），若每次页面刷新都实时打，
+// 用户每次进发现页都要干等。缓存 + stale-while-revalidate 让首屏秒出。
+describe('Scanner 缓存（扫描提速）', () => {
+  const cfg = (): ScanConfig => ({
+    workBuddyPaths: ['/nonexistent/x.info'],
+    zCodeDirs: ['/nonexistent'],
+    zenBaseURL: 'https://zen.example',
+    fetchImpl: (async () => new Response(JSON.stringify({ data: [{ id: 'm-free' }] }), { status: 200 })) as typeof fetch,
+    zenCallProbe: async () => ({ ok: true }),
+  })
+
+  test('二次扫描命中缓存：不再重复打上游', async () => {
+    let calls = 0
+    const c = cfg()
+    c.fetchImpl = (async () => { calls++; return new Response(JSON.stringify({ data: [{ id: 'm-free' }] }), { status: 200 }) }) as typeof fetch
+    const sc = new Scanner(c)
+    await sc.scan()
+    const first = calls
+    await sc.scan()
+    await sc.scan()
+    expect(calls).toBe(first) // 后两次全命中缓存
+  })
+
+  test('force=true 绕过缓存（用户点「重新扫描」要实时结果）', async () => {
+    let calls = 0
+    const c = cfg()
+    c.fetchImpl = (async () => { calls++; return new Response(JSON.stringify({ data: [{ id: 'm-free' }] }), { status: 200 }) }) as typeof fetch
+    const sc = new Scanner(c)
+    await sc.scan()
+    const first = calls
+    await sc.scan(true)
+    expect(calls).toBeGreaterThan(first) // 真的又打了一次
+  })
+
+  test('并发调用共享同一次执行（不重复打上游）', async () => {
+    let calls = 0
+    const c = cfg()
+    c.fetchImpl = (async () => {
+      calls++
+      await new Promise((r) => setTimeout(r, 30))
+      return new Response(JSON.stringify({ data: [{ id: 'm-free' }] }), { status: 200 })
+    }) as typeof fetch
+    const sc = new Scanner(c)
+    await Promise.all([sc.scan(), sc.scan(), sc.scan()])
+    expect(calls).toBe(1) // 三次并发只打一轮
+  })
+
+  test('缓存副本隔离：改返回值不污染缓存', async () => {
+    const sc = new Scanner(cfg())
+    const a = await sc.scan()
+    a[0]!.status = 'unreachable' // 改副本
+    const b = await sc.scan()
+    expect(b[0]!.status).not.toBe('unreachable') // 缓存未被污染
   })
 })
 
