@@ -66,7 +66,7 @@ function readSession(tokenPath: string): { token: string; uid?: string } {
 }
 
 export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
-  const { providers, accounts, changed, discover } = ctx
+  const { providers, accounts, changed, discover, lister } = ctx
 
   // ---- GET /discover ----
   app.get('/admin/api/discover', async (c) => {
@@ -130,7 +130,11 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
       importSuggestedAccounts(key, found.suggestedAccounts, p.providerId)
     warnings.push(...importWarnings)
     if (imported > 0) changed()
-    const res: Record<string, unknown> = { ...p }
+    // 与 quick-import 同样自动补全模型目录（两条路径行为必须一致，
+    // 否则「采用」和「一键导入」出来的 Provider 可用性不同）。
+    const modelWarn = await fillModelsIfEmpty(p)
+    if (modelWarn) warnings.push(modelWarn)
+    const res: Record<string, unknown> = { ...(providers.get(p.providerId) ?? p) }
     if (warnings.length > 0) res.warnings = warnings
     return ok(c, 201, res)
   })
@@ -247,10 +251,55 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     if (imported > 0) changed()
     warnings.push(...importWarnings)
 
-    const res: Record<string, unknown> = { provider: p, created, imported, skipped }
+    // ④ 自动补全模型目录（本次新增，修「导入后按真名调用 404」）：
+    //    导入的 Provider 目录若是空的，用户拿上游真实模型名一调就 404，
+    //    还得自己知道要去 Providers 页点「扫描可用性」。这里顺手扫一次，
+    //    让「一键导入」真的做到一键可用。扫不到（无列表接口且无痕迹）不报错，
+    //    只给一条指引——发现失败不该让整个导入动作失败。
+    const modelWarn = await fillModelsIfEmpty(p)
+    if (modelWarn) warnings.push(modelWarn)
+    const latest = providers.get(p.providerId) ?? p
+
+    const res: Record<string, unknown> = { provider: latest, created, imported, skipped }
     if (warnings.length > 0) res.warnings = warnings
     return ok(c, 200, res)
   })
+
+  // 模型目录为空时自动拉一次真实模型并写回（adopt 与 quick-import 共用）。
+  //
+  // 为什么需要：采用草稿的模型目录是空的（不再预填猜的模型名，见 discover.wbSuggestedProvider）。
+  // 目录空 = 用户拿上游真实模型名调用会 404「没有声明模型」，而「扫描可用性」这一步
+  // README 没提、新用户不会知道要做。这里顺手补上，让「一键导入」真的一键可用。
+  //
+  // 边界：
+  //   - 已有模型则不覆盖（用户可能手工维护过，尊重既有目录）；
+  //   - lister 未接线 / 扫描失败 → 不抛错，回到「目录为空」并给一条可执行指引
+  //     （发现失败不该让导入动作整个失败，那是两件事）；
+  //   - 只写「启用」的新模型。
+  // 返回一条 warning（无需提示时返回空串）。
+  async function fillModelsIfEmpty(p: Provider): Promise<string> {
+    const cur = providers.get(p.providerId)
+    if (cur && cur.models.length > 0) return ''
+    if (!lister) {
+      return `模型目录为空：请到 Providers 页点「扫描可用性」获取真实模型（未接线，无法自动扫描）`
+    }
+    let ids: string[] = []
+    try {
+      const list = await lister.listProviderModels(p.providerId)
+      ids = list.models
+    } catch (e) {
+      return `模型目录为空且自动扫描失败（${(e as Error).message}）：请到 Providers 页点「扫描可用性」或手动添加模型`
+    }
+    if (ids.length === 0) {
+      return `模型目录为空且未能自动发现模型：请到 Providers 页点「扫描可用性」或手动添加模型`
+    }
+    const target = providers.get(p.providerId)
+    if (!target || target.models.length > 0) return ''
+    target.models = ids.map((id) => ({ id, manual: false, enabled: true }))
+    providers.put(target)
+    changed()
+    return `已自动发现 ${ids.length} 个模型（${ids.slice(0, 5).join('、')}${ids.length > 5 ? '…' : ''}）；如与实际可用不符，请到 Providers 页核对`
+  }
 
   // 凭据默认值（adopt 与 quick-import 共用）：ZEN_KEY 未配置时把免费档公共 key
   // 落成凭据文件并改写 Provider 引用——否则和 WB_TOKEN 一样只剩一个空的环境变量引用。

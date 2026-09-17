@@ -837,7 +837,7 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
   })
 
   // ---- 发现 + 一键采用（discover_api.ts）----
-  registerDiscoverRoutes(app, { providers, accounts, changed, discover: deps.discover })
+  registerDiscoverRoutes(app, { providers, accounts, changed, discover: deps.discover, lister: deps.lister })
 
   // ---- Provider 测试 / 模型发现 / 扫描 ----
 
@@ -1057,6 +1057,9 @@ export interface AdminCtx {
   accounts: AccountStore
   changed: ChangeNotifier
   discover?: DiscoverSource
+  // 模型目录探针：一键导入后自动拉一次真实模型写回目录。
+  // 不接也能用（行为退回「目录为空，由用户自己去扫」），接了才让默认路径直接可用。
+  lister?: ProviderModelLister
 }
 
 export type { Account, Provider }

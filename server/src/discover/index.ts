@@ -241,9 +241,22 @@ function wbSuggestedProvider(): Provider {
     baseUrl: 'https://copilot.tencent.com/v2',
     credential: { apiKeyEnv: 'WB_TOKEN' },
     headers: { 'X-Product': 'SaaS', 'X-Domain': 'copilot.tencent.com' },
+    // WorkBuddy 上游对非流式直接回 404 Route Not Found（实测）。
+    // 声明它，非流式调用才能命中 proxy 里那段「只支持流式」的专门提示，
+    // 而不是让用户照着「没有声明模型」去核对模型列表（永远查不出所以然）。
+    streamOnly: true,
     priority: 1,
+    // 模型目录留空，**不预填猜的模型名**。
+    //
+    // 曾经这里写死 'hy3-preview'，代价是双重的：
+    //   ① 用户按上游真实模型名（如 hy4-preview）调用 → 404「没有声明模型」；
+    //   ② 而那个占位名有时上游还认，调用居然出字 → 用户以为配好了，
+    //      实际用的是一个自己没验证过、随时可能消失的模型名。②比①更难发现。
+    // WorkBuddy 没有模型列表接口，真实模型要从本机 traces 痕迹扫（见
+    // cli.ts 注入的 discoverLocal）+ 用户实测确认，不能由网关代替猜测。
+    // 真实目录由「一键导入」时自动扫描补全（见 discover_api.quick-import）。
     // providerId 由存储层在建 Provider 时分配（此处占位 0）
-    models: [{ id: 'hy3-preview', displayName: 'HY免费', manual: false, enabled: true }],
+    models: [],
   }
 }
 

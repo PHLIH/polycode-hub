@@ -51,6 +51,25 @@ describe('checkWorkBuddy', () => {
     expect(providerValidate(p)).toBeUndefined()
   })
 
+  // 草稿**不预填猜的模型名**（2026-09-17 实测新用户路径）：曾写死 hy3-preview，
+  // 用户按真实模型名（hy4-preview）调用 404；而占位名有时上游还认、调用出字，
+  // 让用户以为配好了——比 404 更难发现。真实目录由导入时自动扫描补全。
+  test('草稿不预填猜测的模型，模型目录为空', async () => {
+    const dir = await tempDir()
+    const path = await writeAuthFile(dir, 'workbuddy-desktop.info', craftJWT(new Date(Date.now() + 86400_000)))
+    const { finding: f } = checkWorkBuddy([path])
+    expect((f.suggestedProvider as Provider).models).toEqual([])
+  })
+
+  // WorkBuddy 上游对非流式回 404 Route Not Found（实测）。声明 streamOnly，
+  // 非流式调用才能命中 proxy 里那段专门提示，而不是让用户去核对模型列表。
+  test('草稿声明 streamOnly（非流式应给「只支持流式」提示）', async () => {
+    const dir = await tempDir()
+    const path = await writeAuthFile(dir, 'workbuddy-desktop.info', craftJWT(new Date(Date.now() + 86400_000)))
+    const { finding: f } = checkWorkBuddy([path])
+    expect((f.suggestedProvider as Provider).streamOnly).toBe(true)
+  })
+
   test('过期 token → expired，仍给续登指引', async () => {
     const dir = await tempDir()
     const path = await writeAuthFile(dir, 'workbuddy-desktop.info', craftJWT(new Date(Date.now() - 3600_000)))

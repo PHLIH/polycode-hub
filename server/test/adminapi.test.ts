@@ -1279,7 +1279,7 @@ describe('stats/breakdown（真实 usage Store）', () => {
 // ---- discover ----
 
 describe('discover 端点（DiscoverSource 打桩，对齐 Go discover_test.go）', () => {
-  function discoverAPI(over: { providers?: Provider[] } = {}): { call: ReturnType<typeof caller> } {
+  function discoverAPI(over: { providers?: Provider[]; lister?: ProviderModelLister } = {}): { call: ReturnType<typeof caller> } {
     const findings: Finding[] = [
       { key: 'workbuddy', harness: 'WB', status: 'ready', detail: 'tester', suggestedProvider: readyProvider('wb-auto') },
       { key: 'zcode', harness: 'ZC', status: 'unknown', detail: 'unknown', actions: ['login'] },
@@ -1311,6 +1311,38 @@ describe('discover 端点（DiscoverSource 打桩，对齐 Go discover_test.go�
     expect((await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'zcode' } })).status).toBe(400)
     expect((await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'nope' } })).status).toBe(404)
     expect((await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy', name: 'Bad_ID' } })).status).toBe(400)
+  })
+
+  // 「一键导入」必须真的一键可用（2026-09-17 实测新用户路径发现）：
+  // 草稿不再预填猜的模型名（曾写死 hy3-preview：用户按真实名 hy4-preview 调用 404，
+  // 而那个占位名有时上游还认、调用居然出字，用户以为配好了——比 404 更误导）。
+  // 代价是目录为空 → 用户拿真名调用仍 404，还得自己知道去点「扫描可用性」。
+  // 所以导入时自动扫一次补全。
+  test('adopt：目录为空时自动扫一次真实模型写回', async () => {
+    const lister = new StubLister({ models: ['m1', 'm2', 'm3'], source: 'upstream' })
+    const { call } = discoverAPI({ lister })
+    const res = await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy' } })
+    const p = await res.json() as Provider
+    expect(p.models.map((m) => m.id)).toEqual(['m1', 'm2', 'm3'])
+    expect(p.models.every((m) => m.enabled)).toBe(true)
+  })
+
+  test('adopt：扫描失败不让导入失败，改为给可执行指引', async () => {
+    const { call } = discoverAPI({ lister: new StubLister({ models: [], source: '' }, 'boom') })
+    const res = await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy' } })
+    expect(res.status).toBe(201) // 扫描是尽力而为：失败不该让采用动作整体失败
+    const b = await res.json() as { models: unknown[]; warnings?: string[] }
+    expect(b.models).toHaveLength(0)
+    expect(b.warnings?.some((w) => w.includes('扫描可用性'))).toBe(true)
+  })
+
+  test('adopt：已有模型目录不被自动扫描覆盖（尊重用户手工维护）', async () => {
+    const keep = { ...readyProvider('wb-auto'), models: [{ id: 'mine', manual: true, enabled: true }] }
+    const findings: Finding[] = [{ key: 'workbuddy', harness: 'WB', status: 'ready', detail: 't', suggestedProvider: keep }]
+    const app = build({ discover: new StubDiscover(findings), lister: new StubLister({ models: ['other'], source: 'upstream' }) })
+    const res = await caller(app)('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy' } })
+    const p = await res.json() as Provider
+    expect(p.models.map((m) => m.id)).toEqual(['mine'])
   })
 
   test('adopt 自定义 name 覆盖建议名', async () => {
