@@ -56,6 +56,18 @@ describe('账号 disabled 语义：测试通过不得静默启用', () => {
     expect(db.get('wb-1')!.status).toBe('disabled')
   })
 
+  test('A1b. disabled + 测试成功：fails 清零必须落盘（否则重启后池内/DB 分叉）', () => {
+    const { pool, db } = mkPool([acct({ id: 'wb-1', status: 'disabled', fails: 6 })])
+    pool.markResult('wb-1', true, 0, NOW)
+    // 关键：落盘的 fails 也要归零，不能留在 DB 里等重启时读回来
+    expect(db.get('wb-1')!.fails).toBe(0)
+    expect(db.get('wb-1')!.status).toBe('disabled')
+    // 重启等价于用 DB 重建池，此时不该又冒出连败计数
+    const restarted = new AccountPool([...db.values()].map((a) => ({ ...a })))
+    expect(restarted.snapshot()[0]!.fails).toBe(0)
+    expect(restarted.snapshot()[0]!.status).toBe('disabled')
+  })
+
   test('A2. disabled 账号不参与轮询（Harness 走的就是 pick 这条路）', () => {
     const { pool } = mkPool([
       acct({ id: 'wb-1', status: 'disabled' }),

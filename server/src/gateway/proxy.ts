@@ -102,7 +102,7 @@ interface LockedUpstream {
 // 说一句「无可用 Provider」等于没说：用户手里明明有个能用的 Provider，却不知道
 // 该改哪里。所以这里按前缀逐个查证，把真实原因点名（包括"这个名字属于已删除的
 // Provider"），并给出下一步动作。
-export function noCandidateMessage(modelRef: string, providers: Provider[]): string {
+export function noCandidateMessage(modelRef: string, providers: Provider[], stream = true): string {
   const i = modelRef.indexOf('/')
   const prefix = i > 0 ? modelRef.slice(0, i) : ''
   const bare = i > 0 ? modelRef.slice(i + 1) : modelRef
@@ -116,8 +116,20 @@ export function noCandidateMessage(modelRef: string, providers: Provider[]): str
   const ids = (ps: Provider[]) => ps.map((p) => `#${p.providerId}`).join('、')
   const active = byState('active')
   if (active.length > 0) {
+    // 「只支持流式」必须单独点名：这种情况模型是**声明了且已勾选**的，
+    // 用户照着「没有声明模型」去核对模型列表永远查不出所以然——
+    // 真实原因是当前请求没带 stream，被 `!stream && p.streamOnly` 排除了。
+    // 实测：workbuddy 是 streamOnly，非流式请求报"没有声明模型"，
+    // 加 stream:true 立刻正常返回。
+    const streamOnly = active.filter((p) => p.streamOnly)
+    if (!stream && streamOnly.length > 0 && streamOnly.length === active.length) {
+      return `Provider「${prefix}」（${ids(streamOnly)}）只支持流式请求，`
+        + `而这次是非流式调用（stream=false）。请在客户端开启流式（stream:true）后重试。`
+    }
+    const onlyStreamMismatch = !stream && streamOnly.length > 0
     return `Provider「${prefix}」（${ids(active)}）没有声明模型 ${bare}`
-      + `（或该项未勾选采用；也可能被风险上限/上下文预检排除）`
+      + `（或该项未勾选采用；也可能被风险上限/上下文预检排除`
+      + `${onlyStreamMismatch ? '；该 Provider 同时只支持流式请求' : ''}）`
   }
   const deleted = byState('deleted')
   if (deleted.length > 0) {
@@ -218,7 +230,7 @@ export class Proxy {
     const cands = this.sched.pickOrder(irReq.model, estimate, this.cfg.gateway.precheckContext, irReq.stream)
     if (cands.length === 0) {
       return writeIrError(inb, irError(ERR.NOT_FOUND,
-        noCandidateMessage(irReq.model, this.sched.providers())))
+        noCandidateMessage(irReq.model, this.sched.providers(), irReq.stream)))
     }
     // 限定名剥前缀：上游只认裸模型名；用量记账按裸名归一。
     const split = this.sched.splitRef(irReq.model)

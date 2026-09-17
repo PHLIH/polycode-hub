@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createServer, type Server } from 'node:http'
 import { AddressInfo } from 'node:net'
 import { Hono } from 'hono'
-import { Proxy } from '../src/gateway/proxy.ts'
+import { Proxy, noCandidateMessage } from '../src/gateway/proxy.ts'
 import { DEFAULT_FIRST_BYTE_TIMEOUT_MS, DEFAULT_STREAM_IDLE_TIMEOUT_MS } from '../src/config/index.ts'
 import { Scheduler } from '../src/router/scheduler.ts'
 import { Upstream } from '../src/router/upstream.ts'
@@ -515,5 +515,46 @@ describe('上游挂住不返回：必须掐断而不是无限等', () => {
     })
     expect(res.status).toBe(200)
     expect(await res.text()).toContain('message_stop')
+  })
+})
+
+// ---- 候选为空的诊断文案（用户按提示能不能找到原因）----
+
+describe('noCandidateMessage：诊断要说出真实原因', () => {
+  const mk = (over: Record<string, unknown>) => ({
+    providerId: 5, name: 'wb', state: 'active', displayName: '', accessKind: 'official',
+    risk: 'low', stability: 'stable', api: '', baseUrl: 'https://x', credential: {},
+    priority: 0, models: [{ id: 'hy4', manual: false, enabled: true }], ...over,
+  }) as never
+
+  // 回归（真实踩坑）：workbuddy 是 streamOnly，非流式请求被
+  // `!stream && p.streamOnly` 排除，旧文案却说「没有声明模型」——
+  // 用户照着去核对模型列表永远查不出所以然（模型明明列在 /v1/models 里）。
+  test('streamOnly 的 Provider 在非流式调用下要点名"只支持流式"', () => {
+    const ps = [mk({ streamOnly: true })]
+    const msg = noCandidateMessage('wb/hy4', ps, false)
+    expect(msg).toContain('只支持流式')
+    expect(msg).toContain('stream:true')
+    // 不该再误导成「没有声明模型」
+    expect(msg).not.toContain('没有声明模型')
+  })
+
+  test('同 Provider 混合时（部分 streamOnly）保留原诊断并附带流式提示', () => {
+    const ps = [mk({ streamOnly: true, providerId: 1 }), mk({ streamOnly: false, providerId: 2 })]
+    const msg = noCandidateMessage('wb/nope', ps, false)
+    expect(msg).toContain('没有声明模型')
+    expect(msg).toContain('只支持流式')
+  })
+
+  test('流式调用下不冒出流式提示（原因不成立就不该提）', () => {
+    const msg = noCandidateMessage('wb/hy4', [mk({ streamOnly: true })], true)
+    expect(msg).toContain('没有声明模型')
+    expect(msg).not.toContain('只支持流式')
+  })
+
+  test('已删除 / 已暂停 / 未知前缀各自点名', () => {
+    expect(noCandidateMessage('wb/hy4', [mk({ state: 'deleted' })])).toContain('已删除')
+    expect(noCandidateMessage('wb/hy4', [mk({ state: 'paused' })])).toContain('已暂停')
+    expect(noCandidateMessage('zz/hy4', [mk({})])).toContain('未知的 Provider 前缀')
   })
 })
