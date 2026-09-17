@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import {
   checkWorkBuddy, checkWorkBuddyWithAccounts, checkZCode, checkZen, discoverWorkBuddyAccounts,
   discoverWorkBuddyModels, workBuddyAuthDirs, workBuddySearchPaths, searchWorkBuddyAuthFiles,
+  parseFingerprintFromLog, openCodeDataDirs,
   Scanner, defaultConfig, type ScanConfig,
 } from '../src/discover/index.ts'
 import { providerValidate, type Provider } from '../src/model/index.ts'
@@ -304,6 +305,65 @@ describe('checkZen', () => {
     }))
     expect(f.status).toBe('unreachable')
     expect(f.detail).toContain('http 500')
+  })
+})
+
+// ---- OpenCode 指纹自动识别 ----
+//
+// 免费档要真实 UA + 真实 ses_。这些不用让用户手抄：opencode 自己会把「自建会话 +
+// 版本号」写进本地日志（message=created id=ses_xxx ... version=1.18.29），直接读。
+// 只认「客户端自建 + 确实对 zen 发过 stream」两个证据同时成立的会话，宁缺勿滥。
+describe('opencode 指纹自动识别', () => {
+  const LOG = [
+    'timestamp=2026-09-17T02:49:54.272Z level=INFO run=af99f207 message=created id=ses_AAAA1111bbbb version=1.18.29 slug=x version=1.18.29',
+    'timestamp=2026-09-17T02:50:02.560Z level=INFO run=af99f207 message=stream providerID=opencode modelID=mimo-v2.5-free session.id=ses_AAAA1111bbbb step=0',
+    'timestamp=2026-09-17T05:48:46.376Z level=INFO run=bb11 message=created id=ses_CCCC2222dddd version=1.18.31 slug=y version=1.18.31',
+    'timestamp=2026-09-17T05:49:00.000Z level=INFO run=bb11 message=stream providerID=opencode modelID=union-alpha session.id=ses_CCCC2222dddd step=0',
+  ].join('\n')
+
+  test('从日志提取会话 + 版本，取最近一次会话', () => {
+    const got = parseFingerprintFromLog(LOG)!
+    expect(got.sessionID).toBe('ses_CCCC2222dddd')
+    expect(got.version).toBe('1.18.31')
+    expect(got.modelID).toBe('union-alpha') // 该会话实测用过的模型
+  })
+
+  test('无自建会话 → null（不硬凑）', () => {
+    expect(parseFingerprintFromLog('nothing here')).toBeNull()
+    // 只有 stream 没有 created：会话不是这个客户端建的，不能当指纹
+    expect(parseFingerprintFromLog('message=stream providerID=opencode modelID=x session.id=ses_ZZZ')).toBeNull()
+  })
+
+  test('版本号非法（抓到无关数字串）→ null', () => {
+    expect(parseFingerprintFromLog('message=created id=ses_AAAA1111bbbb x version=nope')).toBeNull()
+  })
+
+  test('自动识别的指纹写进草稿 headers（用户无需手抄）', async () => {
+    const fp = { sessionID: 'ses_TEST', version: '9.9.9', userAgent: 'opencode/9.9.9', logPath: '/x' }
+    const f = await checkZen('https://zen.example', (async () => new Response(
+      JSON.stringify({ data: [{ id: 'm-free' }] }), { status: 200 })) as typeof fetch,
+      8000, async () => ({ ok: true }), fp)
+    const h = (f.suggestedProvider as Provider).headers!
+    expect(h['User-Agent']).toBe('opencode/9.9.9')
+    expect(h['x-session-id']).toBe('ses_TEST')
+    expect(h['x-session-affinity']).toBe('ses_TEST')
+    expect(f.detail).toContain('自动识别')
+  })
+
+  test('识别不到指纹时不伪造任何头', async () => {
+    const f = await checkZen('https://zen.example', (async () => new Response(
+      JSON.stringify({ data: [{ id: 'm-free' }] }), { status: 200 })) as typeof fetch,
+      8000, async () => ({ ok: true }), null)
+    const h = (f.suggestedProvider as Provider).headers ?? {}
+    expect(Object.keys(h)).toHaveLength(0)
+  })
+
+  test('opencode 数据目录按平台给候选（含 XDG 覆盖）', () => {
+    expect(openCodeDataDirs('linux', '/home/u', '', {})).toContain('/home/u/.local/share/opencode')
+    expect(openCodeDataDirs('linux', '/home/u', '', { XDG_DATA_HOME: '/xdg' })).toContain('/xdg/opencode')
+    const win = openCodeDataDirs('windows', 'C:\\Users\\u', 'C:\\Users\\u', {})
+      .map((d) => d.replace(/\\/g, '/'))
+    expect(win.some((d) => d.includes('AppData/Local/opencode'))).toBe(true)
   })
 })
 

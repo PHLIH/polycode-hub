@@ -28,8 +28,12 @@ import { Manager } from './projects/manager.ts'
 import { Store as ProjectsStore } from './projects/store.ts'
 import { openLog, startDetached } from './projects/process.ts'
 import {
-  Scanner, defaultConfig, discoverWorkBuddyModelsFrom, workBuddyDataDirs, type ZenCallProbe,
+  Scanner, defaultConfig, discoverWorkBuddyModelsFrom, workBuddyDataDirs,
+  discoverOpenCodeFingerprint, type ZenCallProbe,
 } from './discover/index.ts'
+
+// 目录候选的安全取值（配置可能未提供该字段）。
+const workBuddyDataNullsafe = (dirs: string[] | undefined): string[] => dirs ?? []
 import { homedir } from 'node:os'
 import { usageStatsSource } from './adminapi/stats.ts'
 import { providerValidate } from './model/index.ts'
@@ -220,15 +224,22 @@ export async function runServe(args: string[]): Promise<void> {
   // 「网络通」误报成 ready，用户到手才发现 403 FreeTierError（真实假阳性）。
   const zenCallProbe: ZenCallProbe = async (model) => {
     const draft = defaultConfig()
-    // 关键：复用**已配置的 zen Provider**（含用户配的指纹头 UA/ses_ 与 egress 出口），
-    // 而不是凭空造一个裸草稿。
+    // 探针必须用「与真实转发同一份配置」，否则会把「探针没带够配置」误报成「源不可用」。
+    // 两份来源，优先级从高到低：
+    //   ① 已配置的 zen Provider —— 用户配的指纹头、egress 出口全在里面；
+    //   ② 草稿 + 自动识别的指纹 —— 还没配过的用户（首次打开发现页）走这条，
+    //      指纹从本机 opencode 日志自动读，用户不需要手抄任何东西。
     //
-    // 曾经的写法用空 headers + 无 egress 去打：用户的指纹和出口全都用不上，
-    // 探针必然被 403（缺指纹）或 403（地区限制）——明明是「探针没带够配置」，
-    // 却报成「模型不可调用」，是典型的假阴性（本轮实测踩到）。
-    // 只有当用户还没配过 zen 时才回落到内置草稿。
+    // 曾经的写法用空 headers 去打：指纹/出口全被忽略，必然 403，报成「模型不可调用」——
+    // 典型假阴性（本轮实测踩到两次：先是无 egress，再是无指纹）。
     const configured = providers.list().find((x) => x.state !== 'deleted'
       && (x.name === 'opencode' || x.name === 'zen' || x.baseUrl.includes('opencode.ai')))
+    // 与发现页同源：从本机 opencode 日志识别指纹（识别不到则为 null，不伪造）。
+    const fp = discoverOpenCodeFingerprint(
+      workBuddyDataNullsafe(draft.openCodeDirs))
+    const autoHeaders: Record<string, string> = fp
+      ? { 'User-Agent': fp.userAgent, 'x-session-id': fp.sessionID, 'x-session-affinity': fp.sessionID }
+      : {}
     const p: Provider = configured
       ? { ...configured, models: [{ id: model, manual: false, enabled: true, ...(configured.models.find((m) => m.id === model)?.api ? { api: configured.models.find((m) => m.id === model)!.api } : {}) }], probeModel: model }
       : {
@@ -236,7 +247,7 @@ export async function runServe(args: string[]): Promise<void> {
         accessKind: 'reverse', risk: 'high', riskNote: 'probe', stability: 'beta',
         api: 'openai-completions', baseUrl: (draft.zenBaseURL ?? 'https://opencode.ai/zen') + '/v1',
         credential: { apiKeyEnv: 'ZEN_KEY' },
-        headers: {},
+        headers: autoHeaders,
         priority: 1,
         models: [{ id: model, manual: false, enabled: true }],
       }

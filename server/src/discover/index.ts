@@ -391,19 +391,28 @@ export function checkZCode(dirs: string[]): Finding {
 
 // ---- OpenCode Zen（连通性探针，无需凭据） ----
 
-function zenSuggestedProvider(baseURL: string): Provider {
+// fp：从本机 opencode 日志自动识别出的指纹（没有则 undefined）。
+// 有就把真实 UA + 会话直接写进草稿——新用户「一键导入」即可用，不需要手抄任何东西。
+// 没有也不伪造：留空头，由「opencode 做客户端时的透传 / ZEN_UA / 静态配置」兜底。
+function zenSuggestedProvider(baseURL: string, fp?: OpenCodeFingerprint | null): Provider {
   return {
     providerId: 0, name: 'opencode', state: 'active' as const, displayName: 'Zen免费档（自动发现）',
     accessKind: 'reverse', risk: 'high',
-    riskNote: '逆向客户端指纹；免费档按 IP 限速；非 opencode 客户端需在头里配一个真实 ses_ 会话（opencode run --print-logs 取 created id=），opencode 做客户端时自动透传',
+    riskNote: '逆向客户端指纹；免费档按 IP 限速；指纹优先用本机 opencode 客户端的真实运行记录自动识别，识别不到时才需要手动配置',
     stability: 'beta', api: 'openai-completions',
     baseUrl: baseURL.replace(/\/+$/, '') + '/v1',
     credential: { apiKeyEnv: 'ZEN_KEY' },
     headers: {
-      // 指纹靠「诚实透传 + 配置兜底」，草稿里不预填任何 UA（网关不内置版本号）：
-      // opencode 做客户端时自动透传它的真 UA；其他客户端经网关调用时，
-      // 在 Provider 头里配一个自己抓包取的真串，或设 ZEN_UA 环境变量。
-      // 会话头同样优先透传客户端的；其他客户端经网关调用时用这里配的静态值。
+      // 指纹优先级（见 upstream.applyZenFingerprint）：
+      //   静态头（这里有值就用）> 客户端透传 > ZEN_UA > 不发。
+      // 自动识别到的就是「本机 opencode 真实发过的样子」，与手工抓包等价。
+      // 注意：只写 opencode/<版本> 这一段 UA——中间两段是 opencode 内部依赖版本，
+      // 日志里没有也无从可靠推断；实测这一段足够（测试有锚点）。不编造版本号。
+      ...(fp ? {
+        'User-Agent': fp.userAgent,
+        'x-session-id': fp.sessionID,
+        'x-session-affinity': fp.sessionID,
+      } : {}),
       // 不要加 x-opencode-*（毒头，见 upstream.applyZenFingerprint）。
     },
     priority: 1,
@@ -466,11 +475,13 @@ export type ZenCallProbe = (model: string) => Promise<{ ok: boolean; error?: str
 
 export async function checkZen(
   baseURL: string, fetchImpl: FetchLike, timeoutMs = 8000, callProbe?: ZenCallProbe,
+  fingerprint?: OpenCodeFingerprint | null,
 ): Promise<Finding> {
   const f: Finding = {
     key: 'opencode-zen', harness: 'OpenCode Zen',
-    suggestedProvider: zenSuggestedProvider(baseURL),
+    suggestedProvider: zenSuggestedProvider(baseURL, fingerprint),
   }
+  // 指纹说明统一在拿到结果后拼进 detail（见下方 fpNote），此处不抢先赋值避免被覆盖。
   let res: Response
   try {
     res = await fetchImpl(baseURL.replace(/\/+$/, '') + '/v1/models', {
@@ -496,9 +507,12 @@ export async function checkZen(
     return f
   }
   const ids = (list.data ?? []).map((d) => d.id).filter((x): x is string => !!x)
+  // 指纹来源要一路带给用户：自动识别来的会话会过期（换号/重登就失效），
+  // 用户得知道「这是自动读到的」才明白过期后该重扫，而不是以为配置坏了。
+  const fpNote = fingerprint ? ` · 指纹自动识别自本机 opencode 客户端（${fingerprint.userAgent}）` : ''
   if (!callProbe) {
     f.status = 'ready'
-    f.detail = `连通，${ids.length} 个模型（export ZEN_KEY=public 后采用）`
+    f.detail = `连通，${ids.length} 个模型${fpNote}（export ZEN_KEY=public 后采用）`
     f.actions = ['export ZEN_KEY=public', '然后在发现页点「采用」']
     return f
   }
@@ -524,7 +538,7 @@ export async function checkZen(
     const r = await callProbe(m)
     if (r.ok) {
       f.status = 'ready'
-      f.detail = `连通，${ids.length} 个模型，实测 ${m} 可调用`
+      f.detail = `连通，${ids.length} 个模型，实测 ${m} 可调用${fpNote}`
       f.actions = ['export ZEN_KEY=public', '然后在发现页点「采用」']
       return f
     }
@@ -557,6 +571,110 @@ export async function checkZen(
     f.actions = ['检查 Provider 协议与模型 ID 是否正确', '到 Providers 页用「测试」逐个排查']
   }
   return f
+}
+
+// ---- OpenCode 客户端指纹自动识别 ----
+//
+// 免费档要求「官方客户端样子」：真实 User-Agent + 真实 x-session-id/affinity。
+// 这些**不用让用户手抄**——opencode 自己会把它们写进本地日志，直接从日志里读。
+//
+// 日志里的可信来源（宁缺勿滥，避免把无关字符串当指纹）：
+//   message=created id=ses_xxx ... version=1.18.29
+//     —— 客户端自建会话（ses_ 的权威出处）+ 客户端版本号
+//   旁证：同会话出现在 message=stream providerID=opencode ...
+//     —— 该会话确实对 zen 发过请求，排除掉别的用途/历史残留
+//
+// UA 只需 opencode/<版本> 这一段：中间两段（ai-sdk/provider-utils、runtime）是
+// opencode 内部依赖版本，日志里没有，也无从可靠推断；实测只发版本号同样被接受
+// （见测试）。宁可少写也不编造——编造的版本号正是本项目一直拒绝做的事。
+export interface OpenCodeFingerprint {
+  sessionID: string
+  version: string // 客户端版本（用于拼 UA）
+  userAgent: string // opencode/<version>
+  logPath: string // 来源日志（回显给用户，便于核对）
+  modelID?: string // 该会话实测用过的模型（可作探针候选）
+}
+
+// opencode 数据目录候选（跨平台；env 可覆盖以便测试与自定义安装）。
+export function openCodeDataDirs(
+  goos: string, home: string, winProfile: string, env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const custom = env.OPENCODE_DATA_DIR
+  if (custom) return [custom]
+  const out: string[] = []
+  const push = (d: string | undefined) => { if (d && !out.includes(d)) out.push(d) }
+  if (goos === 'windows') {
+    push(env.LOCALAPPDATA ? join(env.LOCALAPPDATA, 'opencode') : undefined)
+    push(join(winProfile, 'AppData', 'Local', 'opencode'))
+    push(env.APPDATA ? join(env.APPDATA, 'opencode') : undefined)
+    push(join(winProfile, 'AppData', 'Roaming', 'opencode'))
+    return out
+  }
+  // macOS 与 Linux 都遵循 XDG（opencode 用 ~/.local/share）
+  const xdg = env.XDG_DATA_HOME || join(home, '.local', 'share')
+  push(join(xdg, 'opencode'))
+  if (xdg !== join(home, '.local', 'share')) push(join(home, '.local', 'share', 'opencode'))
+  return out
+}
+
+// 日志文件候选（log 目录下的 *.log；含轮转文件）。
+export function openCodeLogFiles(dirs: string[]): string[] {
+  const out: string[] = []
+  for (const d of dirs) {
+    const logDir = join(d, 'log')
+    let names: string[]
+    try {
+      names = readdirSync(logDir)
+    } catch {
+      continue
+    }
+    for (const n of names) {
+      if (n.endsWith('.log')) out.push(join(logDir, n))
+    }
+  }
+  return out
+}
+
+// 从日志内容提取指纹。纯函数（便于测试），不碰文件系统。
+// 策略：取**最后一个**可用会话（最近一次真实运行的最可能还新鲜）；
+// 需要「自建会话」与「确实对 opencode(zen) 发起过 stream」两个证据同时成立。
+export function parseFingerprintFromLog(text: string): { sessionID: string; version: string; modelID?: string } | null {
+  // 会话自建：id 与 version 同现。version 用 [\w.]+ 而不是纯数字，兼容预发布号。
+  const created = [...text.matchAll(/message=created id=(ses_[A-Za-z0-9_-]{8,})[^\n]*?version=([\w.]+)/g)]
+  if (created.length === 0) return null
+  const last = created[created.length - 1]!
+  const sessionID = last[1]!
+  const version = last[2]!
+  // 只接受 opencode 自己解析出的语义化版本，避免抓到无关数字串。
+  if (!/^\d+\.\d+\.\d+/.test(version)) return null
+  // 旁证：该会话对 zen(opencode provider) 发过流式请求；顺带取它用过的模型。
+  const used = [...text.matchAll(
+    new RegExp(`message=stream providerID=opencode modelID=([^\\s]+) session\\.id=${sessionID}`, 'g'),
+  )]
+  return { sessionID, version, modelID: used.length > 0 ? used[used.length - 1]![1] : undefined }
+}
+
+// 扫描本机 opencode 日志，返回指纹（找不到返回 null）。
+// 从最新的日志文件开始找（轮转文件里越新的越可能含未过期会话）。
+export function discoverOpenCodeFingerprint(dirs: string[]): OpenCodeFingerprint | null {
+  const files = openCodeLogFiles(dirs)
+  // 按修改时间倒序：先看最新日志。
+  const sorted = files.map((p) => {
+    let m = 0
+    try { m = statSync(p).mtimeMs } catch { /* 取不到按 0 */ }
+    return { p, m }
+  }).sort((a, b) => b.m - a.m)
+  for (const { p } of sorted) {
+    let raw: string
+    try {
+      raw = readFileSync(p, 'utf8')
+    } catch {
+      continue
+    }
+    const got = parseFingerprintFromLog(raw)
+    if (got) return { ...got, userAgent: `opencode/${got.version}`, logPath: p }
+  }
+  return null
 }
 
 // ---- WorkBuddy 多账号发现 ----
@@ -723,6 +841,8 @@ export interface ScanConfig {
   fetchImpl?: FetchLike // 不填用全局 fetch
   // zen 可调用性验证（真打一次模型）。不填 = 只做列表探测（既有单测契约不变）。
   zenCallProbe?: ZenCallProbe
+  // opencode 数据目录候选（自动识别指纹用）。不填 = 不做识别（既有单测契约不变）。
+  openCodeDirs?: string[]
 }
 
 // 按本机平台生成默认输入（只生成路径表，不做 IO）。
@@ -737,6 +857,8 @@ export function defaultConfig(): ScanConfig {
     // 智能兜底起点：候选全 miss 时按文件名递归找（覆盖装到别处/目录改名）。
     workBuddyFallbackRoots: workBuddyDataRoots(goos, home, profile),
     zCodeDirs: zCodeSearchDirs(goos, home, profile),
+    // opencode 数据目录（指纹自动识别的来源）。
+    openCodeDirs: openCodeDataDirs(goos, home, profile),
     zenBaseURL: 'https://opencode.ai/zen',
   }
 }
@@ -768,11 +890,16 @@ export class Scanner {
       out.push(wb)
     }
     out.push(checkZCode(this.cfg.zCodeDirs ?? []))
+    // 指纹自动识别：从本机 opencode 日志读真实 UA/会话（用户无需手抄任何东西）。
+    const fp = this.cfg.openCodeDirs && this.cfg.openCodeDirs.length > 0
+      ? discoverOpenCodeFingerprint(this.cfg.openCodeDirs)
+      : null
     out.push(await checkZen(
       this.cfg.zenBaseURL ?? 'https://opencode.ai/zen',
       this.cfg.fetchImpl ?? globalThis.fetch,
       this.zenTimeoutMs,
       this.cfg.zenCallProbe,
+      fp,
     ))
     return out
   }
