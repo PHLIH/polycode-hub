@@ -949,15 +949,18 @@ describe('accounts CRUD（对齐 Go TestAccountCRUD）', () => {
 })
 
 describe('账号列表带运行时状态（冷却/连败不在 DB 里）', () => {
-  // 账号归属 = 数字 providerId；这些用例不查 Provider 表，给个固定正数即可。
-  const accts = [{ id: 'a1', providerId: 1, credential: {}, status: 'available' as const, fails: 0 }]
+  // 账号归属 = 数字 providerId，且**必须指向一条真实存在的 Provider 行**：
+  // 列表只下发「归属 Provider 还在」的账号（已删除 Provider 名下的账号不再展示），
+  // 所以这里不能像以前那样随手给个固定正数 —— 那是孤儿账号，会被过滤掉。
+  const owner = mkProviderFixed({ name: 'runtime-owner' })
+  const accts = [{ id: 'a1', providerId: owner.providerId, credential: {}, status: 'available' as const, fails: 0 }]
+  const withOwner = (o = {}) => ({ providers: [owner], accounts: accts, ...o })
 
   test('池内冷却覆盖 DB 的 available，并显示真实连败数', async () => {
     const until = new Date(Date.now() + 60_000)
-    const call = caller(build({
-      accounts: accts,
+    const call = caller(build(withOwner({
       accountRuntime: { runtime: () => ({ status: 'cooldown', fails: 4, cooldownUntil: until }) },
-    }))
+    })))
     const body = await (await call('GET', '/admin/api/accounts', { key: 'secret' })).json() as { accounts: Account[] }
     expect(body.accounts[0]!.status).toBe('cooldown')
     expect(body.accounts[0]!.fails).toBe(4)
@@ -966,20 +969,37 @@ describe('账号列表带运行时状态（冷却/连败不在 DB 里）', () =>
   })
 
   test('过期冷却不显示为冷却中（避免 UI 撒谎）', async () => {
-    const call = caller(build({
-      accounts: accts,
+    const call = caller(build(withOwner({
       accountRuntime: { runtime: () => ({ status: 'cooldown', fails: 4, cooldownUntil: new Date(Date.now() - 1000) }) },
-    }))
+    })))
     const body = await (await call('GET', '/admin/api/accounts', { key: 'secret' })).json() as { accounts: Account[] }
     expect(body.accounts[0]!.status).toBe('available')
     expect(body.accounts[0]!.cooldownUntil).toBeUndefined()
   })
 
   test('未接运行时：退化为 DB 状态（不炸）', async () => {
-    const call = caller(build({ accounts: accts }))
+    const call = caller(build(withOwner()))
     const body = await (await call('GET', '/admin/api/accounts', { key: 'secret' })).json() as { accounts: Account[] }
     expect(body.accounts[0]!.status).toBe('available')
     expect(body.accounts[0]!.fails).toBe(0)
+  })
+
+  // 归属的 Provider 已删除 → 该账号不再出现在列表里（反复删渠道/重导入不再攒重复号）。
+  test('已删除 Provider 名下的账号不进列表（只展示当前 Provider 的账号）', async () => {
+    const gone = mkProviderFixed({ name: 'gone-provider' })
+    const live = mkProviderFixed({ name: 'live-provider' })
+    const call = caller(build({
+      providers: [gone, live],
+      accounts: [
+        { id: 'orphan', providerId: gone.providerId, credential: {}, status: 'available', fails: 0 },
+        { id: 'kept', providerId: live.providerId, credential: {}, status: 'available', fails: 0 },
+      ],
+    }))
+    await call('DELETE', `/admin/api/providers/${gone.providerId}`, { key: 'secret' })
+    const body = await (await call('GET', '/admin/api/accounts', { key: 'secret' })).json() as { accounts: Account[] }
+    expect(body.accounts.map((a) => a.id)).toEqual(['kept'])
+    // 行还在库里（历史用量归因靠它），只是不再展示
+    expect((await call('GET', `/admin/api/accounts/orphan/credential`, { key: 'secret' })).status).toBe(200)
   })
 
   // 健康度由后端算好下发：前端不再复制阈值常量（改阈值只改 model 层一处）。
@@ -990,22 +1010,22 @@ describe('账号列表带运行时状态（冷却/连败不在 DB 里）', () =>
       [3, 'available', 'warn'],
     ]
     for (const [fails, status, want] of cases) {
-      const call = caller(build({
-        accounts: accts,
+      const call = caller(build(withOwner({
         accountRuntime: { runtime: () => ({ status, fails }) },
-      }))
+      })))
       const body = await (await call('GET', '/admin/api/accounts', { key: 'secret' })).json() as { accounts: { health?: string }[] }
       expect(body.accounts[0]!.health).toBe(want)
     }
     // 冷却中 → warn
-    const cool = caller(build({
-      accounts: accts,
+    const cool = caller(build(withOwner({
       accountRuntime: { runtime: () => ({ status: 'cooldown', fails: 0, cooldownUntil: new Date(Date.now() + 60_000) }) },
-    }))
+    })))
     const cb = await (await cool('GET', '/admin/api/accounts', { key: 'secret' })).json() as { accounts: { health?: string }[] }
     expect(cb.accounts[0]!.health).toBe('warn')
     // 停用 → bad（未接运行时也要有 health）
-    const dis = caller(build({ accounts: [{ id: 'a1', providerId: 1, credential: {}, status: 'disabled' as const, fails: 0 }] }))
+    const dis = caller(build(withOwner({
+      accounts: [{ id: 'a1', providerId: owner.providerId, credential: {}, status: 'disabled' as const, fails: 0 }],
+    })))
     const db = await (await dis('GET', '/admin/api/accounts', { key: 'secret' })).json() as { accounts: { health?: string }[] }
     expect(db.accounts[0]!.health).toBe('bad')
   })
@@ -1697,6 +1717,46 @@ describe('discover/quick-import（对齐 Go quickimport_test.go）', () => {
       key: 'secret', body: { id: 'fake', providerName: 'wb-auto', importSource: 'workbuddy', credential: {} },
     })
     expect(posted.status).toBe(400)
+  })
+
+  // 真实缺陷（用户报「不停删除 workbuddy 再导入，账号池里堆出一堆 workbuddy 账号，
+  // 其实都是同一个号」）：
+  // 删 Provider 是软删，账号行不会跟着消失；重新一键导入会新建一条 Provider（新 id），
+  // 而旧账号归属判等是 providerId 相等，老行永远匹配不上 → 每删导一轮多一批。
+  // 护栏：按身份（UID/token）跨 Provider 认同一个账号，重新导入时改挂到当前 Provider。
+  test('删掉 Provider 再一键导入：同账号复用，不再翻倍（只留当前 Provider 的账号）', async () => {
+    isolateCwd()
+    const a = makeAuthFile('主号')
+    const call = caller(build({ discover: new StubDiscover([
+      qf([{ nickname: '主号', tokenPath: a.tokenPath, alive: true }]),
+    ]) }))
+
+    // 第一轮：导入 → 1 个账号
+    const first = await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: { key: 'workbuddy' } })
+    const firstOut = await first.json() as { provider: Provider; imported: number }
+    expect(firstOut.imported).toBe(1)
+    const p1 = firstOut.provider
+    const after1 = ((await (await call('GET', '/admin/api/accounts', { key: 'secret' })).json()) as { accounts: Account[] }).accounts
+    expect(after1).toHaveLength(1)
+    const uid1 = after1[0]!.workbuddyUid
+
+    // 删掉这个 Provider（软删：行还在，账号行也还在库里）
+    expect((await call('DELETE', '/admin/api/providers/' + p1.providerId, { key: 'secret' })).status).toBe(204)
+
+    // 第二轮：重新一键导入 → 还是同一个号，改挂到新 Provider 名下，不能变成 2 个
+    const second = await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: { key: 'workbuddy' } })
+    const secondOut = await second.json() as { provider: Provider; imported: number }
+    expect(secondOut.provider.providerId).not.toBe(p1.providerId) // 新的一条 Provider 记录
+    const after2 = ((await (await call('GET', '/admin/api/accounts', { key: 'secret' })).json()) as { accounts: Account[] }).accounts
+    expect(after2).toHaveLength(1) // 关键：没有翻倍
+    expect(after2[0]!.workbuddyUid).toBe(uid1) // 还是同一个账号身份
+    expect(after2[0]!.providerId).toBe(secondOut.provider.providerId) // 已归到当前 Provider
+
+    // 第三轮再来一次，依然只有一个
+    await call('DELETE', '/admin/api/providers/' + secondOut.provider.providerId, { key: 'secret' })
+    await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: { key: 'workbuddy' } })
+    const after3 = ((await (await call('GET', '/admin/api/accounts', { key: 'secret' })).json()) as { accounts: Account[] }).accounts
+    expect(after3).toHaveLength(1)
   })
 
   test('zen 未配 ZEN_KEY：公共 key 自动落凭据文件；已配则不动', async () => {
