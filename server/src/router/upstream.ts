@@ -316,8 +316,16 @@ const QUOTA_HINT = /额度已用尽|额度不足|余额不足|quota|insufficient
 
 export function classifyUpstreamError(status: number, body: string): string {
   const kind = kindForStatus(status)
-  if (kind === UPSTREAM.AUTH && /regionerror|not available in your country/i.test(body)) {
-    return UPSTREAM.BAD_REQUEST
+  if (kind === UPSTREAM.AUTH) {
+    // 403 不等于「你的 Key 错了」。上游用 403 表达很多策略性拒绝，
+    // 归成 auth 会把用户引向错误方向（反复去翻/重置 API Key，而 Key 其实是好的）。
+    // 已确认的两类：
+    //   RegionError   —— 地区不可用（换出口代理能解）
+    //   FreeTierError —— 免费档只允许官方客户端内部使用。opencode 实测：
+    //     "OpenCode's free tier can only be used from within OpenCode"，
+    //     **绕过网关直连上游同样 403**，与网关配置无关；出路是换付费档或换上游。
+    if (/regionerror|not available in your country/i.test(body)) return UPSTREAM.BAD_REQUEST
+    if (/freetiererror|free tier can only be used/i.test(body)) return UPSTREAM.BAD_REQUEST
   }
   if (kind === UPSTREAM.RATE_LIMIT && QUOTA_HINT.test(body)) {
     return UPSTREAM.QUOTA

@@ -227,6 +227,24 @@ describe('上游错误分类细化：429 额度用尽 ≠ 429 限流', () => {
   test('402 支付/额度 → quota（原有语义不变）', () => {
     expect(classifyUpstreamError(402, '')).toBe(UPSTREAM.QUOTA)
   })
+
+  // 回归（真实踩坑）：opencode 免费档被上游用 403 拒绝，
+  // 但**不是**用户 Key 的问题——直连上游同样 403：
+  //   FreeTierError: OpenCode's free tier can only be used from within OpenCode
+  // 归成 auth 会让人反复去翻/重置 API Key（而 Key 是好的），排查方向全错。
+  test('403 但属于策略性拒绝时不归 auth（否则误导排查方向）', () => {
+    const freeTier = JSON.stringify({
+      type: 'error',
+      error: { type: 'FreeTierError', message: "Error from provider (Console): OpenCode's free tier can only be used from within OpenCode" },
+    })
+    expect(classifyUpstreamError(403, freeTier)).toBe(UPSTREAM.BAD_REQUEST)
+    // 地区限制同理（换出口代理能解，不是 Key 错）
+    expect(classifyUpstreamError(403, '{"error":{"type":"RegionError"}}')).toBe(UPSTREAM.BAD_REQUEST)
+    // 真正的凭据错误仍归 auth（别把这条顺手改坏了）
+    expect(classifyUpstreamError(403, '{"error":{"type":"AuthError","message":"Missing API key."}}'))
+      .toBe(UPSTREAM.AUTH)
+    expect(classifyUpstreamError(401, 'invalid token')).toBe(UPSTREAM.AUTH)
+  })
 })
 
 describe('egress 出口分流（按 Provider 选取 dispatcher）', () => {
