@@ -118,14 +118,17 @@ interface BuildOpts {
   sidecar?: Hono
   projects?: Hono
   workbuddyCheckinFetch?: typeof fetch
+  // 外部注入的存储：需要直接读到底层行数时用（列表端点会按 Provider 过滤孤儿账号，
+  // 断言「有没有偷偷多建一行」必须绕过它，否则断言会被过滤掩盖成恒真）。
+  stores?: { providers: MemoryProviderStore; accounts: MemoryAccountStore }
 }
 
 function build(o: BuildOpts = {}): Hono {
   return createAdminApi({
     adminKey: o.key ?? 'secret',
     egresses: o.egresses && (() => { const st = new MemoryEgressStore(); for (const e of o.egresses) st.put(e); return st })(),
-    providers: new MemoryProviderStore(o.providers),
-    accounts: new MemoryAccountStore(o.accounts),
+    providers: o.stores?.providers ?? new MemoryProviderStore(o.providers),
+    accounts: o.stores?.accounts ?? new MemoryAccountStore(o.accounts),
     stats: o.stats ?? stubStats,
     discover: o.discover,
     resetter: o.resetter,
@@ -1608,6 +1611,17 @@ const qf = (accounts: { nickname: string; tokenPath: string; alive: boolean }[])
   suggestedAccounts: accounts.map((a) => ({ nickname: a.nickname, alive: a.alive, tokenPath: a.tokenPath })),
 })
 
+// 同 qf，但 harness key 可指定：判重逻辑对所有渠道通用（不只 workbuddy），
+// 非 workbuddy 渠道的回归必须能构造出来。
+const qfKey = (
+  key: string, draftName: string,
+  accounts: { nickname: string; tokenPath: string; alive: boolean }[],
+): Finding => ({
+  key, harness: key, status: 'ready', detail: '',
+  suggestedProvider: readyProvider(draftName),
+  suggestedAccounts: accounts.map((a) => ({ nickname: a.nickname, alive: a.alive, tokenPath: a.tokenPath })),
+})
+
 describe('discover/quick-import（对齐 Go quickimport_test.go）', () => {
   test('一键导入：Provider 入库 + 活账号入池 + 死账号跳过 + 幂等', async () => {
     isolateCwd()
@@ -1727,18 +1741,24 @@ describe('discover/quick-import（对齐 Go quickimport_test.go）', () => {
   test('删掉 Provider 再一键导入：同账号复用，不再翻倍（只留当前 Provider 的账号）', async () => {
     isolateCwd()
     const a = makeAuthFile('主号')
-    const call = caller(build({ discover: new StubDiscover([
-      qf([{ nickname: '主号', tokenPath: a.tokenPath, alive: true }]),
-    ]) }))
+    const stores = { providers: new MemoryProviderStore(), accounts: new MemoryAccountStore() }
+    const call = caller(build({
+      stores,
+      discover: new StubDiscover([
+        qf([{ nickname: '主号', tokenPath: a.tokenPath, alive: true }]),
+      ]),
+    }))
+    // 断言直接读底层行数：列表端点会过滤孤儿账号，用它断言会被掩盖成恒真
+    // （回退成按 providerId 判重时「列表仍显示 1 条」→ 断言照样过，等于没测到）。
+    const total = () => stores.accounts.list().length
 
     // 第一轮：导入 → 1 个账号
     const first = await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: { key: 'workbuddy' } })
     const firstOut = await first.json() as { provider: Provider; imported: number }
     expect(firstOut.imported).toBe(1)
     const p1 = firstOut.provider
-    const after1 = ((await (await call('GET', '/admin/api/accounts', { key: 'secret' })).json()) as { accounts: Account[] }).accounts
-    expect(after1).toHaveLength(1)
-    const uid1 = after1[0]!.workbuddyUid
+    expect(total()).toBe(1)
+    const uid1 = stores.accounts.list()[0]!.workbuddyUid
 
     // 删掉这个 Provider（软删：行还在，账号行也还在库里）
     expect((await call('DELETE', '/admin/api/providers/' + p1.providerId, { key: 'secret' })).status).toBe(204)
@@ -1747,16 +1767,62 @@ describe('discover/quick-import（对齐 Go quickimport_test.go）', () => {
     const second = await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: { key: 'workbuddy' } })
     const secondOut = await second.json() as { provider: Provider; imported: number }
     expect(secondOut.provider.providerId).not.toBe(p1.providerId) // 新的一条 Provider 记录
-    const after2 = ((await (await call('GET', '/admin/api/accounts', { key: 'secret' })).json()) as { accounts: Account[] }).accounts
-    expect(after2).toHaveLength(1) // 关键：没有翻倍
-    expect(after2[0]!.workbuddyUid).toBe(uid1) // 还是同一个账号身份
-    expect(after2[0]!.providerId).toBe(secondOut.provider.providerId) // 已归到当前 Provider
+    expect(total()).toBe(1) // 关键：没有翻倍（旧行为这里会是 2）
+    const row2 = stores.accounts.list()[0]!
+    expect(row2.workbuddyUid).toBe(uid1) // 还是同一个账号身份
+    expect(row2.providerId).toBe(secondOut.provider.providerId) // 已归到当前 Provider
 
     // 第三轮再来一次，依然只有一个
     await call('DELETE', '/admin/api/providers/' + secondOut.provider.providerId, { key: 'secret' })
     await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: { key: 'workbuddy' } })
-    const after3 = ((await (await call('GET', '/admin/api/accounts', { key: 'secret' })).json()) as { accounts: Account[] }).accounts
-    expect(after3).toHaveLength(1)
+    expect(total()).toBe(1)
+  })
+
+  // 同上肌理，但走**非 workbuddy 渠道**：判重是按 harness key 分区的通用逻辑，
+  // zcode / opencode-zen 删掉再导入同样不能翻倍（此前只有 workbuddy 分支修了）。
+  test('非 workbuddy 渠道同样不翻倍（zcode 删掉再导入）', async () => {
+    isolateCwd()
+    const a = makeAuthFile('z主号')
+    const stores = { providers: new MemoryProviderStore(), accounts: new MemoryAccountStore() }
+    const call = caller(build({
+      stores,
+      discover: new StubDiscover([
+        qfKey('zcode', 'zcode-auto', [{ nickname: 'z主号', tokenPath: a.tokenPath, alive: true }]),
+      ]),
+    }))
+    // 断言直接读底层行数：列表端点会过滤孤儿账号，用它断言会被掩盖成恒真。
+    const total = () => stores.accounts.list().length
+
+    const first = await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: { key: 'zcode' } })
+    const out1 = await first.json() as { provider: Provider; imported: number }
+    expect(out1.imported).toBe(1)
+    expect(total()).toBe(1)
+    expect(stores.accounts.list()[0]!.importSource).toBe('zcode') // 来源标记：下轮判重的分区键
+
+    await call('DELETE', '/admin/api/providers/' + out1.provider.providerId, { key: 'secret' })
+    const second = await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: { key: 'zcode' } })
+    const out2 = await second.json() as { provider: Provider }
+    expect(total()).toBe(1) // 关键：没有翻倍（回退成按 providerId 判重这里会是 2）
+    expect(stores.accounts.list()[0]!.providerId).toBe(out2.provider.providerId) // 已归到新 Provider
+  })
+
+  // 分区必须生效：同名登录态在两个不同渠道里是**两个不同的账号**，不能互认。
+  test('不同渠道的身份不互认（zcode 不会认成 workbuddy 的号）', async () => {
+    isolateCwd()
+    const shared = makeAuthFile('同名号')
+    const stores = { providers: new MemoryProviderStore(), accounts: new MemoryAccountStore() }
+    const call = caller(build({
+      stores,
+      discover: new StubDiscover([
+        qfKey('workbuddy', 'wb-auto', [{ nickname: '同名号', tokenPath: shared.tokenPath, alive: true }]),
+        qfKey('zcode', 'zcode-auto', [{ nickname: '同名号', tokenPath: shared.tokenPath, alive: true }]),
+      ]),
+    }))
+    await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: { key: 'workbuddy' } })
+    await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: { key: 'zcode' } })
+    expect(stores.accounts.list().length).toBe(2) // 两个渠道各一个，不是合併也不是漏
+    expect(new Set(stores.accounts.list().map((r) => r.importSource)))
+      .toEqual(new Set(['workbuddy', 'zcode']))
   })
 
   test('zen 未配 ZEN_KEY：公共 key 自动落凭据文件；已配则不动', async () => {
