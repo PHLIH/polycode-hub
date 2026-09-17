@@ -186,7 +186,14 @@ async function quickImport(f) {
     if (r.imported) msg += `，${r.imported} 个账号已入池`
     if (r.skipped) msg += `，${r.skipped} 个已在池中跳过`
     ElMessage.success(`${f.harness}：${msg}`)
-    ;(r.warnings || []).forEach(w => ElMessage.warning(w, { duration: 6000 }))
+    // ElMessage 第二个位置参数是 appContext，不是选项（Element Plus 源码：
+    // message(type)(options, appContext) → vnode.appContext = context || message._context）。
+    // 以前这里传 { duration: 6000 } 会被当成 appContext，导致
+    // Object.create(appContext.provides) 拿到 undefined，抛出
+    // 「Object prototype may only be an Object or null: undefined」，
+    // 并跳过下面的 load()（列表不刷新），catch 里又把异常弹成红色报错——
+    // 导入明明成功了，用户却看到报错 + 列表没动。duration 必须包进第一个参数对象。
+    ;(r.warnings || []).forEach(w => ElMessage.warning({ message: w, duration: 6000 }))
     await Promise.all([load(), loadFindings()])
   } catch (e) { ElMessage.error(e.message) } finally { qiBusy.value = '' }
 }

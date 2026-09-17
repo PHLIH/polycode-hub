@@ -256,7 +256,10 @@ async function adopt(f) {
     ElMessage.success(accts > 0
       ? `已采用为 Provider「${label}」，${accts} 个登录态已入账号池，去 Provider 页确认模型`
       : `已采用为 Provider「${label}」，去 Provider 页确认模型`)
-    for (const w of p.warnings || []) ElMessage.warning(w, { duration: 6000 })
+    // 同 Providers.vue：ElMessage 第二个位置参数是 appContext 而非选项，
+    // { duration } 必须包进第一个参数对象，否则抛
+    // 「Object prototype may only be an Object or null: undefined」。
+    for (const w of p.warnings || []) ElMessage.warning({ message: w, duration: 6000 })
     await Promise.all([rescan(), loadPool()])
   } catch (e) { ElMessage.error(e.message) }
   finally { adopting.value = '' }
