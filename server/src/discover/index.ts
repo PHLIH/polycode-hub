@@ -616,17 +616,21 @@ export function openCodeDataDirs(
   if (custom) return [custom]
   const out: string[] = []
   const push = (d: string | undefined) => { if (d && !out.includes(d)) out.push(d) }
+  // 三平台都要查 XDG 位置：opencode 是按 XDG 规范实现的，**不随平台变**。
+  // 实测（Windows 11）真实路径就是 C:\Users\<u>\.local\share\opencode\log\opencode.log，
+  // 而 %LOCALAPPDATA%\opencode 并不存在——早先只在非 Windows 分支查 XDG，
+  // 导致 Windows 用户装了 opencode 也识别不到指纹。
+  const xdg = env.XDG_DATA_HOME || join(winProfile || home, '.local', 'share')
+  push(join(xdg, 'opencode'))
+  push(join(home, '.local', 'share', 'opencode'))
+  push(join(winProfile, '.local', 'share', 'opencode'))
   if (goos === 'windows') {
+    // AppData 也保留：不同版本/打包方式可能改位置，两条都查、谁有日志用谁。
     push(env.LOCALAPPDATA ? join(env.LOCALAPPDATA, 'opencode') : undefined)
     push(join(winProfile, 'AppData', 'Local', 'opencode'))
     push(env.APPDATA ? join(env.APPDATA, 'opencode') : undefined)
     push(join(winProfile, 'AppData', 'Roaming', 'opencode'))
-    return out
   }
-  // macOS 与 Linux 都遵循 XDG（opencode 用 ~/.local/share）
-  const xdg = env.XDG_DATA_HOME || join(home, '.local', 'share')
-  push(join(xdg, 'opencode'))
-  if (xdg !== join(home, '.local', 'share')) push(join(home, '.local', 'share', 'opencode'))
   return out
 }
 

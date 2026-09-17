@@ -333,6 +333,20 @@ describe('opencode 指纹自动识别', () => {
   // 真实缺陷（用户实测报回）：早先的正则假设 id 在 version 之前，字段序一变就
   // 整条识别不出来 → 用户装了 opencode 却被告知「缺少客户端指纹」。
   // 日志字段顺序是 opencode 内部实现细节，不该成为我们的假设。
+  // 用户提供的真实日志行（logfmt、含大量字段、CRLF、Windows 路径、1.18.27）。
+  // 逐字作为回归锚点：格式再变也不能解析不出来。
+  test('解析用户真实日志行（logfmt 全字段形态）', () => {
+    const real = 'timestamp=2026-09-04T12:30:01.251Z level=INFO run=02c48c4e message=created '
+      + 'id=ses_f939a45dAAAAbbbb1111 slug=lucky-planet version=1.18.27 '
+      + 'projectID=59cdb1c95758cb8416e9e8fd295f5d4a936f9612 directory="F:\\\\stock-strategy-lab" path="" '
+      + 'workspaceID=undefined parentID=undefined title="New session - 2026-09-04T12:30:01.251Z" '
+      + 'agent=undefined model=undefined metadata=undefined cost=0 tokens.input=0 tokens.output=0 '
+      + 'time.created=1788525001251 time.updated=1788525001251'
+    const got = parseFingerprintFromLog(real)!
+    expect(got.sessionID).toBe('ses_f939a45dAAAAbbbb1111')
+    expect(got.version).toBe('1.18.27')
+  })
+
   test('不依赖字段顺序（version 在前也能识别）', () => {
     const got = parseFingerprintFromLog('message=created version=1.20.0 id=ses_AAAAbbbb1111 slug=x')
     expect(got?.sessionID).toBe('ses_AAAAbbbb1111')
@@ -406,6 +420,16 @@ describe('opencode 指纹自动识别', () => {
     const win = openCodeDataDirs('windows', 'C:\\Users\\u', 'C:\\Users\\u', {})
       .map((d) => d.replace(/\\/g, '/'))
     expect(win.some((d) => d.includes('AppData/Local/opencode'))).toBe(true)
+  })
+
+  // 真实缺陷（Windows 用户实测报回）：opencode 按 XDG 规范实现，**不随平台变**——
+  // Windows 上真实路径是 C:\\Users\\<u>\\.local\\share\\opencode\\log\\opencode.log，
+  // 而 %LOCALAPPDATA%\\opencode 并不存在。早先只在非 Windows 分支查 XDG，
+  // 导致 Windows 用户装了 opencode 也识别不到指纹。
+  test('Windows 也查 XDG 位置（.local/share）——实测真实路径就在这里', () => {
+    const dirs = openCodeDataDirs('windows', 'C:\\Users\\19169', 'C:\\Users\\19169', {})
+      .map((d) => d.replace(/\\/g, '/'))
+    expect(dirs.some((d) => d.endsWith('19169/.local/share/opencode'))).toBe(true)
   })
 })
 
