@@ -244,7 +244,12 @@ export interface Account {
   // 指向数字 id 而非名字：Provider 改名后账号归属自动跟着走，不用迁移。
   providerId: number
   displayName?: string
-  importSource?: 'workbuddy'
+  // 该账号由哪个 harness 的登录态导入而来（workbuddy / zcode / opencode-zen…）。
+  // 放宽为 string：除 workbuddy 外的渠道同样需要它标记来源，
+  // 两侧 channel-specific 逻辑（如签到）仍精确认具体值。
+  importSource?: string
+  // 导出该登录态的 harness 上的账号 UID（跨删除/重建唯一稳定的身份凭据）。
+  // 判重必须与 importSource 分区比对：不同渠道的 UID 命名空间不搭界。
   workbuddyUid?: string
   workbuddyTokenHash?: string
   credential: CredentialRef

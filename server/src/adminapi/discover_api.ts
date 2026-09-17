@@ -205,7 +205,7 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
       status: 'available',
       fails: 0,
     }
-    if (key === 'workbuddy') markWorkbuddySource(acct, sess)
+    markImportSource(acct, key, sess)
     accounts.put(acct)
     changed()
     return ok(c, 201, acct)
@@ -350,15 +350,14 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
         continue
       }
       const tok = sess.token
-      const same = key === 'workbuddy'
-        ? findSameWorkbuddyIdentity(sess)
-        : findSameIdentity(ownerId, acc.nickname)
+      const same = findSameIdentity(key, sess)
       if (same) {
         // 复用而不是新建：原本挂在一条已删除 Provider 记录上的账号，直接改挂到当前
         // Provider 名下（就这一个号，不因为换了个 providerId 又建一行）。
         const prevOwner = providers.list().find((p) => p.providerId === same.providerId)
         if (!prevOwner || prevOwner.state === 'deleted') same.providerId = ownerId
-        if (key === 'workbuddy') markWorkbuddySource(same, sess)
+        // 各渠道都留来源标记：它是后续判重的分区键（缺了它下一轮又会新建一行）。
+        markImportSource(same, key, sess)
         // 凭据就地刷新（token 轮换）：文件型引用原路径覆盖；连引用都没有的补一个。
         let refreshed = false
         if (same.credential.apiKeyFile) {
@@ -402,7 +401,7 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
         credential: { apiKeyFile: credFile },
         status: 'available', fails: 0,
       }
-      if (key === 'workbuddy') markWorkbuddySource(fresh, { uid: sess.uid, token: tok })
+      markImportSource(fresh, key, { uid: sess.uid, token: tok })
       accounts.put(fresh)
       imported++
     }
@@ -431,27 +430,29 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     return undefined
   }
 
-  // 同一个 WorkBuddy 身份（账号池里已存在的那一行）。
+  // 同一个 harness 身份在账号池里已存在的那一行（**跨 Provider** 找）。
   //
-  // 判据必须**跨 Provider**：反复「删掉 workbuddy 再一键导入」时，每次导入都会
-  // 新建一条 Provider 记录（新 providerId），而账号归属判等是
-  // `a.providerId === ownerId`，老账号因此永远匹配不上 → 每删导一轮就多出一整批。
-  // 表面看是「好多 workbuddy 账号」，其实是同一个号被复制了 N 份。
-  // 所以这里按身份（UID 优先，token 指纹兜底）全局找，不按 providerId 找。
-  function findSameWorkbuddyIdentity(sess: { token: string; uid?: string }): Account | undefined {
-    // 认 WorkBuddy 的行：UID 精确命中优先——它是跨删除/重建唯一稳定的身份凭据。
+  // 判据必须跨 Provider：反复「删掉渠道再一键导入」时，每次导入都会新建一条
+  // Provider 记录（新 providerId），而账号归属判等是 `a.providerId === ownerId`，
+  // 老账号因此永远匹配不上 → 每删导一轮就多出一整批。表面看是「好多账号」，
+  // 其实是同一个号被复制了 N 份。所以按身份全局找，不按 providerId 找。
+  //
+  // 通用：workbuddy / zcode / opencode-zen 走同一条路径，判据都按 key 分区
+  // （importSource 必须等于 key），不同渠道的 UID 命名空间互不搭界，不会互认。
+  // 降级顺序：UID 精确命中 → token 指纹 → 凭据文件原文（宁漏，不错配）。
+  function findSameIdentity(
+    key: string, sess: { token: string; uid?: string },
+  ): Account | undefined {
+    const own = accounts.list().filter((a) => (a.importSource ?? '') === key)
     if (sess.uid) {
-      const byUid = accounts.list().find((a) => a.workbuddyUid === sess.uid)
+      const byUid = own.find((a) => a.workbuddyUid === sess.uid)
       if (byUid) return byUid
     }
-    // 老行是早期版本导进来的、UID 没落库：token 指纹命中才算同一个身份。
-    // 只在已打标记的 workbuddy 行里比指纹，避免拿 zen/zcode 的行当账号认。
     const hash = workbuddyTokenHash(sess.token)
-    const byHash = accounts.list().find((a) => a.workbuddyTokenHash === hash)
+    const byHash = own.find((a) => a.workbuddyTokenHash === hash)
     if (byHash) return byHash
-    // 同上：只对 workbuddy 来源的行比凭据原文，宁漏不错配。
-    for (const acct of accounts.list()) {
-      if (acct.importSource !== 'workbuddy' || !acct.credential.apiKeyFile) continue
+    for (const acct of own) {
+      if (!acct.credential.apiKeyFile) continue
       try {
         if (readFileSync(acct.credential.apiKeyFile, 'utf8').trim() === sess.token) return acct
       } catch {
@@ -461,16 +462,12 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     return undefined
   }
 
-  function findSameIdentity(providerId: number, nickname: string): Account | undefined {
-    if (nickname === '') return undefined
-    return accounts.list().find((a) => a.providerId === providerId
-      && (a.displayName ?? '').includes(nickname))
-  }
-
-  function markWorkbuddySource(
-    acct: Account, s: { uid?: string; token: string },
+  // 给账号打上「由哪个 harness 导入 + 身份凭据」。所有渠道都打，不只是 workbuddy：
+  // importSource 是判重的分区键，缺了它下一轮删除重导就又会新建一行（问题复发）。
+  function markImportSource(
+    acct: Account, key: string, s: { uid?: string; token: string },
   ): void {
-    acct.importSource = 'workbuddy'
+    acct.importSource = key
     if (s.uid) acct.workbuddyUid = s.uid
     else delete acct.workbuddyUid
     acct.workbuddyTokenHash = workbuddyTokenHash(s.token)
