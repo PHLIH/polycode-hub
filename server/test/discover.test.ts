@@ -225,13 +225,15 @@ describe('checkZen', () => {
   // 真实假阳性（2026-09-17 实测）：GET /v1/models 是免指纹端点，71 个模型全列出
   // 只证明网络通；缺 UA/会话指纹时真正的 chat/completions 回 403 FreeTierError。
   // 旧实现把「探得到模型」当 ready，用户到手才炸。现在必须真调一次才认 ready。
-  test('列表通但真实调用 403 指纹错 → 不冒充 ready，点名缺指纹', async () => {
+  test('列表通但真实调用 403 指纹错 → 不冒充 ready，如实说明未找到指纹', async () => {
     const f = await checkZen('https://zen.example', fetchOK, 8000, async () => ({
       ok: false, kind: 'fingerprint',
       error: "upstream fingerprint (http 403): OpenCode's free tier can only be used from within OpenCode",
     }))
     expect(f.status).toBe('unreachable')
-    expect(f.detail).toContain('缺少客户端指纹')
+    expect(f.detail).toContain('未找到可用的客户端指纹')
+    // 出路按门槛从低到高：先「装并运行一次 opencode」，抓包排在后面。
+    expect(f.actions?.[0]).toContain('运行一次 opencode')
     expect(f.actions?.some((a) => a.includes('x-session-id'))).toBe(true)
   })
 
@@ -328,6 +330,20 @@ describe('opencode 指纹自动识别', () => {
     expect(got.modelID).toBe('union-alpha') // 该会话实测用过的模型
   })
 
+  // 真实缺陷（用户实测报回）：早先的正则假设 id 在 version 之前，字段序一变就
+  // 整条识别不出来 → 用户装了 opencode 却被告知「缺少客户端指纹」。
+  // 日志字段顺序是 opencode 内部实现细节，不该成为我们的假设。
+  test('不依赖字段顺序（version 在前也能识别）', () => {
+    const got = parseFingerprintFromLog('message=created version=1.20.0 id=ses_AAAAbbbb1111 slug=x')
+    expect(got?.sessionID).toBe('ses_AAAAbbbb1111')
+    expect(got?.version).toBe('1.20.0')
+  })
+
+  test('容忍 v 前缀版本号与 CRLF 换行', () => {
+    expect(parseFingerprintFromLog('message=created id=ses_AAAAbbbb1111 version=v1.18.29')?.version).toBe('1.18.29')
+    expect(parseFingerprintFromLog('message=created id=ses_AAAAbbbb1111 x version=1.18.29\r\n')?.version).toBe('1.18.29')
+  })
+
   test('无自建会话 → null（不硬凑）', () => {
     expect(parseFingerprintFromLog('nothing here')).toBeNull()
     // 只有 stream 没有 created：会话不是这个客户端建的，不能当指纹
@@ -348,6 +364,32 @@ describe('opencode 指纹自动识别', () => {
     expect(h['x-session-id']).toBe('ses_TEST')
     expect(h['x-session-affinity']).toBe('ses_TEST')
     expect(f.detail).toContain('自动识别')
+  })
+
+  // 用户报回的真实体验：没识别到指纹时，文案直接让人去「抓包」——门槛最高的一条路，
+  // 绝大多数用户不会做。应先给最省事的（装并运行一次 opencode），抓包作为最后选项。
+  test('未识别到指纹时的指引分级：先给最省事的，抓包排最后', async () => {
+    const fetchFree = (async () => new Response(
+      JSON.stringify({ data: [{ id: 'm-free' }] }), { status: 200 },
+    )) as typeof fetch
+    const f = await checkZen('https://zen.example', fetchFree, 8000,
+      async () => ({ ok: false, kind: 'fingerprint', error: 'FreeTierError' }), null)
+    expect(f.status).toBe('unreachable')
+    expect(f.actions?.[0]).toContain('运行一次 opencode') // 最省事的在前
+    expect(f.actions?.some((a) => a.includes('OPENCODE_DATA_DIR'))).toBe(true)
+    expect(f.actions?.some((a) => a.includes('抓包'))).toBe(true) // 抓包仍提供但不在首位
+  })
+
+  test('识别到但已失效时，提示重新运行客户端而非抓包', async () => {
+    const fp = { sessionID: 'ses_X', version: '1.0.0', userAgent: 'opencode/1.0.0', logPath: '/x' }
+    const fetchFree = (async () => new Response(
+      JSON.stringify({ data: [{ id: 'm-free' }] }), { status: 200 },
+    )) as typeof fetch
+    const f = await checkZen('https://zen.example', fetchFree, 8000,
+      async () => ({ ok: false, kind: 'fingerprint', error: 'FreeTierError' }), fp)
+    expect(f.detail).toContain('已失效')
+    expect(f.actions?.[0]).toContain('重扫')
+    expect(JSON.stringify(f.actions)).not.toContain('抓包')
   })
 
   test('识别不到指纹时不伪造任何头', async () => {

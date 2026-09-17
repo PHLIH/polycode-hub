@@ -560,12 +560,25 @@ export async function checkZen(
     return f
   }
   if (r.kind === 'fingerprint' || /free tier can only be used/i.test(r.error ?? '')) {
-    f.detail = `模型列表可达（${ids.length} 个），但真实调用被拒：缺少客户端指纹（${probeModel}）`
-    f.actions = [
-      '免费档只认官方客户端指纹：在 Provider 头里配 User-Agent（抓包取 opencode 真串）与 x-session-id/x-session-affinity（真实 ses_）',
-      '或设 ZEN_UA 环境变量；用 opencode 做客户端时自动透传，无需配置',
-      '否则改用付费档凭据',
-    ]
+    // 指纹已尽力自动识别过（fingerprint 有值就是识别到了，仍失败说明会话过期）。
+    // 两种情况文案不同：用户能做的事完全不一样。
+    if (fingerprint) {
+      f.detail = `模型列表可达（${ids.length} 个），但自动识别到的指纹已失效（${fingerprint.userAgent}）`
+      f.actions = [
+        '本机 opencode 客户端的会话已过期：运行一次 opencode（如 opencode run "hi"）后重扫，网关会重新读取',
+        '或改用付费档凭据',
+      ]
+    } else {
+      // 没识别到：最可能是本机没装 opencode、装了没运行过、或数据目录不在默认位置。
+      // 不要一上来就让用户「抓包」——那是门槛最高的一条路，绝大多数人不会做。
+      f.detail = `模型列表可达（${ids.length} 个），但真实调用被拒：未找到可用的客户端指纹`
+      f.actions = [
+        'Zen 免费档只接受 opencode 官方客户端的指纹。最省事：安装并运行一次 opencode（opencode run "hi"），它会写入真实指纹，再回本页重扫即可',
+        '已装但重扫仍无效？确认数据目录在默认位置，或用 OPENCODE_DATA_DIR 指定其数据目录后重启网关',
+        '若不打算用 opencode：在该 Provider 头里手填 User-Agent 与 x-session-id/x-session-affinity（抓包取真值），或设 ZEN_UA 环境变量',
+        '以上都不想：改用付费档凭据（免费档的限制与额度无关，是客户端身份校验）',
+      ]
+    }
   } else {
     f.detail = `模型列表可达（${ids.length} 个），但真实调用失败：${r.error ?? '未知原因'}`
     f.actions = ['检查 Provider 协议与模型 ID 是否正确', '到 Providers 页用「测试」逐个排查']
@@ -639,14 +652,25 @@ export function openCodeLogFiles(dirs: string[]): string[] {
 // 策略：取**最后一个**可用会话（最近一次真实运行的最可能还新鲜）；
 // 需要「自建会话」与「确实对 opencode(zen) 发起过 stream」两个证据同时成立。
 export function parseFingerprintFromLog(text: string): { sessionID: string; version: string; modelID?: string } | null {
-  // 会话自建：id 与 version 同现。version 用 [\w.]+ 而不是纯数字，兼容预发布号。
-  const created = [...text.matchAll(/message=created id=(ses_[A-Za-z0-9_-]{8,})[^\n]*?version=([\w.]+)/g)]
-  if (created.length === 0) return null
-  const last = created[created.length - 1]!
-  const sessionID = last[1]!
-  const version = last[2]!
-  // 只接受 opencode 自己解析出的语义化版本，避免抓到无关数字串。
-  if (!/^\d+\.\d+\.\d+/.test(version)) return null
+  // 会话自建：在 message=created 的那一行里同时拿到 id 与 version。
+  //
+  // 刻意**不依赖字段顺序**：早先的写法假设 `id=` 在 `version=` 之前，字段序一变
+  // （换版本、不同构建）就整条识别不出来 → 用户明明装了 opencode、却被告知
+  // 「缺少客户端指纹」。日志字段顺序是 opencode 内部实现细节，不该成为我们的假设。
+  // 逐行处理，行内独立提取两个字段。
+  let sessionID = ''
+  let version = ''
+  for (const line of text.split('\n')) {
+    if (!line.includes('message=created')) continue
+    const id = /(?:^|\s)id=(ses_[A-Za-z0-9_-]{8,})(?:\s|$)/.exec(line)
+    if (!id) continue
+    const ver = /(?:^|\s)version=v?(\d+\.\d+\.\d+[\w.-]*)(?:\s|$)/.exec(line)
+    if (!ver) continue
+    sessionID = id[1]!
+    version = ver[1]!
+    // 继续循环：取最后一次出现的（最近一次会话）
+  }
+  if (!sessionID || !version) return null
   // 旁证：该会话对 zen(opencode provider) 发过流式请求；顺带取它用过的模型。
   const used = [...text.matchAll(
     new RegExp(`message=stream providerID=opencode modelID=([^\\s]+) session\\.id=${sessionID}`, 'g'),
