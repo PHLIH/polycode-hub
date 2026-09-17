@@ -104,24 +104,23 @@ accounts: []
 #         input: [text]
 #         enabled: true
 
-# OpenCode Zen 免费档示例（2026-09-12 已实测打通：mimo/nemotron -free 模型可出字；
-# 用法：export ZEN_KEY=public，client 模型填 opencode/<模型>）：
+# OpenCode Zen 免费档示例（2026-09-17 更新：旧 x-opencode-* 四件套已变毒头，必 403；
+# 真机指纹 = 真实 UA + 真实 ses_ 会话，opencode 做客户端时网关自动透传它的）：
 # providers:
 #   - id: "zen-free"
 #     display_name: "Zen免费档"
-#     access_kind: "reverse"          # 逆向私有协议头（风险高，见 NOTICE.md 登记）
+#     access_kind: "reverse"          # 逆向客户端指纹（风险高，见 NOTICE.md 登记）
 #     risk: "high"
-#     risk_note: "逆向私有协议头；上游可随时变更；免费档按 IP 限速（FreeUsageLimitError 即撞限）"
+#     risk_note: "逆向客户端指纹；上游可随时变更；免费档按 IP 限速；ses_ 须真实有效（opencode run --print-logs 取 created id=），过期/403 就重收"
 #     stability: "beta"
-#     api: "openai-completions"      # zen 的 /v1/messages 曾 500，用 OpenAI 形态最稳
+#     api: "openai-completions"      # 仅作默认；muse-spark 系实际走 responses，网关自动探测
 #     base_url: "https://opencode.ai/zen/v1"
 #     credential:
 #       api_key_env: "ZEN_KEY"       # 值固定为 public
-#     headers:                       # 缺 x-opencode-* 即 AuthError: Missing API key
-#       x-opencode-client: "cli"
-#       x-opencode-project: "global"
-#       x-opencode-request: "msg_polycode"
-#       x-opencode-session: "ses_polycode"
+#     headers:                       # 真机指纹：UA + 会话头（与 id 同值）；不要加 x-opencode-*（毒头）
+#       User-Agent: "opencode/1.18.29 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+#       x-session-id: "ses_换成你自己的真实会话"
+#       x-session-affinity: "ses_换成你自己的真实会话"
 #     enabled: false
 #     priority: 1
 #     models:

@@ -41,6 +41,71 @@ type Lookup = (name: string) => [string, boolean]
 const defaultLookup: Lookup = (name) =>
   process.env[name] === undefined ? ['', false] : [process.env[name]!, true]
 
+// ---- OpenCode Zen 反代指纹（2026-09-17 实测结论） ----
+//
+// 上游免费档只认「官方客户端样子」的请求（否则 403 FreeTierError）：
+//   User-Agent: opencode/<ver> ai-sdk/provider-utils/<ver> runtime/bun/<ver>
+//   x-session-id / x-session-affinity: 官方客户端会话 ID（ses_…）
+// 2026-09 前用的 x-opencode-client/project/request/session 四件套现在是毒头——
+// 带了必回 403（"can only be used from within OpenCode"），真机抓包确认官方
+// 客户端（1.18.29）根本不发这四个头。
+//
+// 会话 ID 必须来自一次真实的官方客户端运行（`opencode run --print-logs` 输出的
+// created id=ses_…），跨模型、跨端点可复用；本地随机编一个通不过。
+// opencode 自己做客户端时网关直接透传它的会话头（见 proxy.sessionHintFromHeaders），
+// 其他客户端则用 Provider 静态头里的那一份。
+export const ZEN_REAL_UA = 'opencode/1.18.29 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14'
+
+// client 透传/静态配置的会话提示：id 缺省时 affinity 取 id（真机行为：两者同值）。
+export interface SessionHint {
+  id?: string
+  affinity?: string
+}
+
+function isZenUpstream(baseUrl: string): boolean {
+  try {
+    const h = new URL(baseUrl).hostname.toLowerCase()
+    return h === 'opencode.ai' || h.endsWith('.opencode.ai')
+  } catch {
+    return false
+  }
+}
+
+// 大小写不敏感的头查找（fetch 头名不敏感，但这里操作的是普通对象）。
+function findHeaderKey(h: Record<string, string>, name: string): string | undefined {
+  const want = name.toLowerCase()
+  for (const k of Object.keys(h)) if (k.toLowerCase() === want) return k
+  return undefined
+}
+
+function validSessionToken(s: string): boolean {
+  return /^[A-Za-z0-9_-]{1,128}$/.test(s)
+}
+
+// zen 指纹校准（导出供测试）：去毒头、落实会话头（透传 > 静态）；
+// defaultUA=true（即 opencode.ai 上游）且缺 UA 时补真实 UA。
+// 去毒头不限 host：x-opencode-* 是本网关早期逆向的臆测头，官方客户端从不发送，
+// 发给任何上游都没有意义，只会触发 zen 系网关的免费档拒绝。
+export function applyZenFingerprint(h: Record<string, string>, session?: SessionHint, defaultUA = true): void {
+  for (const n of ['x-opencode-client', 'x-opencode-project', 'x-opencode-request', 'x-opencode-session']) {
+    const k = findHeaderKey(h, n)
+    if (k !== undefined) delete h[k]
+  }
+  if (findHeaderKey(h, 'user-agent') === undefined && defaultUA) h['User-Agent'] = ZEN_REAL_UA
+  const staticId = findHeaderKey(h, 'x-session-id') !== undefined
+    ? (h[findHeaderKey(h, 'x-session-id')!] ?? '').trim() : ''
+  const sid = (session?.id ?? '').trim() || staticId
+  if (!validSessionToken(sid)) return // 无可用会话：不硬凑，失败信息更干净
+  const aff = (session?.affinity ?? '').trim()
+  const affKey = findHeaderKey(h, 'x-session-affinity')
+  const sidKey = findHeaderKey(h, 'x-session-id')
+  if (sidKey !== undefined) h[sidKey] = sid
+  else h['x-session-id'] = sid
+  const affVal = validSessionToken(aff) ? aff : sid
+  if (affKey !== undefined) h[affKey] = affVal
+  else h['x-session-affinity'] = affVal
+}
+
 export class Upstream {
   // 上游调用器：协议解析/自动探测、动态头铸币、出口代理分流、模型目录拉取。
   // 无状态（除 dispatcher 缓存与 autoProtocol 进程内记忆）；失败一律抛 UpstreamError。
@@ -94,18 +159,19 @@ export class Upstream {
   // 2xx → 返回响应 body 流（此后不可换源）。
   // 协议解析顺序：模型级 api → 缓存的事实协议 → Provider 默认 api；
   // 三者皆无时逐个试候选协议，首个成功者被记住。
-  async stream(p: Provider, irReq: IrRequest): Promise<ReadableStream<Uint8Array>> {
+  // session：opencode 做客户端时的会话透传（缺省用 Provider 静态头）。
+  async stream(p: Provider, irReq: IrRequest, session?: SessionHint): Promise<ReadableStream<Uint8Array>> {
     const [proto, known] = resolveProtocol(p, irReq.model)
     if (this.noAutoProtocol) {
       if (!known) {
         throw new UpstreamError(0, UPSTREAM.BAD_REQUEST, '协议未定且已关闭自动回退，无法发请求')
       }
-      return this.streamWith(p, irReq, proto)
+      return this.streamWith(p, irReq, proto, session)
     }
     let lastErr: unknown
     if (known) {
       try {
-        return await this.streamWith(p, irReq, proto)
+        return await this.streamWith(p, irReq, proto, session)
       } catch (err) {
         if (!shouldTryOtherProtocol(err)) throw err
         forgetProtocol(p.name, irReq.model) // 记住的协议失效 → 丢掉并重探
@@ -114,7 +180,7 @@ export class Upstream {
     }
     for (const cand of probeOrder(proto)) {
       try {
-        const s = await this.streamWith(p, irReq, cand)
+        const s = await this.streamWith(p, irReq, cand, session)
         rememberProtocol(p.name, irReq.model, cand)
         return s
       } catch (err) {
@@ -126,7 +192,7 @@ export class Upstream {
   }
 
   // 用指定协议打一次上游。有动态头时最多打两次：首调失败且为换 token 信号 → 重铸再打一次。
-  private async streamWith(p: Provider, irReq: IrRequest, proto: Protocol): Promise<ReadableStream<Uint8Array>> {
+  private async streamWith(p: Provider, irReq: IrRequest, proto: Protocol, session?: SessionHint): Promise<ReadableStream<Uint8Array>> {
     let body: Uint8Array
     let path: string
     try {
@@ -153,7 +219,7 @@ export class Upstream {
       try {
         resp = await this.fetch(url, {
           method: 'POST',
-          headers: this.buildHeaders(p, irReq.stream, dyn, proto),
+          headers: this.buildHeaders(p, irReq.stream, dyn, proto, session),
           body: body as never, // Node fetch 接受 Uint8Array；类型侧缺 DOM BodyInit
           dispatcher: this.dispatcherFor(p) as never,
         })
@@ -183,11 +249,14 @@ export class Upstream {
   // 用户完全看不出是自己没配凭据。宁可本地报错，也不打这种必然失败还误导人的上游请求。
   private buildHeaders(
     p: Provider, stream: boolean, dyn: Record<string, string> | null, proto: Protocol,
+    session?: SessionHint,
   ): Record<string, string> {
     const h: Record<string, string> = { 'Content-Type': 'application/json' }
     if (stream) h['Accept'] = 'text/event-stream'
     for (const [k, v] of Object.entries(p.headers ?? {})) h[k] = v
     for (const [k, v] of Object.entries(dyn ?? {})) h[k] = v
+    // zen 指纹校准必须在鉴权头落定前做：它只动 UA/会话类头，不碰 Authorization。
+    applyZenFingerprint(h, session, isZenUpstream(p.baseUrl))
     let key = ''
     if (p.credential.apiKeyEnv || p.credential.apiKeyFile) {
       const [v, ok] = credentialResolve(p.credential, this.credLookup)
@@ -321,9 +390,11 @@ export function classifyUpstreamError(status: number, body: string): string {
     // 归成 auth 会把用户引向错误方向（反复去翻/重置 API Key，而 Key 其实是好的）。
     // 已确认的两类：
     //   RegionError   —— 地区不可用（换出口代理能解）
-    //   FreeTierError —— 免费档只允许官方客户端内部使用。opencode 实测：
+    //   FreeTierError —— 免费档只认官方客户端指纹。2026-09-17 实测：
     //     "OpenCode's free tier can only be used from within OpenCode"，
-    //     **绕过网关直连上游同样 403**，与网关配置无关；出路是换付费档或换上游。
+    //     触发条件是缺 x-session-id/affinity 或带了旧的 x-opencode-* 四件套；
+    //     指纹对上后匿名 Bearer public 照常用。出路按序：先查会话头透传/
+    //     Provider 静态会话是否有效（重收一个 ses_），再考虑换付费档或换上游。
     if (/regionerror|not available in your country/i.test(body)) return UPSTREAM.BAD_REQUEST
     if (/freetiererror|free tier can only be used/i.test(body)) return UPSTREAM.BAD_REQUEST
   }

@@ -340,6 +340,53 @@ function decodeStop(raw: unknown): string[] {
   return []
 }
 
+// 解析推理强度：各方言的 effort 写法收敛为单个字符串（原样透传，不校验取值）。
+// 优先级：reasoning_effort > reasoningEffort > reasoning（字符串或 {effort}）>
+// thinking（字符串或 {effort}）> output_config.effort（Anthropic 新式误发到此端点的容错）。
+// 空串视为未提供；off/none 等关闭档也如实透传（出站侧再决定省略还是 disabled）。
+function decodeReasoningEffort(w: Record<string, unknown>): string | undefined {
+  const pick = (v: unknown): string | undefined => {
+    if (typeof v === 'string' && v.trim() !== '') return v.trim()
+    return undefined
+  }
+  const direct = pick(w['reasoning_effort']) ?? pick(w['reasoningEffort'])
+  if (direct) return direct
+  const r = w['reasoning']
+  if (typeof r === 'string' && r.trim() !== '') return r.trim()
+  if (r !== null && typeof r === 'object' && !Array.isArray(r)) {
+    const e = pick((r as Record<string, unknown>)['effort'])
+    if (e) return e
+  }
+  const t = w['thinking']
+  if (typeof t === 'string' && t.trim() !== '') return t.trim()
+  if (t !== null && typeof t === 'object' && !Array.isArray(t)) {
+    const e = pick((t as Record<string, unknown>)['effort'])
+    if (e) return e
+  }
+  const oc = w['output_config']
+  if (oc !== null && typeof oc === 'object' && !Array.isArray(oc)) {
+    const e = pick((oc as Record<string, unknown>)['effort'])
+    if (e) return e
+  }
+  return undefined
+}
+
+// 解析推理预算（token 数形态）：thinking.budget_tokens 等；>0 的有限数才收。
+function decodeThinkingBudget(w: Record<string, unknown>): number | undefined {
+  const t = w['thinking']
+  if (t !== null && typeof t === 'object' && !Array.isArray(t)) {
+    for (const k of ['budget_tokens', 'budget', 'thinking_budget']) {
+      const v = (t as Record<string, unknown>)[k]
+      if (typeof v === 'number' && Number.isFinite(v) && v > 0) return v
+    }
+  }
+  for (const k of ['thinking_budget', 'thinkingBudget', 'max_thinking_tokens']) {
+    const v = w[k]
+    if (typeof v === 'number' && Number.isFinite(v) && v > 0) return v
+  }
+  return undefined
+}
+
 // ---- wire content 序列化（IR 块 → string / 部件数组 / null）----
 
 // 中间部件形态：先收集再决定 string / 数组 wire 形态（README 约定 #10）。
@@ -384,6 +431,13 @@ interface InWireRequest {
   top_p?: unknown
   stop?: unknown // string 或数组
   stream?: boolean
+  // 推理强度：DSH 会话偏好 reasoningEffort 落在这些字段里（DeepSeek 官方即 OpenAI 兼容格式）。
+  // 必须进 IR，否则换个 harness 调档位到上游完全没效果（此前静默丢弃就是这个 bug）。
+  reasoning_effort?: unknown
+  reasoningEffort?: unknown // 少数客户端的驼峰写法，容错
+  reasoning?: unknown // 字符串或 {effort} 对象形态
+  thinking?: unknown // DeepSeek/ZAI 方言的 thinking 对象（含 effort / budget_tokens 时也收）
+  output_config?: unknown // Anthropic 新式 output_config.effort 被误发到 openai 端点时的容错
   // 未知字段容忍：JSON.parse 默认忽略（stream_options / user / frequency_penalty 等）
 }
 
@@ -474,6 +528,10 @@ class InCodec implements InboundCodec {
     if (toolChoice !== undefined) req.toolChoice = toolChoice
     const stop = decodeStop(w.stop)
     if (stop.length > 0) req.stopSequences = stop
+    const effort = decodeReasoningEffort(w as unknown as Record<string, unknown>)
+    if (effort !== undefined) req.reasoningEffort = effort
+    const budget = decodeThinkingBudget(w as unknown as Record<string, unknown>)
+    if (budget !== undefined) req.thinkingBudget = budget
     return req
   }
 
@@ -734,6 +792,11 @@ class OutCodec implements OutboundCodec {
       })
     }
     const toolChoice = outToolChoice(req.toolChoice)
+    // 推理强度透传：off/none 系关闭档在 openai-completions 无标准关闭写法，省略即回到上游默认；
+    // 其余档位原样发 reasoning_effort（DeepSeek / ZAI / OpenAI 兼容端都认这个字段）。
+    // thinkingBudget 在此协议无标准形态，不发（Anthropic 端点由 anthropicmessages 出站负责）。
+    const effort = req.reasoningEffort?.trim()
+    const effortOff = effort !== undefined && ['off', 'none', 'disabled', 'disable'].includes(effort.toLowerCase())
     return bytes(JSON.stringify({
       model: req.model,
       messages,
@@ -743,6 +806,7 @@ class OutCodec implements OutboundCodec {
       ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
       ...(req.topP !== undefined ? { top_p: req.topP } : {}),
       ...(req.stopSequences !== undefined && req.stopSequences.length > 0 ? { stop: req.stopSequences } : {}),
+      ...(effort !== undefined && effort !== '' && !effortOff ? { reasoning_effort: effort } : {}),
       // 坑位 #1：stream:true 时必须补 include_usage，否则上游不回 usage 且不报错
       ...(req.stream ? { stream: true, stream_options: { include_usage: true } } : {}),
     }))

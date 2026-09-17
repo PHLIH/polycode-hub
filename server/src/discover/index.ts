@@ -6,6 +6,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { Provider } from '../model/index.ts'
+import { ZEN_REAL_UA } from '../router/upstream.ts'
 import type { Finding } from '../adminapi/types.ts'
 
 // 状态枚举的唯一定义是 adminapi/types.ts 的 DiscoverStatus（Finding.status 用的就是它）。
@@ -244,13 +245,14 @@ function zenSuggestedProvider(baseURL: string): Provider {
   return {
     providerId: 0, name: 'opencode', state: 'active' as const, displayName: 'Zen免费档（自动发现）',
     accessKind: 'reverse', risk: 'high',
-    riskNote: '逆向私有协议头；免费档按 IP 限速',
+    riskNote: '逆向客户端指纹；免费档按 IP 限速；非 opencode 客户端需在头里配一个真实 ses_ 会话（opencode run --print-logs 取 created id=），opencode 做客户端时自动透传',
     stability: 'beta', api: 'openai-completions',
     baseUrl: baseURL.replace(/\/+$/, '') + '/v1',
     credential: { apiKeyEnv: 'ZEN_KEY' },
     headers: {
-      'x-opencode-client': 'cli', 'x-opencode-project': 'global',
-      'x-opencode-request': 'msg_polycode', 'x-opencode-session': 'ses_polycode',
+      // 真机指纹：官方客户端只发 UA + 会话头，不发 x-opencode-*（那是毒头，见 upstream.applyZenFingerprint）。
+      // 会话头优先透传客户端的；其他客户端经网关调用时用这里配的静态值。
+      'User-Agent': ZEN_REAL_UA,
     },
     priority: 1,
     models: [

@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createServer, type Server } from 'node:http'
 import { AddressInfo } from 'node:net'
-import { Upstream, joinURL, probeOrder, shouldTryOtherProtocol, resolveProtocol, egressProxyURI, buildRequestURL, classifyUpstreamError } from '../src/router/upstream.ts'
+import { Upstream, joinURL, probeOrder, shouldTryOtherProtocol, resolveProtocol, egressProxyURI, buildRequestURL, classifyUpstreamError, applyZenFingerprint, ZEN_REAL_UA } from '../src/router/upstream.ts'
 import { UpstreamError } from '../src/ir/index.ts'
 import { forgetProtocol, rememberProtocol } from '../src/model/index.ts'
 import type { Provider } from '../src/model/index.ts'
@@ -327,8 +327,7 @@ describe('withOpts 派生实例必须继承 egress 表（探测按钮真实缺�
   })
 })
 
-test('setEgresses 热更新：换表并清 dispatcher 缓存（旧表引用失效、新表生效）', async () => {
-  const { server: px, base: pbase } = await import('./helpers/one-shot-server.ts').then((m) =>
+test('setEgresses 热更新：换表并清 dispatcher 缓存（旧表引用失效、新表生效）', async () => {  const { server: px, base: pbase } = await import('./helpers/one-shot-server.ts').then((m) =>
     m.startOneShot((req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"object":"list","data":[{"id":"m"}]}') }))
   const up = new Upstream({ credLookup: () => ['', false], egresses: { old: 'http://127.0.0.1:1' } })
   const pv = prov({ baseUrl: `${pbase}/v1`, api: 'openai-completions', egress: 'old' })
@@ -337,4 +336,57 @@ test('setEgresses 热更新：换表并清 dispatcher 缓存（旧表引用失�
   expect(await up.fetchModels({ ...pv, egress: 'fresh' })).toEqual(['m'])
   await expect(up.fetchModels(pv)).rejects.toThrow(/old/) // 旧引用已随换表失效
   await new Promise<void>((r) => px.close(() => r()))
+})
+
+// zen 指纹校准（2026-09-17 真机抓包回归）：上游免费档只认官方客户端指纹，
+// 旧 x-opencode-* 四件套是毒头（带了必 403 FreeTierError），必须删；
+// 会话头按 透传 > 静态 落实，affinity 缺省跟 id。
+describe('zen 指纹校准 applyZenFingerprint', () => {
+  test('去毒头：x-opencode-* 四件套一律删除（大小写不敏感）', () => {
+    const h: Record<string, string> = {
+      'x-opencode-client': 'cli', 'X-OpenCode-Project': 'global',
+      'x-opencode-request': 'msg_x', 'x-opencode-session': 'ses_x',
+      'Content-Type': 'application/json',
+    }
+    applyZenFingerprint(h, { id: 'ses_real' })
+    expect(Object.keys(h).some((k) => k.toLowerCase().startsWith('x-opencode-'))).toBe(false)
+    expect(h['Content-Type']).toBe('application/json') // 无关头不动
+  })
+
+  test('缺 UA 时补真实 UA；已有 UA 不覆盖；非 zen 可关默认', () => {
+    const h1: Record<string, string> = {}
+    applyZenFingerprint(h1)
+    expect(h1['User-Agent']).toBe(ZEN_REAL_UA)
+    const h2: Record<string, string> = { 'user-agent': 'custom/1.0' }
+    applyZenFingerprint(h2)
+    expect(h2['user-agent']).toBe('custom/1.0')
+    const h3: Record<string, string> = {}
+    applyZenFingerprint(h3, undefined, false)
+    expect(h3['User-Agent']).toBeUndefined()
+  })
+
+  test('会话头：透传覆盖静态；affinity 缺省跟 id；静态保留', () => {
+    const h1: Record<string, string> = { 'x-session-id': 'ses_static', 'x-session-affinity': 'ses_static' }
+    applyZenFingerprint(h1, { id: 'ses_live', affinity: 'ses_live' })
+    expect(h1['x-session-id']).toBe('ses_live')
+    expect(h1['x-session-affinity']).toBe('ses_live')
+    const h2: Record<string, string> = {}
+    applyZenFingerprint(h2, { id: 'ses_live' })
+    expect(h2['x-session-id']).toBe('ses_live')
+    expect(h2['x-session-affinity']).toBe('ses_live') // 缺省跟 id（真机行为）
+    const h3: Record<string, string> = { 'x-session-id': 'ses_static' }
+    applyZenFingerprint(h3) // 无透传：静态保留并补 affinity
+    expect(h3['x-session-id']).toBe('ses_static')
+    expect(h3['x-session-affinity']).toBe('ses_static')
+  })
+
+  test('非法会话值不硬凑：透传脏值时回退静态，静态也脏则不写', () => {
+    const h1: Record<string, string> = { 'x-session-id': 'ses_static', 'x-session-affinity': 'ses_static' }
+    applyZenFingerprint(h1, { id: 'has space!' })
+    expect(h1['x-session-id']).toBe('ses_static')
+    const h2: Record<string, string> = {}
+    applyZenFingerprint(h2, { id: '' })
+    expect(h2['x-session-id']).toBeUndefined()
+    expect(h2['x-session-affinity']).toBeUndefined()
+  })
 })

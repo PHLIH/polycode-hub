@@ -244,6 +244,10 @@ class Inbound implements InboundCodec {
     if (w['tool_choice'] !== undefined && w['tool_choice'] !== null) {
       req.toolChoice = parseToolChoice(w['tool_choice'])
     }
+    // 推理强度：Responses 标准形态 reasoning: {effort}，另容错顶层 reasoning_effort /
+    // reasoningEffort / reasoning 字符串 / output_config.effort（跨协议误发）。
+    const effort = parseReasoningEffort(w)
+    if (effort !== undefined) req.reasoningEffort = effort
     return req
   }
 
@@ -631,6 +635,32 @@ function parseToolChoice(raw: unknown): ToolChoice {
   throw invalidRequest(`tool_choice 形态不合法: ${typeof raw}`)
 }
 
+// 推理强度：reasoning: {effort}（Responses 标准）为主，另容错 reasoning_effort /
+// reasoningEffort / reasoning 字符串 / output_config.effort。原样透传不校验。
+function parseReasoningEffort(w: Record<string, unknown>): string | undefined {
+  const r = w['reasoning']
+  if (typeof r === 'string' && r.trim() !== '') return r.trim()
+  if (r !== null && typeof r === 'object' && !Array.isArray(r)) {
+    const e = asString((r as Record<string, unknown>)['effort'])
+    if (e.trim() !== '') return e.trim()
+  }
+  for (const k of ['reasoning_effort', 'reasoningEffort']) {
+    const v = w[k]
+    if (typeof v === 'string' && v.trim() !== '') return v.trim()
+  }
+  const oc = w['output_config']
+  if (oc !== null && typeof oc === 'object' && !Array.isArray(oc)) {
+    const e = asString((oc as Record<string, unknown>)['effort'])
+    if (e.trim() !== '') return e.trim()
+  }
+  return undefined
+}
+
+function isOff(effort: string): boolean {
+  const v = effort.trim().toLowerCase()
+  return v === 'off' || v === 'none' || v === 'disabled' || v === 'disable'
+}
+
 // ---- 出站：IR ↔ openai-responses 上游（对齐 outbound.go） ----
 
 export function newOutbound(): OutboundCodec {
@@ -669,6 +699,10 @@ class Outbound implements OutboundCodec {
       max_output_tokens: req.maxTokens || undefined,
       temperature: req.temperature,
       top_p: req.topP,
+      // 推理强度透传：Responses 标准形态 reasoning: {effort}；off 系关闭档省略即回上游默认。
+      reasoning: req.reasoningEffort !== undefined && req.reasoningEffort.trim() !== '' && !isOff(req.reasoningEffort)
+        ? { effort: req.reasoningEffort.trim() }
+        : undefined,
       stream: req.stream || undefined,
     }
     return textEncoder.encode(JSON.stringify(wire))

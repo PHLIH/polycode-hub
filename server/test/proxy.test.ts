@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createServer, type Server } from 'node:http'
 import { AddressInfo } from 'node:net'
 import { Hono } from 'hono'
-import { Proxy, noCandidateMessage } from '../src/gateway/proxy.ts'
+import { Proxy, noCandidateMessage, sessionHintFromHeaders } from '../src/gateway/proxy.ts'
 import { DEFAULT_FIRST_BYTE_TIMEOUT_MS, DEFAULT_STREAM_IDLE_TIMEOUT_MS } from '../src/config/index.ts'
 import { Scheduler } from '../src/router/scheduler.ts'
 import { Upstream } from '../src/router/upstream.ts'
@@ -75,6 +75,13 @@ upstreamMode.streamerror = (_q, res) => {
 let flip = 0
 upstreamMode.flip = (req, res, body) => {
   if (flip++ === 0) { res.writeHead(401); res.end('auth dead'); return }
+  upstreamMode.sse!(req, res, body)
+}
+
+// 捕获发往上游的请求体（推理预设测试用），行为同 sse（非流式回 JSON）
+let lastUpstreamBody = ''
+upstreamMode.capture = (req, res, body) => {
+  lastUpstreamBody = body
   upstreamMode.sse!(req, res, body)
 }
 
@@ -189,6 +196,64 @@ describe('POST /v1/messages 流式转发（anthropic 入站 × openai-completion
     const body = (await res.json()) as { data: { id: string; object: string; owned_by: string }[] }
     // 前缀是 Provider 的 name（客户端从 /v1/models 拿到什么就填什么）
     expect(body.data).toEqual([{ id: 'p1/glm-4.6', object: 'model', owned_by: 'p1' }])
+  })
+})
+
+describe('模型推理强度预设（强制覆盖，端到端）', () => {
+  const chatBody = (over: Record<string, unknown> = {}) => ({
+    model: 'p1/m1', stream: false,
+    messages: [{ role: 'user', content: 'hi' }], ...over,
+  })
+  const pv = (modelOver: Record<string, unknown>) => provider({
+    headers: { 'x-mode': 'capture' },
+    models: [{ id: 'm1', manual: false, enabled: true, ...modelOver }],
+  })
+
+  test('有预设：客户端传 high 也被替换成 low', async () => {
+    const { app } = buildApp({ providers: [pv({ reasoningEffort: 'low' })] })
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST', body: JSON.stringify(chatBody({ reasoning_effort: 'high' })),
+    })
+    expect(res.status).toBe(200)
+    await res.json()
+    expect(JSON.parse(lastUpstreamBody).reasoning_effort).toBe('low')
+  })
+
+  test('有预设：客户端没传也按预设发', async () => {
+    const { app } = buildApp({ providers: [pv({ reasoningEffort: 'max' })] })
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST', body: JSON.stringify(chatBody()),
+    })
+    expect(res.status).toBe(200)
+    await res.json()
+    expect(JSON.parse(lastUpstreamBody).reasoning_effort).toBe('max')
+  })
+
+  test('无预设：跟随客户端透传（没传就不发）', async () => {
+    const { app } = buildApp({ providers: [pv({})] })
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST', body: JSON.stringify(chatBody({ reasoning_effort: 'high' })),
+    })
+    expect(res.status).toBe(200)
+    await res.json()
+    expect(JSON.parse(lastUpstreamBody).reasoning_effort).toBe('high')
+
+    const res2 = await app.request('/v1/chat/completions', {
+      method: 'POST', body: JSON.stringify(chatBody()),
+    })
+    expect(res2.status).toBe(200)
+    await res2.json()
+    expect(JSON.parse(lastUpstreamBody)).not.toHaveProperty('reasoning_effort')
+  })
+
+  test('预设 off：客户端传 high 也被关掉（上游收不到 reasoning_effort）', async () => {
+    const { app } = buildApp({ providers: [pv({ reasoningEffort: 'off' })] })
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST', body: JSON.stringify(chatBody({ reasoning_effort: 'high' })),
+    })
+    expect(res.status).toBe(200)
+    await res.json()
+    expect(JSON.parse(lastUpstreamBody)).not.toHaveProperty('reasoning_effort')
   })
 })
 
@@ -556,5 +621,20 @@ describe('noCandidateMessage：诊断要说出真实原因', () => {
     expect(noCandidateMessage('wb/hy4', [mk({ state: 'deleted' })])).toContain('已删除')
     expect(noCandidateMessage('wb/hy4', [mk({ state: 'paused' })])).toContain('已暂停')
     expect(noCandidateMessage('zz/hy4', [mk({})])).toContain('未知的 Provider 前缀')
+  })
+})
+
+describe('sessionHintFromHeaders（opencode 会话透传，zen 指纹）', () => {
+  const get = (m: Record<string, string>) => (n: string) => m[n]
+  test('双头同值透传；缺 affinity 时跟 id', () => {
+    expect(sessionHintFromHeaders(get({ 'x-session-id': 'ses_a', 'x-session-affinity': 'ses_a' })))
+      .toEqual({ id: 'ses_a', affinity: 'ses_a' })
+    expect(sessionHintFromHeaders(get({ 'x-session-id': 'ses_a' })))
+      .toEqual({ id: 'ses_a', affinity: 'ses_a' })
+  })
+  test('无头 / 脏值 → undefined（不透传垃圾）', () => {
+    expect(sessionHintFromHeaders(get({}))).toBeUndefined()
+    expect(sessionHintFromHeaders(get({ 'x-session-id': 'has space!' }))).toBeUndefined()
+    expect(sessionHintFromHeaders(get({ 'x-session-id': '' }))).toBeUndefined()
   })
 })

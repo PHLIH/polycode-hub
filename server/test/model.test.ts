@@ -3,13 +3,16 @@ import { readFileSync } from 'node:fs'
 import {
   accountEffectiveStatus,
   accountHealth,
+  applyReasoningPreset,
   capabilitiesFrom,
   credentialResolve,
   looksFree,
   modelEffAPI,
+  normalizeReasoningEffort,
   providerValidate,
   riskAllowed,
   supportsImage,
+  validReasoningEffort,
   forgetProtocol,
   autoProtocol,
   rememberProtocol,
@@ -106,6 +109,32 @@ describe('Model 目录条目', () => {
   test('supportsImage 只认显式 image 声明', () => {
     expect(supportsImage(m({ input: [] }))).toBe(false)
     expect(supportsImage(m({ input: ['text', 'image'] }))).toBe(true)
+  })
+
+  test('推理预设校验：大小写收敛、非法值拒绝', () => {
+    expect(validReasoningEffort('high')).toBe(true)
+    expect(validReasoningEffort('HIGH')).toBe(true)
+    expect(validReasoningEffort('ultra')).toBe(false)
+    expect(normalizeReasoningEffort(' High ')).toBe('high')
+    expect(normalizeReasoningEffort('ultra')).toBeUndefined()
+    expect(normalizeReasoningEffort('')).toBeUndefined()
+  })
+
+  test('providerValidate 点名非法规模型预设', () => {
+    expect(providerValidate(p({ models: [m({ reasoningEffort: 'high' })] }))).toBeUndefined()
+    expect(providerValidate(p({ models: [m({ id: 'm9', reasoningEffort: 'ultra' })] }))).toMatch(/m9/)
+  })
+
+  test('applyReasoningPreset：有预设强制覆盖并清 budget，无预设跟随客户端', () => {
+    const req = { reasoningEffort: 'high', thinkingBudget: 10000 }
+    // 强制覆盖：客户端 high + budget 都被 low 替换
+    expect(applyReasoningPreset(req, m({ reasoningEffort: 'low' }))).toEqual({
+      reasoningEffort: 'low', thinkingBudget: undefined,
+    })
+    // 原请求对象不动（返回的是副本）
+    expect(req).toEqual({ reasoningEffort: 'high', thinkingBudget: 10000 })
+    // 无预设：原样返回
+    expect(applyReasoningPreset(req, m({}))).toBe(req)
   })
 
   test('capabilitiesFrom：modalities 优先、vision 收敛为 image、无声明返回 null', () => {

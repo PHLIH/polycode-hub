@@ -100,6 +100,12 @@ class InCodec implements InboundCodec {
     if (isObj(w.tool_choice)) {
       req.toolChoice = { mode: str(w.tool_choice.type) as ToolChoiceMode, name: nonEmpty(str(w.tool_choice.name)) }
     }
+    // 推理强度：Anthropic 新式 output_config.effort + 旧式 thinking.budget_tokens，
+    // 另容错 OpenAI 方言 reasoning_effort / reasoning.effort 被发到此端点。
+    // thinking.type=disabled 记为 off（关闭档），出站侧再映射回 disabled。
+    const { effort, budget } = parseReasoning(w)
+    if (effort !== undefined) req.reasoningEffort = effort
+    if (budget !== undefined) req.thinkingBudget = budget
     return req
   }
 
@@ -215,6 +221,41 @@ function parseImageSource(s: Obj): ImageSource {
     default:
       throw new Error(`anthropic-messages: 未知图片来源 ${JSON.stringify(str(s.type))}`)
   }
+}
+
+// 推理强度解析：新式 output_config.effort / 旧式 thinking.budget_tokens /
+// OpenAI 方言 reasoning_effort（跨协议误发容错）。原样透传不校验取值。
+function parseReasoning(w: Obj): { effort?: string; budget?: number } {
+  let effort: string | undefined
+  let budget: number | undefined
+  if (isObj(w.output_config)) {
+    const e = str(w.output_config.effort).trim()
+    if (e !== '') effort = e
+  }
+  if (isObj(w.thinking)) {
+    const t = str(w.thinking.type).trim().toLowerCase()
+    if (t === 'disabled') effort ??= 'off'
+    else if (t === 'adaptive') {
+      const e = str(w.thinking.effort).trim()
+      if (e !== '') effort ??= e
+    }
+    const b = num(w.thinking.budget_tokens)
+    if (b !== undefined && Number.isFinite(b) && b > 0) budget = b
+  }
+  if (effort === undefined) {
+    const r = str(w.reasoning_effort).trim()
+    if (r !== '') effort = r
+    else if (isObj(w.reasoning)) {
+      const e = str(w.reasoning.effort).trim()
+      if (e !== '') effort = e
+    }
+  }
+  return { ...(effort !== undefined ? { effort } : {}), ...(budget !== undefined ? { budget } : {}) }
+}
+
+function isOffEffort(effort: string): boolean {
+  const v = effort.trim().toLowerCase()
+  return v === 'off' || v === 'none' || v === 'disabled' || v === 'disable'
 }
 
 // ---- 入站序列化：IR → client wire ----
@@ -344,6 +385,20 @@ class OutCodec implements OutboundCodec {
     if (req.topP !== undefined) w.top_p = req.topP
     if (req.stopSequences?.length) w.stop_sequences = req.stopSequences
     if (req.stream) w.stream = true // stream:false 时省略 stream 字段（W2 契约 §8）
+    // 推理强度透传：budget 优先走旧式 thinking.enabled（老 Claude 只认这个）；
+    // 无 budget 时走新式 adaptive + output_config.effort（Opus 4.7+/Sonnet 必需）；
+    // off 系关闭档显式 thinking.disabled（缺省即关闭，不发也行，显式更明确）。
+    if (req.thinkingBudget !== undefined && Number.isFinite(req.thinkingBudget) && req.thinkingBudget > 0) {
+      w.thinking = { type: 'enabled', budget_tokens: req.thinkingBudget }
+    } else if (req.reasoningEffort !== undefined && req.reasoningEffort.trim() !== '') {
+      const effort = req.reasoningEffort.trim()
+      if (isOffEffort(effort)) {
+        w.thinking = { type: 'disabled' }
+      } else {
+        w.thinking = { type: 'adaptive' }
+        w.output_config = { effort }
+      }
+    }
     if (req.tools?.length) {
       w.tools = req.tools.map((t) => ({
         name: t.name,

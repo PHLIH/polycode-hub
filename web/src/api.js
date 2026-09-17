@@ -119,6 +119,9 @@ export const api = {
   // 改单个模型的出口代理（空字符串 = 继承 Provider 默认）
   updateProviderModelEgress: (pid, modelId, egress) =>
     req('PUT', `/admin/api/providers/${encodeURIComponent(pid)}/models/${encodeURIComponent(modelId)}/egress`, { egress }),
+  // 改单个模型的推理强度预设（强制覆盖客户端；空字符串 = 清掉，跟随客户端）
+  updateProviderModelReasoningEffort: (pid, modelId, reasoningEffort) =>
+    req('PUT', `/admin/api/providers/${encodeURIComponent(pid)}/models/${encodeURIComponent(modelId)}/reasoning-effort`, { reasoningEffort }),
   // 开关单个模型：对外暴露（/v1/models）、路由、测试候选都以它为准
   updateProviderModelEnabled: (pid, modelId, enabled) =>
     req('PUT', `/admin/api/providers/${encodeURIComponent(pid)}/models/${encodeURIComponent(modelId)}/enabled`, { enabled }),

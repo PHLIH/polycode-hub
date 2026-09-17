@@ -57,8 +57,24 @@ export interface IrRequest {
   temperature?: number
   topP?: number
   stopSequences?: string[]
+  // 推理强度：原样透传的档位名（low / medium / high / max / minimal / xhigh / off / none …）。
+  // DSH 侧是会话偏好 reasoningEffort，最终落在各协议的 reasoning_effort / reasoning.effort /
+  // output_config.effort 里；网关不校验取值、只透传（未知值也透传，由上游决定是否接受）。
+  // 缺省 = 客户端没说，上游用自己的默认档（DeepSeek 系默认 high）。
+  reasoningEffort?: string
+  // 推理预算（token 数形态）：Anthropic 旧式 budget_tokens 等。
+  // 与 reasoningEffort 正交、可并存；各出站 codec 只发自己协议认识的那个，不互相换算。
+  thinkingBudget?: number
   stream: boolean
   created?: number
+}
+
+// reasoningEffort 是否表示「关闭思考」（DSH 的 off / OpenAI 的 none / Anthropic disabled）。
+// 大小写不敏感；网关用它决定出站时省略还是显式 disabled，不做档位合法性校验。
+export function isReasoningOff(effort?: string): boolean {
+  if (!effort) return false
+  const v = effort.trim().toLowerCase()
+  return v === 'off' || v === 'none' || v === 'disabled' || v === 'disable'
 }
 
 export type StopReason = 'end_turn' | 'max_tokens' | 'tool_use' | 'content_filter'

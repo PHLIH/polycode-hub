@@ -14,6 +14,9 @@ const emit = defineEmits(['test', 'reload', 'models', 'edit', 'remove'])
 const open = ref(false)
 
 const PROTOCOLS = ['openai-completions', 'openai-responses', 'anthropic-messages']
+// 推理强度预设档位（DSH 档位体系）：空 = 跟随客户端，off = 强制关闭思考，
+// 其余强制覆盖客户端档位。网关原样透传给上游，不校验上游是否接受。
+const EFFORTS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 const KIND_LABELS = {
   official: '官方 API',
   'session-reuse': '复用登录态',
@@ -139,6 +142,10 @@ function egressValue(p, id) {
   const m = modelOf(p, id)
   return (m && m.egress) || ''
 }
+function effortValue(p, id) {
+  const m = modelOf(p, id)
+  return (m && m.reasoningEffort) || ''
+}
 // 就地回填行内模型：改完立刻反映在下拉上，不用整表重拉
 function patchRowModel(p, id, key, val) {
   const m = modelOf(p, id)
@@ -160,6 +167,16 @@ async function setModelEgress(p, id, eg) {
     await api.updateProviderModelEgress(p.providerId, id, eg)
     patchRowModel(p, id, 'egress', eg)
     ElMessage.success(`${id} 出口 → ${eg || '直连'}`)
+  } catch (e) { ElMessage.error(e.message) }
+}
+
+// 模型推理强度预设：配上即强制覆盖客户端档位（含 DSH 的 reasoningEffort），
+// 清空则回到跟随客户端透传。off = 强制关闭思考。
+async function setModelEffort(p, id, effort) {
+  try {
+    await api.updateProviderModelReasoningEffort(p.providerId, id, effort)
+    patchRowModel(p, id, 'reasoningEffort', effort)
+    ElMessage.success(`${id} 推理强度 → ${effort || '跟随客户端'}`)
   } catch (e) { ElMessage.error(e.message) }
 }
 
@@ -361,6 +378,12 @@ async function toggle() {
             <el-option v-for="e in egresses" :key="e.id" :value="e.id" :label="e.id" />
           </el-select>
 
+          <el-select :model-value="effortValue(p, m.id)" size="small" class="lane-sel sm"
+            placeholder="强度·跟随" :title="effortValue(p, m.id) ? `推理强度预设 ${effortValue(p, m.id)}（强制覆盖客户端）` : '推理强度：跟随客户端'"
+            clearable filterable @change="v => setModelEffort(p, m.id, v || '')">
+            <el-option v-for="e in EFFORTS" :key="e" :value="e" :label="e" />
+          </el-select>
+
           <span class="lane-detect">
             <button class="act tiny" :class="{ busy: detecting[keyOf(p, m.id)] }"
               :title="detecting[keyOf(p, m.id)] ? '正在探测，点此取消' : '探测这个模型的协议与可用性'"
@@ -555,6 +578,8 @@ async function toggle() {
 /* 安静下拉：无边框无底色，只留文字；hover/focus 才显形。
    协议/出口是配一次长期不动的，不配拥有两个常驻框。 */
 .lane-sel { flex: 0 0 176px; width: 176px; }
+/* 强度下拉只放 7 个短档位，不需要协议下拉那么宽 */
+.lane-sel.sm { flex-basis: 128px; width: 128px; }
 .lane-sel :deep(.el-select__wrapper) {
   background: none; box-shadow: none; border: 1px solid transparent;
   border-radius: var(--r-ctl); min-height: 26px; padding: 0 8px;
@@ -608,6 +633,7 @@ async function toggle() {
 @media (max-width: 1100px) {
   .lane-note { width: 120px; }
   .lane-sel { flex-basis: 140px; width: 140px; }
+  .lane-sel.sm { flex-basis: 112px; width: 112px; }
   .url, .proto { max-width: 20ch; }
 }
 @media (max-width: 820px) {

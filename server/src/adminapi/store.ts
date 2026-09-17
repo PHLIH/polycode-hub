@@ -40,6 +40,9 @@ function cleanModel(m: Model): Model {
   if (typeof m.displayName === 'string') out.displayName = m.displayName
   if (typeof m.note === 'string' && m.note !== '') out.note = m.note
   if (typeof m.egress === 'string' && m.egress !== '') out.egress = m.egress
+  if (typeof m.reasoningEffort === 'string' && m.reasoningEffort.trim() !== '') {
+    out.reasoningEffort = m.reasoningEffort.trim().toLowerCase()
+  }
   if (typeof m.contextWindow === 'number') out.contextWindow = m.contextWindow
   if (typeof m.maxOutputTokens === 'number') out.maxOutputTokens = m.maxOutputTokens
   if (Array.isArray(m.input) && m.input.length > 0) out.input = [...m.input]

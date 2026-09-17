@@ -9,9 +9,9 @@ import {
   ERR, accuracyWorst, getInbound, getOutbound, irError, UpstreamError, UPSTREAM,
   type InboundCodec, type IrError, type Protocol, type StreamEvent,
 } from '../ir/index.ts'
-import { resolveProtocol, estimateRequestTokens, type Scheduler, type Upstream } from '../router/index.ts'
+import { resolveProtocol, estimateRequestTokens, type Scheduler, type Upstream, type SessionHint } from '../router/index.ts'
 import type { AccountPool } from '../pool/account.ts'
-import { accountEffectiveStatus, type Account, type Provider, type UsageLog, type UsageStatus } from '../model/index.ts'
+import { accountEffectiveStatus, applyReasoningPreset, type Account, type Provider, type UsageLog, type UsageStatus } from '../model/index.ts'
 import {
   DEFAULT_FIRST_BYTE_TIMEOUT_MS, DEFAULT_STREAM_IDLE_TIMEOUT_MS, type Config,
 } from '../config/index.ts'
@@ -40,6 +40,18 @@ export function bearerMatch(authHeader: string | undefined, key: string): boolea
   const want = Buffer.from(key)
   if (got.length !== want.length) return false
   return timingSafeEqual(got, want)
+}
+
+// opencode 客户端的会话透传（zen 免费档指纹的一部分）。
+// opencode 发出的每个请求都带 x-session-id/x-session-affinity（同值 ses_…）；
+// 网关把它原样递给上游，上游才认这是"官方客户端内部"流量。非 opencode 客户端
+// 不带这两个头时返回 undefined，上游侧回退到 Provider 静态头里的那一份。
+// 只收字母数字/下划线/连字符（≤128）：透传的是上游鉴别依据，不收脏值。
+export function sessionHintFromHeaders(get: (name: string) => string | undefined): SessionHint | undefined {
+  const id = (get('x-session-id') ?? '').trim()
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)) return undefined
+  const aff = (get('x-session-affinity') ?? '').trim()
+  return { id, affinity: /^[A-Za-z0-9_-]{1,128}$/.test(aff) ? aff : id }
 }
 
 // 把最后一个上游错误映射为对 client 的规范错误。
@@ -238,12 +250,17 @@ export class Proxy {
 
     // 指定账号（x-polycode-account）：不轮询、不换号，失败即报错。
     const pinnedId = (c.req.header('x-polycode-account') ?? '').trim()
+    // opencode 客户端自带官方会话头：有就透传（zen 指纹），没有就用 Provider 静态配置。
+    const session = sessionHintFromHeaders((n) => c.req.header(n))
     const start = Date.now()
-    if (pinnedId) return this.servePinned(inb, p, irReq, start, pinnedId, cands)
+    if (pinnedId) return this.servePinned(inb, p, irReq, start, pinnedId, cands, session)
 
     let lastErr: UpstreamError | undefined
     let lastAcctId = '' // 最后尝试的账号（兜底失败账也要归因到账号，ACCOUNT-HEALTH）
     let locked: LockedUpstream | undefined
+    // 锁定那次实际发出的请求：候选 Provider 的模型预设可能各不相同，forward 的用量
+    // 归因（modelId/stream）与它保持一致；无预设时就是 irReq 本体。
+    let lockedReq = irReq
 
     // 用指定账号（null = Provider 级凭据）尝试一个候选；成功则锁定（上游 2xx 头已到，
     // 首字节闸门尚未过：forward() 会先等首个真实事件再承诺 200，此后才禁止换源）。
@@ -251,9 +268,12 @@ export class Proxy {
       const pvv: Provider = acct ? { ...pv, credential: acct.credential } : { ...pv } // 账号 JWT 覆盖 Provider 凭据
       const [m] = this.sched.modelOf(pv.providerId, irReq.model)
       if (m.egress) pvv.egress = m.egress // 模型级出口覆盖 Provider 级（未声明的模型继承 Provider）
+      // 模型级推理预设（强制覆盖）：配了就替换客户端档位，没配跟随客户端。
+      const effReq = applyReasoningPreset(irReq, m)
       try {
-        const stream = await this.up.stream(pvv, irReq)
+        const stream = await this.up.stream(pvv, effReq, session)
         locked = { stream, provider: pvv, acctId: acct?.id ?? '' }
+        lockedReq = effReq
         return true
       } catch (err) {
         const ue = err instanceof UpstreamError
@@ -290,7 +310,7 @@ export class Proxy {
       if (locked) break
     }
 
-    if (locked) return this.forward(inb, p, locked, irReq, start)
+    if (locked) return this.forward(inb, p, locked, lockedReq, start)
 
     // 全部候选失败：记一笔失败账（tokens 为 0）——轮询路径流式失败的兜底落账点
     // （指定账号路径见 servePinned，转发中失败见 forward 的各 logUsage）。
@@ -316,7 +336,7 @@ export class Proxy {
   private async servePinned(
     inb: InboundCodec, p: Protocol,
     irReq: import('../ir/index.ts').IrRequest, start: number,
-    pinnedId: string, cands: Provider[],
+    pinnedId: string, cands: Provider[], session?: SessionHint,
   ): Promise<Response> {
     const acct = this.accounts?.get(pinnedId)
     if (!acct) {
@@ -337,9 +357,10 @@ export class Proxy {
     const pvv: Provider = { ...pv, credential: acct.credential }
     const [m] = this.sched.modelOf(pv.providerId, irReq.model)
     if (m.egress) pvv.egress = m.egress
+    const effReq = applyReasoningPreset(irReq, m)
     let stream: ReadableStream<Uint8Array>
     try {
-      stream = await this.up.stream(pvv, irReq)
+      stream = await this.up.stream(pvv, effReq, session)
     } catch (err) {
       const ue = err instanceof UpstreamError
         ? err
@@ -360,7 +381,7 @@ export class Proxy {
       const irErr = mapUpstreamError(ue)
       return writeIrErrorStatus(inb, irErr, irErr.httpStatus)
     }
-    return this.forward(inb, p, { stream, provider: pvv, acctId: acct.id }, irReq, start)
+    return this.forward(inb, p, { stream, provider: pvv, acctId: acct.id }, effReq, start)
   }
 
   // 已锁定上游后：流式逐事件转发，非流式整体转换（此后绝不能换源）。

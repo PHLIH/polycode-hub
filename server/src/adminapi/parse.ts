@@ -41,6 +41,10 @@ function parseModel(v: unknown): Model | undefined {
   if (typeof v.displayName === 'string') m.displayName = v.displayName
   if (typeof v.note === 'string' && v.note !== '') m.note = v.note
   if (typeof v.egress === 'string' && v.egress !== '') m.egress = v.egress
+  // 推理预设只收敛大小写：非法值原样保留，由 providerValidate 点名报错，不静默吞掉。
+  if (typeof v.reasoningEffort === 'string' && v.reasoningEffort.trim() !== '') {
+    m.reasoningEffort = v.reasoningEffort.trim().toLowerCase()
+  }
   if (typeof v.contextWindow === 'number') m.contextWindow = v.contextWindow
   if (typeof v.maxOutputTokens === 'number') m.maxOutputTokens = v.maxOutputTokens
   const input = strArr(v.input)

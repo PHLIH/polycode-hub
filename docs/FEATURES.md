@@ -144,7 +144,7 @@
 | `zcode` | 仅 `statSync` 安装目录存在即 unknown（`checkZCode:222-239`，`zCodeSearchDirs:87-91`）；登录态无法本地判定，指引走 OAuth。 |
 | `opencode-zen` | 连通探针 `GET {base}/v1/models` 带 `Bearer public`（`checkZen:264-297`），200 即 ready；默认 `https://opencode.ai/zen`。 |
 
-一键导入的 Provider 草稿：WorkBuddy（`wb-auto`，openai-completions，`copilot.tencent.com/v2`，`headers X-Product/X-Domain`，模型 `hy3-preview`）与 Zen（`zen-auto`，openai-completions，`zen/v1`，`x-opencode-*` 四头，模型 `mimo-v2.5-free` / `nemotron-3-ultra-free`）——见 `discover/index.ts:136-148,243-261`。
+一键导入的 Provider 草稿：WorkBuddy（`wb-auto`，openai-completions，`copilot.tencent.com/v2`，`headers X-Product/X-Domain`，模型 `hy3-preview`）与 Zen（`zen-auto`，openai-completions，`zen/v1`，真机指纹 `User-Agent` + `x-session-id`/`x-session-affinity`，模型 `mimo-v2.5-free` / `nemotron-3-ultra-free`）——见 `discover/index.ts:136-148,243-261`。注意：旧 `x-opencode-*` 四头自 2026-09 起是毒头（带了必 403），已移除，见 `router/upstream.ts applyZenFingerprint`。
 
 ## 9. 用量统计口径
 

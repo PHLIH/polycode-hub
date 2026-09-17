@@ -29,6 +29,26 @@ export type Stability = 'stable' | 'beta' | 'experimental'
 
 const STABILITIES: Stability[] = ['stable', 'beta', 'experimental']
 
+// 推理强度档位（模型级预设的合法值）：DSH 档位体系 + OpenAI 的 none。
+// 空 = 未设置（跟随客户端透传）；off/none = 强制关闭思考。
+export type ReasoningEffort = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'none'
+
+export const REASONING_EFFORTS: ReasoningEffort[] = [
+  'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'none',
+]
+
+export function validReasoningEffort(v: string): v is ReasoningEffort {
+  return (REASONING_EFFORTS as string[]).includes(v.trim().toLowerCase())
+}
+
+// 收敛成规范小写；非法/非字符串回 undefined（调用方决定是报错还是忽略）。
+export function normalizeReasoningEffort(v: unknown): ReasoningEffort | undefined {
+  if (typeof v !== 'string') return undefined
+  const t = v.trim().toLowerCase()
+  if (t === '') return undefined
+  return validReasoningEffort(t) ? (t as ReasoningEffort) : undefined
+}
+
 // CredentialRef：凭据不落明文，只存环境变量名或密钥文件路径。
 // 文件引用的值每次请求现读：改文件即换凭据，进程不重启（热轮换）。
 export interface CredentialRef {
@@ -75,6 +95,9 @@ export interface Model {
   input?: string[] // ["text"] 或 ["text","image"]
   api?: Protocol // 覆盖 Provider 级 api（空 = 继承）
   egress?: string // 覆盖 Provider 级出口代理（空 = 继承；EGRESS-SPIKE §7 粒度拍板：精确到模型）
+  // 模型级推理强度预设（强制覆盖语义）：配了就听模型的，客户端传什么都被替换；
+  // 空 = 未设置，跟随客户端透传。off/none = 强制关闭思考。
+  reasoningEffort?: string
   // 备注：一句话运维知识（如「23 点后才免费，白天用会扣额度」）。
   // 与 displayName 分工不同——displayName 是"叫什么"，note 是"要注意什么"。
   note?: string
@@ -84,6 +107,16 @@ export interface Model {
 
 export function modelEffAPI(m: Model, providerAPI: Protocol): Protocol {
   return m.api ? m.api : providerAPI
+}
+
+// 模型预设应用到待发请求（强制覆盖）：有预设就替换客户端档位，同时清掉客户端带的
+// budget——否则 Anthropic 出站优先走旧式 budget，预设会被静默架空；无预设原样返回。
+export function applyReasoningPreset<T extends { reasoningEffort?: string; thinkingBudget?: number }>(
+  req: T, m: Model | undefined,
+): T {
+  const preset = m?.reasoningEffort?.trim()
+  if (!preset) return req
+  return { ...req, reasoningEffort: preset, thinkingBudget: undefined }
 }
 
 export function supportsImage(m: Model): boolean {
@@ -174,6 +207,12 @@ export function providerValidate(p: Provider): string | undefined {
     return `provider ${p.name}: api "${p.api}" 非法（空 = 自动探测；可选 anthropic-messages / openai-completions / openai-responses）`
   }
   if (!p.baseUrl) return `provider ${p.name}: base_url 不能为空`
+  for (const m of p.models ?? []) {
+    if (m.reasoningEffort !== undefined && m.reasoningEffort.trim() !== '' && !validReasoningEffort(m.reasoningEffort)) {
+      return `provider ${p.name} 模型 ${m.id}: reasoning_effort "${m.reasoningEffort}" 非法`
+        + `（允许 ${REASONING_EFFORTS.join(' / ')}，或留空 = 跟随客户端）`
+    }
+  }
   if (p.dynamicHeaders) {
     if (!p.dynamicHeaders.command) {
       return `provider ${p.name}: dynamic_headers.command 不能为空`
