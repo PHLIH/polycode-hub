@@ -182,16 +182,18 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
         `还没有接管 ${key} 的 Provider，先「一键导入」采用它，再导账号`)
     }
     // 服务端读 token → 写凭据文件（0600）→ 建 account（只存文件引用）。
-    let token: string
+    // workbuddy 单账号导入同样打来源标记，否则账号页的「签到」（自动登录）按钮
+    // 永不显示——该按钮只认 importSource === 'workbuddy'（见 api.ts checkin）。
+    let sess: { token: string; uid?: string }
     try {
-      token = readSession(tokenPath).token
+      sess = readSession(tokenPath)
     } catch (e) {
       const msg = (e as Error).message
       return errRes(c, 400, ERR.INVALID_REQUEST,
         msg === '登录态文件不含有效 accessToken' ? msg : `读取登录态失败: ${msg}`)
     }
     try {
-      writeFile0600(credentialFile, token)
+      writeFile0600(credentialFile, sess.token)
     } catch (e) {
       return errRes(c, 500, ERR.API, `写凭据文件失败: ${(e as Error).message}`)
     }
@@ -203,6 +205,7 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
       status: 'available',
       fails: 0,
     }
+    if (key === 'workbuddy') markWorkbuddySource(acct, sess)
     accounts.put(acct)
     changed()
     return ok(c, 201, acct)

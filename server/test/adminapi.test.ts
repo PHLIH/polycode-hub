@@ -117,6 +117,7 @@ interface BuildOpts {
   notify?: () => void
   sidecar?: Hono
   projects?: Hono
+  workbuddyCheckinFetch?: typeof fetch
 }
 
 function build(o: BuildOpts = {}): Hono {
@@ -136,6 +137,7 @@ function build(o: BuildOpts = {}): Hono {
     notify: o.notify,
     sidecar: o.sidecar,
     projects: o.projects,
+    workbuddyCheckinFetch: o.workbuddyCheckinFetch,
   })
 }
 
@@ -1533,6 +1535,11 @@ describe('discover/import-account（对齐 Go import_account_test.go）', () => 
     const credPath = join(process.cwd(), 'config', 'credentials', 'wb-jwt-x')
     expect(readFileSync(credPath, 'utf8')).toBe(token)
     expect(statSync(credPath).mode & 0o777).toBe(0o600)
+    // 单账号导入同样打来源标记：账号页「签到」（自动登录）按钮只认它，
+    // 不打标 = 导进来也点不了签到（此前只有 quick-import 打标）。
+    expect(acct.importSource).toBe('workbuddy')
+    expect(acct.workbuddyUid).toBe('uid-副号A')
+    expect(acct.workbuddyTokenHash).toBe(workbuddyTokenHash(token))
   })
 
   test('credentialFile 越界一律 400', async () => {
@@ -1733,6 +1740,96 @@ describe('discover/quick-import（对齐 Go quickimport_test.go）', () => {
     expect(((await res.json()) as { error: { message: string } }).error.message).toContain('先登录')
     expect((await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: { key: 'nope' } })).status).toBe(404)
     expect((await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: {} })).status).toBe(400)
+  })
+})
+
+// ---- accounts/checkin（WorkBuddy 自动登录：账号页「签到」按钮，只认一键导入账号） ----
+
+describe('accounts/checkin（WorkBuddy 签到，上游调用经 workbuddyCheckinFetch 注入桩）', () => {
+  const TOKEN = 'wb-checkin-token'
+  // 真实 WorkBuddy uid 是 36 位 ASCII（UUID 形态，见登录态 account.uid）；
+  // checkin 把它放进 X-User-Id 请求头，含中文/空格的 uid 发不出去，接口会 400 拒收——
+  // 所以夹具必须用 ASCII uid，不能像 makeAuthFile 那样拿中文昵称拼 uid。
+  const UID = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890'
+  const ENV = 'WB_CHECKIN_TEST_TOKEN'
+  // 一键导入形态的账号：importSource + uid + token 指纹三件套齐（按钮只给这种账号显示）。
+  const wbAccount = (wbProviderId: number, over: Partial<Account> = {}): Account => ({
+    id: 'wb-1', providerId: wbProviderId, displayName: '主号',
+    credential: { apiKeyEnv: ENV }, status: 'available', fails: 0,
+    importSource: 'workbuddy', workbuddyUid: UID, workbuddyTokenHash: workbuddyTokenHash(TOKEN),
+    ...over,
+  })
+  const jsonFetch = (status: number, body: unknown, capture?: { url?: string; init?: RequestInit }): typeof fetch =>
+    (async (url: string | URL | Request, init?: RequestInit) => {
+      if (capture && typeof url === 'string') { capture.url = url; capture.init = init }
+      return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+    }) as typeof fetch
+  const withEnv = async (fn: () => Promise<void>): Promise<void> => {
+    const prev = process.env[ENV]
+    process.env[ENV] = TOKEN
+    try { await fn() } finally {
+      if (prev === undefined) delete process.env[ENV]
+      else process.env[ENV] = prev
+    }
+  }
+
+  test('签到成功：200 accepted，且带上导入登录态的 Authorization/X-User-Id', async () => {
+    await withEnv(async () => {
+      const wb = mkProviderFixed({ name: 'wb-auto' })
+      const capture: { url?: string; init?: RequestInit } = {}
+      const call = caller(build({
+        providers: [wb], accounts: [wbAccount(wb.providerId)],
+        workbuddyCheckinFetch: jsonFetch(200, { code: 0, msg: 'OK' }, capture),
+      }))
+      const res = await call('POST', '/admin/api/accounts/wb-1/checkin', { key: 'secret' })
+      expect(res.status).toBe(200)
+      expect(await res.json()).toEqual({ status: 'accepted', message: 'WorkBuddy 已接受本次签到请求' })
+      expect(capture.url).toBe('https://copilot.tencent.com/billing/meter/daily-checkin')
+      const headers = capture.init?.headers as Record<string, string>
+      expect(headers.Authorization).toBe(`Bearer ${TOKEN}`)
+      expect(headers['X-User-Id']).toBe(UID)
+    })
+  })
+
+  test('今天已签到：上游 400/code 10001 → 200 already_checked_in', async () => {
+    await withEnv(async () => {
+      const wb = mkProviderFixed({ name: 'wb-auto' })
+      const call = caller(build({
+        providers: [wb], accounts: [wbAccount(wb.providerId)],
+        workbuddyCheckinFetch: jsonFetch(400, { code: 10001, msg: '今天已签到，请明天再来' }),
+      }))
+      const res = await call('POST', '/admin/api/accounts/wb-1/checkin', { key: 'secret' })
+      expect(res.status).toBe(200)
+      expect(await res.json()).toEqual({ status: 'already_checked_in', message: '今天已签到，请明天再来' })
+    })
+  })
+
+  test('门禁：未知账号 404；非一键导入账号 400；凭据变更 400；登录态失效 502', async () => {
+    await withEnv(async () => {
+      const wb = mkProviderFixed({ name: 'wb-auto' })
+      const manual: Account = {
+        id: 'manual', providerId: wb.providerId, displayName: '手建',
+        credential: { apiKeyEnv: ENV }, status: 'available', fails: 0,
+      }
+      const stale = wbAccount(wb.providerId, {
+        id: 'wb-stale', workbuddyTokenHash: workbuddyTokenHash('rotated-elsewhere'),
+      })
+      const call = caller(build({
+        providers: [wb], accounts: [wbAccount(wb.providerId), manual, stale],
+        workbuddyCheckinFetch: jsonFetch(401, { code: 401, msg: 'unauthorized' }),
+      }))
+      expect((await call('POST', '/admin/api/accounts/nope/checkin', { key: 'secret' })).status).toBe(404)
+      const nonWb = await call('POST', '/admin/api/accounts/manual/checkin', { key: 'secret' })
+      expect(nonWb.status).toBe(400)
+      expect(((await nonWb.json()) as { error: { message: string } }).error.message).toContain('仅支持一键导入')
+      const changed = await call('POST', '/admin/api/accounts/wb-stale/checkin', { key: 'secret' })
+      expect(changed.status).toBe(400)
+      expect(((await changed.json()) as { error: { message: string } }).error.message).toContain('凭据缺失或已变更')
+      // token 指纹对上才会走到上游：401/403 转 502 并指引重新登录导入。
+      const expired = await call('POST', '/admin/api/accounts/wb-1/checkin', { key: 'secret' })
+      expect(expired.status).toBe(502)
+      expect(((await expired.json()) as { error: { message: string } }).error.message).toContain('重新登录')
+    })
   })
 })
 

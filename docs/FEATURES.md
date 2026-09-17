@@ -128,10 +128,10 @@
 
 - egresses：`GET /admin/api/egresses`，`PUT /admin/api/egresses/:id`（body `{kind:http|https, addr}`），`DELETE`（`api.ts:146-170`）。
 - providers：`GET` 列表，`POST` 新建（`parse.ts` 收敛解析 + `providerValidate`，冲突 409），`PATCH /:id`（白名单 `enabled/priority/streamOnly/displayName/riskNote/credential/models/probeModel/egress`，models 只增不减），`DELETE /:id`（builtin 禁删 403，成功 204）。
-- accounts：`GET /admin/api/accounts`（DB + 池内冷却/连败合并，过期冷却复位），`POST` 新建（id/providerId 必填，归属 Provider 必须存在；重名 409；新建只许 available/disabled），`PATCH /:id`（白名单 status/displayName/credential/weight），`DELETE /:id`，`POST /:id/recheck`（零上游成本，只清惩罚），`POST /:id/test`（真实请求，可传 `{model}`，成功清冷却归零）。
+- accounts：`GET /admin/api/accounts`（DB + 池内冷却/连败合并，过期冷却复位），`POST` 新建（id/providerId 必填，归属 Provider 必须存在；重名 409；新建只许 available/disabled），`PATCH /:id`（白名单 status/displayName/credential/weight），`DELETE /:id`，`POST /:id/recheck`（零上游成本，只清惩罚），`POST /:id/test`（真实请求，可传 `{model}`，成功清冷却归零），`POST /:id/checkin`（WorkBuddy 自动登录：账号页「签到」按钮，只认一键导入/import-account 打标的 importSource=workbuddy 账号；用导入登录态调上游每日签到，一天一次，不自动重试）。
 - 模型：`POST /providers/:id/test`（最小真实请求），`POST /providers/:id/scan`（探到协议写回），`PUT /providers/:id/models/:model/{protocol,egress,note,enabled,reasoning-effort}`（note 限 200 字，空串删字段；reasoning-effort 为模型级推理强度预设，强制覆盖客户端档位，空串 = 跟随客户端），`DELETE /providers/:id/models/:model`（PATCH 删不掉故独立端点），`GET /providers/:id/models`（lister 报错转 502）。
 - stats：`GET /admin/api/stats`（全量），`GET /admin/api/breakdown?days|since|until&account_id`（默认 365 天），`GET /admin/api/usage/accounts`（账号维度）。
-- discover（`discover_api.ts`）：`GET /admin/api/discover`（未接线返回空列表），`POST /discover/adopt {key,id?}`（须 ready 否则 400，幂等），`POST /discover/import-account`（必填 key/tokenPath/accountId/credentialFile，服务端 0600 落盘，token 不经前端），`POST /discover/quick-import {key}`（全量导入存活登录态）。
+- discover（`discover_api.ts`）：`GET /admin/api/discover`（未接线返回空列表），`POST /discover/adopt {key,id?}`（须 ready 否则 400，幂等），`POST /discover/import-account`（必填 key/tokenPath/accountId/credentialFile，服务端 0600 落盘，token 不经前端；workbuddy 导入打 `importSource` + uid + token 指纹标记，账号页才显示「签到」），`POST /discover/quick-import {key}`（全量导入存活登录态，同样打标记）。
 - sidecar / projects 以 Hono 子应用注入（`api.ts:646-653`），未注入对应端点 501。
 
 ## 8. 自动发现：本机 harness（仅 3 项）

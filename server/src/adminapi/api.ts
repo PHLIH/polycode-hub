@@ -45,6 +45,9 @@ export interface AdminApiDeps {
   notify?: ChangeNotifier
   sidecar?: Hono
   projects?: Hono
+  // WorkBuddy 签到（自动登录）上游调用：缺省走全局 fetch，测试注入桩。
+  // 不注入真实网络——签到有上游成本且结果不可复现，单测必须离线可跑。
+  workbuddyCheckinFetch?: typeof fetch
 }
 
 // PATCH 白名单（只读字段出现即 400；ID 永久不可改；credential 只收引用）。
@@ -731,8 +734,9 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     checkins.add(uid)
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), 15_000)
+    const checkinFetch = deps.workbuddyCheckinFetch ?? globalThis.fetch
     try {
-      const response = await fetch('https://copilot.tencent.com/billing/meter/daily-checkin', {
+      const response = await checkinFetch('https://copilot.tencent.com/billing/meter/daily-checkin', {
         method: 'POST',
         redirect: 'error',
         signal: controller.signal,
