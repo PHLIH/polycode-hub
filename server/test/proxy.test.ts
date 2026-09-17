@@ -647,22 +647,30 @@ describe('sessionHintFromHeaders（客户端指纹透传，zen 指纹）', () =>
   })
 })
 
-describe('mapUpstreamError：推理参数 400 带指引', () => {
-  test('bad_request 且上游点名 reasoning_effort → 附核对预设的指引', () => {
-    const e = mapUpstreamError(new UpstreamError(400, UPSTREAM.BAD_REQUEST,
-      "reasoning_effort 'minimal' is not supported for this model"))
-    expect(e.type).toBe('api_error')
-    expect(e.httpStatus).toBe(500)
-    expect(e.message).toContain('推理强度预设')
+describe('mapUpstreamError：推理参数 400 带指引（按“发过档位”触发，不猜文本语言）', () => {
+  const bad = (msg: string) => new UpstreamError(400, UPSTREAM.BAD_REQUEST, msg)
+
+  test('发过档位 + bad_request → 附核对预设的指引（中英文报错都一样）', () => {
+    const en = mapUpstreamError(bad("reasoning_effort 'minimal' is not supported"), 'minimal')
+    expect(en.type).toBe('api_error')
+    expect(en.httpStatus).toBe(500)
+    expect(en.message).toContain('推理强度')
+    const zh = mapUpstreamError(bad('不支持的推理档位'), 'high')
+    expect(zh.message).toContain('推理强度')
   })
 
-  test('bad_request 但与推理无关 → 不带指引（别狼来了）', () => {
-    const e = mapUpstreamError(new UpstreamError(404, UPSTREAM.BAD_REQUEST, '404 Route Not Found'))
-    expect(e.message).not.toContain('推理强度预设')
+  test('没发过档位 → 不带指引（别狼来了）', () => {
+    const e = mapUpstreamError(bad("reasoning_effort 'minimal' is not supported"))
+    expect(e.message).not.toContain('推理强度')
+    const e2 = mapUpstreamError(bad('404 Route Not Found'), '')
+    expect(e2.message).not.toContain('推理强度')
   })
 
   test('其它 kind 不受影响', () => {
     expect(mapUpstreamError(new UpstreamError(429, UPSTREAM.RATE_LIMIT, 'slow')).type).toBe('rate_limit_error')
+    // 限流即使发过档位也不指引：病因是限流不是档位
+    expect(mapUpstreamError(new UpstreamError(429, UPSTREAM.RATE_LIMIT, 'slow'), 'high').message)
+      .not.toContain('推理强度')
     expect(mapUpstreamError(undefined).message).toBe('无可用上游')
   })
 })

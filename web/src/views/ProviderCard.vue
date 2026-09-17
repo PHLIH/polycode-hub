@@ -258,6 +258,18 @@ async function saveNote(p, id) {
   } catch (e) { ElMessage.error(e.message) }
 }
 
+// 测试失败且被测模型配了强度预设：探针会带预设实测（见 probe.ts probeOne），
+// 失败就可能是档位不在上游枚举里。按“配过预设”这个事实触发，不猜报错文本的语言。
+function testedPreset(p, res) {
+  const id = String((res && res.model) || '')
+  const bare = id.includes('/') ? id.slice(id.indexOf('/') + 1) : id
+  if (!bare) return ''
+  return modelOf(p, bare)?.reasoningEffort || ''
+}
+function showReasoningHint(p, res) {
+  return !!res && !res.ok && testedPreset(p, res) !== ''
+}
+
 // 点整行开合；没有勾选任何模型时，点它直接去「模型」里勾——否则点了没反应像坏了
 function onHeadClick() {
   if (exposedCount.value) open.value = !open.value
@@ -344,7 +356,10 @@ async function toggle() {
         </template>
         <template v-else>
           <span class="dot bad" /><span>失败</span>
-          <span class="msg">{{ testRes.error }}</span>
+          <span class="msg" :title="testRes.error">{{ testRes.error }}</span>
+          <span v-if="showReasoningHint(p, testRes)" class="hint-warn">
+            该模型配了强度预设「{{ testedPreset(p, testRes) }}」（测试会带上实测）：失败可能与档位不在上游枚举里有关，核对「强度」下拉（或清空回跟随）后重测
+          </span>
         </template>
         <button class="act" :disabled="testing" @click="emit('test', p)">重测</button>
       </div>
@@ -539,8 +554,15 @@ async function toggle() {
 }
 .result.ok { border-left-color: var(--ok); }
 .result.bad { border-left-color: var(--bad); }
-.result .msg { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.result .msg {
+  color: var(--dim); overflow-wrap: anywhere; user-select: text;
+  flex-basis: 100%; font-size: 12px; line-height: 1.6;
+}
 .result .act { margin-left: auto; }
+/* 推理预设嫌疑：跟失败原因放一起，但用警告色区分“这是推测、不是定论” */
+.hint-warn {
+  flex-basis: 100%; font-size: 11.5px; line-height: 1.6; color: var(--warn);
+}
 
 /* 模型总线：竖线 + 每格一个分支，一眼看出这些模型挂在这一路上 */
 .bus { margin-top: 10px; }

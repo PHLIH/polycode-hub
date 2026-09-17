@@ -65,10 +65,11 @@ export function sessionHintFromHeaders(get: (name: string) => string | undefined
 }
 
 // 把最后一个上游错误映射为对 client 的规范错误。
-// bad_request 且上游原文提到推理参数时多半是档位不在上游枚举里：
-// 网关只透传不校验，配错只能在这里点名（管理台测试按钮同样带预设实测，先在那里验）。
-const REASONING_PARAM_HINT = /reasoning_effort|reasoning effort|unsupported[^.]{0,40}effort|effort[^.]{0,40}support|budget_tokens|thinking[^.]{0,40}budget/i
-export function mapUpstreamError(ue: UpstreamError | undefined): IrError {
+// sentEffort：这次转发实际发给上游的推理档位（客户端传的或模型预设强制的）。
+// bad_request 且发过档位时，档位不在上游枚举里是头号嫌疑，直接点名——
+// 按“发过什么”触发，不按报错文本关键字猜，任何语言的上游报错都适用。
+const REASONING_PRESET_HINT = '（本次请求带了推理强度档位，疑似不在上游枚举里：到 Providers 页展开该模型核对档位，或清空预设跟随客户端）'
+export function mapUpstreamError(ue: UpstreamError | undefined, sentEffort?: string): IrError {
   if (!ue) return irError(ERR.API, '无可用上游')
   switch (ue.kind) {
     case UPSTREAM.RATE_LIMIT: return irError(ERR.RATE_LIMIT, '所有上游限流: ' + ue.message)
@@ -76,8 +77,8 @@ export function mapUpstreamError(ue: UpstreamError | undefined): IrError {
     case UPSTREAM.QUOTA: return irError(ERR.RATE_LIMIT, '上游额度耗尽: ' + ue.message)
     case UPSTREAM.NETWORK: return irError(ERR.OVERLOADED, '上游不可达: ' + ue.message)
     default: {
-      const hint = ue.kind === UPSTREAM.BAD_REQUEST && REASONING_PARAM_HINT.test(ue.message)
-        ? '（疑似模型推理强度预设不在上游枚举里：到 Providers 页展开该模型核对档位，或清空预设跟随客户端）'
+      const hint = ue.kind === UPSTREAM.BAD_REQUEST && (sentEffort ?? '').trim() !== ''
+        ? REASONING_PRESET_HINT
         : ''
       return irError(ERR.API, '上游错误: ' + ue.message + hint)
     }
@@ -276,6 +277,9 @@ export class Proxy {
     let lastErr: UpstreamError | undefined
     let lastAcctId = '' // 最后尝试的账号（兜底失败账也要归因到账号，ACCOUNT-HEALTH）
     let locked: LockedUpstream | undefined
+    // 试过的推理档位（客户端传的或某候选的模型预设）：全灭且 kind 为 bad_request 时，
+    // 档位不在枚举里是头号嫌疑，mapUpstreamError 据此追加指引（按事实触发，不猜文本）。
+    let triedEffort = ''
     // 锁定那次实际发出的请求：候选 Provider 的模型预设可能各不相同，forward 的用量
     // 归因（modelId/stream）与它保持一致；无预设时就是 irReq 本体。
     let lockedReq = irReq
@@ -288,6 +292,7 @@ export class Proxy {
       if (m.egress) pvv.egress = m.egress // 模型级出口覆盖 Provider 级（未声明的模型继承 Provider）
       // 模型级推理预设（强制覆盖）：配了就替换客户端档位，没配跟随客户端。
       const effReq = applyReasoningPreset(irReq, m)
+      if ((effReq.reasoningEffort ?? '').trim() !== '') triedEffort = effReq.reasoningEffort!.trim()
       try {
         const stream = await this.up.stream(pvv, effReq, session)
         locked = { stream, provider: pvv, acctId: acct?.id ?? '' }
@@ -344,7 +349,7 @@ export class Proxy {
       }, 'upstream_error', Date.now() - start)
     }
     console.error(`全部 Provider 失败 attempts=${cands.length} last=${lastErr?.message ?? '-'}`)
-    const irErr = mapUpstreamError(lastErr)
+    const irErr = mapUpstreamError(lastErr, triedEffort)
     return writeIrErrorStatus(inb, irErr, irErr.httpStatus)
   }
 
@@ -396,7 +401,7 @@ export class Proxy {
         reasoningTokens: 0, totalTokens: 0, accuracy: 'unknown', latencyMs: 0, status: 'ok',
         errorKind: ue.kind,
       }, 'upstream_error', Date.now() - start)
-      const irErr = mapUpstreamError(ue)
+      const irErr = mapUpstreamError(ue, effReq.reasoningEffort)
       return writeIrErrorStatus(inb, irErr, irErr.httpStatus)
     }
     return this.forward(inb, p, { stream, provider: pvv, acctId: acct.id }, effReq, start)

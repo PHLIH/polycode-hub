@@ -221,7 +221,15 @@ export class Probe {
     if (lastUL && lastUL.modelId) {
       void this.usage?.insertLog({ ...lastUL, status: 'upstream_error', latencyMs: lastLatency })
     }
-    return { model: modelID, ok: false, error: best?.err ?? lastErr, kind: best?.kind || undefined }
+    const errText = best?.err ?? lastErr
+    const errKind = best?.kind || undefined
+    // 探测带上了该模型的推理预设（见 probeOne）：终因是 bad_request 时档位不在
+    // 上游枚举里是头号嫌疑，直接点名——按“发过预设”触发，不猜报错文本的语言。
+    const preset = pv.models.find((x) => x.id === modelID)?.reasoningEffort?.trim()
+    const hint = errKind === 'bad_request' && preset
+      ? '（本次测试带了推理强度预设 ' + preset + '，疑似不在上游枚举里：核对该模型强度下拉，或清空回跟随）'
+      : ''
+    return { model: modelID, ok: false, error: errText + hint, kind: errKind }
   }
 
   // 返回该 Provider 用于探测的副本：同源有可用账号则用账号凭据（与真实转发同路径），

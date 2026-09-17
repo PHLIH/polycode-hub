@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createServer, type Server } from 'node:http'
 import { AddressInfo } from 'node:net'
-import { Upstream, joinURL, probeOrder, shouldTryOtherProtocol, resolveProtocol, egressProxyURI, buildRequestURL, classifyUpstreamError, applyZenFingerprint, sanitizeUA } from '../src/router/upstream.ts'
+import { Upstream, joinURL, probeOrder, shouldTryOtherProtocol, resolveProtocol, egressProxyURI, buildRequestURL, classifyUpstreamError, applyZenFingerprint, sanitizeUA, summarizeUpstreamBody } from '../src/router/upstream.ts'
 import { UpstreamError } from '../src/ir/index.ts'
 import { forgetProtocol, rememberProtocol } from '../src/model/index.ts'
 import type { Provider } from '../src/model/index.ts'
@@ -244,6 +244,40 @@ describe('上游错误分类细化：429 额度用尽 ≠ 429 限流', () => {
     expect(classifyUpstreamError(403, '{"error":{"type":"AuthError","message":"Missing API key."}}'))
       .toBe(UPSTREAM.AUTH)
     expect(classifyUpstreamError(401, 'invalid token')).toBe(UPSTREAM.AUTH)
+  })
+})
+
+describe('上游错误体提炼 summarizeUpstreamBody（各家字段名不一，只抽人话+业务码）', () => {
+  test('OpenAI 形态：error.message', () => {
+    expect(summarizeUpstreamBody(`{"error":{"message":"reasoning_effort 'minimal' is not supported","type":"invalid_request_error"}}`))
+      .toBe(`reasoning_effort 'minimal' is not supported`)
+  })
+
+  test('腾讯系形态：error.data.msg + code（code 拼后缀）', () => {
+    expect(summarizeUpstreamBody(`{"error":{"data":{"code":14018,"msg":"额度已用尽"}}}`))
+      .toBe('额度已用尽 (code 14018)')
+  })
+
+  test('Anthropic 形态：type.error.message；code 已在正文出现不重复', () => {
+    expect(summarizeUpstreamBody(`{"type":"error","error":{"type":"rate_limit_error","message":"[1113] Insufficient balance."}}`))
+      .toBe('[1113] Insufficient balance.')
+  })
+
+  test('顶层 message / 纯文本原样保留（不猜语言）', () => {
+    expect(summarizeUpstreamBody(`{"message":"quota exceeded"}`)).toBe('quota exceeded')
+    expect(summarizeUpstreamBody('upstream boom')).toBe('upstream boom')
+    expect(summarizeUpstreamBody('慢')).toBe('慢')
+  })
+
+  test('HTML 错误页去标签（issue-1：整页 HTML 等于没说）', () => {
+    const got = summarizeUpstreamBody('<!DOCTYPE html><html><body><h1>404 Not Found</h1></body></html>')
+    expect(got).toBe('404 Not Found')
+    expect(got).not.toContain('<')
+  })
+
+  test('空体与超长回落', () => {
+    expect(summarizeUpstreamBody('   ')).toBe('(上游空响应体)')
+    expect(summarizeUpstreamBody('x'.repeat(300))).toHaveLength(200)
   })
 })
 

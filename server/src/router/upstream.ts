@@ -270,8 +270,9 @@ export class Upstream {
       }
       const text = await resp.text() // text() 已消费 body，无需再 cancel
       console.warn(`[upstream] POST ${url} -> ${resp.status} (${ue2s(resp.status, text)})`)
-      const ue = new UpstreamError(resp.status, classifyUpstreamError(resp.status, text), text.slice(0, 512).trim())
-      if (a === 0 && p.dynamicHeaders && needsRemint(ue.message, p.dynamicHeaders.retryOn)) {
+      const ue = new UpstreamError(resp.status, classifyUpstreamError(resp.status, text), summarizeUpstreamBody(text))
+      // 换 token 信号看原文全文：提炼只留人话 + 业务码，散落在其它字段的标记会丢。
+      if (a === 0 && p.dynamicHeaders && needsRemint(text, p.dynamicHeaders.retryOn)) {
         continue // 换 token 信号：重铸一次
       }
       throw ue
@@ -396,7 +397,7 @@ export class Upstream {
     if (resp.status >= 200 && resp.status <= 299) return resp.body!
     // resp.text() 已消费 body（此时 cancel() 会抛 ERR_INVALID_STATE 并崩掉进程——真实环境教训）
     const text = await resp.text()
-    throw new UpstreamError(resp.status, classifyUpstreamError(resp.status, text), text.slice(0, 512).trim())
+    throw new UpstreamError(resp.status, classifyUpstreamError(resp.status, text), summarizeUpstreamBody(text))
   }
 }
 
@@ -440,6 +441,80 @@ export function classifyUpstreamError(status: number, body: string): string {
     return UPSTREAM.QUOTA
   }
   return kind
+}
+
+// 上游错误体提炼（导出供测试）：各家报错字段名不一样（message / msg /
+// error.message / error.data.msg / detail……），直接把原文 JSON 怼给用户，
+// 前面全是 `upstream bad_request (http 400): {"error":` 这种前缀，真正的
+// 原因被挤到省略号后面看不见。这里尽力抽出「人话 + 业务码」，抽不出再回落
+// 原文截断。前缀 `upstream <kind> (http <status>)` 保持不动（测试与
+// errorRank/issue-1 断言都依赖它），只换冒号后面的部分。
+export function summarizeUpstreamBody(text: string): string {
+  const t = text.trim()
+  if (t === '') return '(上游空响应体)'
+  const parsed = tryParseObject(t)
+  if (parsed) {
+    const msg = firstString(parsed, [
+      ['error', 'message'], ['error', 'msg'],
+      ['error', 'data', 'msg'], ['error', 'data', 'message'],
+      ['message'], ['msg'], ['detail'], ['error', 'detail'],
+    ])
+    if (msg) {
+      const code = firstScalar(parsed, [
+        ['error', 'code'], ['error', 'data', 'code'], ['code'],
+      ])
+      // code 已在消息里出现过就不再缀一次（如 "[1113] Insufficient balance."）。
+      const suffix = code !== undefined && !msg.includes(String(code)) ? ` (code ${String(code)})` : ''
+      return msg + suffix
+    }
+  }
+  // HTML 错误页（APISIX/网关 404 页）：去标签取正文，issue-1 的教训——整页
+  // HTML 怼给用户等于没说，还会把凭据排查带偏。
+  if (/<[a-z][\s\S]*>/i.test(t)) {
+    const stripped = t.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()
+    if (stripped !== '') return truncate(stripped, 200)
+  }
+  return truncate(t, 200)
+}
+
+function tryParseObject(t: string): Record<string, unknown> | undefined {
+  if (!t.startsWith('{')) return undefined
+  try {
+    const v: unknown = JSON.parse(t)
+    if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
+      return v as Record<string, unknown>
+    }
+  } catch { /* 非 JSON，走回落 */ }
+  return undefined
+}
+
+function dig(obj: Record<string, unknown>, path: string[]): unknown {
+  let cur: unknown = obj
+  for (const k of path) {
+    if (cur === null || typeof cur !== 'object' || Array.isArray(cur)) return undefined
+    cur = (cur as Record<string, unknown>)[k]
+  }
+  return cur
+}
+
+function firstString(obj: Record<string, unknown>, paths: string[][]): string | undefined {
+  for (const p of paths) {
+    const v = dig(obj, p)
+    if (typeof v === 'string' && v.trim() !== '') return v.trim()
+  }
+  return undefined
+}
+
+function firstScalar(obj: Record<string, unknown>, paths: string[][]): string | number | undefined {
+  for (const p of paths) {
+    const v = dig(obj, p)
+    if ((typeof v === 'string' && v.trim() !== '') || typeof v === 'number') return v
+  }
+  return undefined
+}
+
+function truncate(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n) : s
 }
 
 // 简短状态摘要（日志用，不泄漏 body 明文细节）
