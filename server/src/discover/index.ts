@@ -422,6 +422,31 @@ function zenSuggestedProvider(baseURL: string): Provider {
 // 免费档名字启发式（与 model.looksFree 同口径，但不引 model 包以免依赖环）：
 // 命名约定是唯一线索，要求独立词段（freeform 不判免费），误判比漏报安全。
 const ZEN_FREE_MARKERS = ['free', 'contributor', 'trial']
+
+// 可调用性验证最多试几个候选模型：太少会因单模型下线而误判整源不可用，
+// 太多则发现页每次刷新都要打好几个真实请求（有成本、也慢）。
+const ZEN_PROBE_MODELS = 3
+
+// 同族归并：id 去掉版本号与免费后缀后相同者视为一族（muse-spark-1.3-x-free → muse-spark）。
+// 返回顺序保持原顺序，但同族只保留首个。
+function familyOf(id: string): string {
+  return id.toLowerCase()
+    .replace(/[-_.]?(free|contributor|trial)$/g, '')
+    .replace(/[-_.]?v?\d+([-_.]\d+)*/g, '')
+    .replace(/[-_.]+$/, '')
+}
+
+function spreadByFamily(ids: string[]): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const id of ids) {
+    const fam = familyOf(id)
+    if (seen.has(fam)) continue
+    seen.add(fam)
+    out.push(id)
+  }
+  return out
+}
 function looksFreeName(id: string): boolean {
   return id.toLowerCase().split(/[-_./: \t]+/).some((seg) => ZEN_FREE_MARKERS.includes(seg))
 }
@@ -477,24 +502,49 @@ export async function checkZen(
     f.actions = ['export ZEN_KEY=public', '然后在发现页点「采用」']
     return f
   }
-  // 真实调用验证：优先免费档模型（免费档才是本 Provider 的目标）。
+  // 真实调用验证：免费档优先，**多试几个**。
+  //
+  // 只测一个模型就下结论是错的：单个模型可能恰好下线/地区受限/额度单独用尽，
+  // 而 Provider 整体仍可用。那样用户会看到「这个也不能用」，实际只是选错了探针模型。
+  // 任一候选调通即 ready；全失败才报不可用，且报**最有信息量**的那次病因。
   // 本地判免费（不引 gateway/probe：发现层不该依赖网关层，避免反向依赖环）。
-  const cands = ids.filter((id) => looksFreeName(id))
-  const probeModel = cands[0] ?? ids[0]
-  if (!probeModel) {
+  const freeIds = ids.filter((id) => looksFreeName(id))
+  // 按「族」分散取样：同一族（id 去掉免费后缀后的主体）只取第一个。
+  // 否则列表里同族模型扎堆时（如 muse-spark 有 1.2/1.3 两代），几个名额全被它占掉，
+  // 一族不可用就误判整个 Provider 不可用——而其他族可能完全正常。
+  const cands = spreadByFamily(freeIds.length > 0 ? freeIds : ids).slice(0, ZEN_PROBE_MODELS)
+  if (cands.length === 0) {
     f.status = 'unreachable'
     f.detail = `连通，但模型列表为空（${ids.length} 个），无法验证可调用性`
     return f
   }
-  const r = await callProbe(probeModel)
-  if (r.ok) {
-    f.status = 'ready'
-    f.detail = `连通，${ids.length} 个模型，实测 ${probeModel} 可调用`
-    f.actions = ['export ZEN_KEY=public', '然后在发现页点「采用」']
+  let last: { ok: boolean; error?: string; kind?: string } = { ok: false }
+  let lastModel = cands[0]!
+  for (const m of cands) {
+    const r = await callProbe(m)
+    if (r.ok) {
+      f.status = 'ready'
+      f.detail = `连通，${ids.length} 个模型，实测 ${m} 可调用`
+      f.actions = ['export ZEN_KEY=public', '然后在发现页点「采用」']
+      return f
+    }
+    last = r
+    lastModel = m
+    // 指纹缺失是全 Provider 级别的（不是某个模型的事），继续试没意义。
+    if (r.kind === 'fingerprint' || /free tier can only be used/i.test(r.error ?? '')) break
+  }
+  const r = last
+  const probeModel = lastModel
+  // 列表通但调用失败：不再冒充 ready。地区限制单独说（换出口可解，不是模型下线）。
+  f.status = 'unreachable'
+  if (r.kind === 'region' || /not available in your country/i.test(r.error ?? '')) {
+    f.detail = `模型列表可达（${ids.length} 个），但试过的 ${cands.length} 个模型在当前出口地区都不可用（${probeModel}）`
+    f.actions = [
+      '这些模型有地区限制：给 Provider 配一个出口代理（egress）后即可调用',
+      '若不打算用它们，可到 Providers 页只保留其他可用模型',
+    ]
     return f
   }
-  // 列表通但调用失败：不再冒充 ready。指纹错单独点名（这是最常见的一种）。
-  f.status = 'unreachable'
   if (r.kind === 'fingerprint' || /free tier can only be used/i.test(r.error ?? '')) {
     f.detail = `模型列表可达（${ids.length} 个），但真实调用被拒：缺少客户端指纹（${probeModel}）`
     f.actions = [

@@ -46,6 +46,10 @@ export const UPSTREAM = {
   // 归 auth 会让人去翻 API Key，归 bad_request 又会被探测当成「路径噪音」压到最低优先级，
   // 真实病因（缺 UA/会话指纹）在报错里永远浮不上来。
   FINGERPRINT: 'fingerprint',
+  // 地区限制：模型在当前出口 IP 所在地区不可用（RegionError / "not available in your
+  // country"）。与指纹同属「被拒但不是凭据问题」，但病灶不同——换出口代理可解，
+  // 所以必须分开：归 auth 会让人去翻 API Key，归 bad_request 会被当协议噪音压下去。
+  REGION: 'region',
   UNKNOWN: 'unknown',
 } as const
 

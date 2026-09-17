@@ -425,8 +425,11 @@ function pinModelProtocol(models: Provider['models'], modelID: string, proto: st
 // （muse-spark 真实缺陷）。403 同理有 RegionError 细分，已在 classifyUpstreamError 归为
 // bad_request，不在此早停。
 function probeFatalError(msg: string, kind = ''): boolean {
-  // 指纹缺失（FreeTierError）：上游只认官方客户端样子，换协议/换出口都无解，早停省时间。
+  // 指纹缺失（FreeTierError）：上游只认官方客户端样子，换协议无解，早停省时间。
   if (kind === 'fingerprint') return true
+  // 地区限制（RegionError）：换协议无解（是出口 IP 的问题，不是端点的问题），
+  // 早停避免白试三轮；出路是配 egress，报错文案已点名。
+  if (kind === 'region') return true
   return msg.includes('http 401')
 }
 
@@ -439,6 +442,9 @@ function errorRank(kind: string, msg: string): number {
     // 指纹缺失排最高：它是「上游明确拒绝这个身份」，比额度/限流更能定位问题，
     // 且绝不能被后续协议的 404/400 路径噪音盖掉。
     fingerprint: 60,
+    // 地区限制紧随其后：同为「明确拒绝且换协议无解」，必须能浮到报错面上，
+    // 否则用户看到的是被 404 噪音盖过的含糊错，以为模型下线了。
+    region: 55,
     quota: 50, rate_limit: 40, auth: 45, server: 20, network: 15, bad_request: 5, unknown: 0,
   }
   const k = byKind[kind] ?? 0

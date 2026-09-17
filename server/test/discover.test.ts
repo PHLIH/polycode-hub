@@ -248,6 +248,56 @@ describe('checkZen', () => {
     expect(f.detail).toContain('实测')
   })
 
+  // 单模型误判（2026-09-17 实测）：探针只试第一个模型就下结论，
+  // 那个模型恰好不可用（下线/地区受限）时，整个 Provider 被误报成不可用——
+  // 用户看到「这也不能用」，实际只是选错了探针模型。
+  test('首个模型失败但后续可用 → 仍判 ready（不因单模型下线误杀整源）', async () => {
+    const fetchMulti = (async () => new Response(
+      JSON.stringify({ data: [{ id: 'a-free' }, { id: 'b-free' }, { id: 'c-free' }] }), { status: 200 },
+    )) as typeof fetch
+    const tried: string[] = []
+    const f = await checkZen('https://zen.example', fetchMulti, 8000, async (m) => {
+      tried.push(m)
+      return m === 'a-free' ? { ok: false, error: 'upstream server (http 500)' } : { ok: true }
+    })
+    expect(f.status).toBe('ready')
+    expect(tried).toEqual(['a-free', 'b-free'])
+    expect(f.detail).toContain('b-free')
+  })
+
+  // 同族扎堆：muse-spark 有 1.2/1.3 两代，若按原顺序取前 3 个，名额全被它占掉，
+  // 一族不可用就误判整源不可用——其他族可能完全正常。候选必须跨族分散。
+  test('候选跨族取样：同族不同代不重复占用探测名额', async () => {
+    const fetchFam = (async () => new Response(
+      JSON.stringify({ data: [
+        { id: 'muse-spark-1.3-contributor-free' },
+        { id: 'muse-spark-1.2-contributor-free' },
+        { id: 'mimo-v2.5-free' },
+        { id: 'nemotron-3-ultra-free' },
+      ] }), { status: 200 },
+    )) as typeof fetch
+    const tried: string[] = []
+    const f = await checkZen('https://zen.example', fetchFam, 8000, async (m) => {
+      tried.push(m)
+      // 模拟 muse-spark 族不可用（如地区限制），其他族正常
+      return m.startsWith('muse-spark') ? { ok: false, kind: 'region', error: 'not available in your country' } : { ok: true }
+    })
+    expect(f.status).toBe('ready')
+    expect(tried).toEqual(['muse-spark-1.3-contributor-free', 'mimo-v2.5-free'])
+  })
+
+  test('全族都不可用（地区限制）→ unreachable 且指引配 egress', async () => {
+    const fetchMulti = (async () => new Response(
+      JSON.stringify({ data: [{ id: 'a-free' }, { id: 'b-free' }] }), { status: 200 },
+    )) as typeof fetch
+    const f = await checkZen('https://zen.example', fetchMulti, 8000, async () => ({
+      ok: false, kind: 'region', error: 'not available in your country',
+    }))
+    expect(f.status).toBe('unreachable')
+    expect(f.detail).toContain('地区')
+    expect(f.actions?.some((a) => a.includes('egress'))).toBe(true)
+  })
+
   test('列表通但调用非指纹类失败 → unreachable 且保留原因', async () => {
     const f = await checkZen('https://zen.example', fetchOK, 8000, async () => ({
       ok: false, error: 'upstream server (http 500): boom',

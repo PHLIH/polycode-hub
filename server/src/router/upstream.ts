@@ -440,7 +440,9 @@ export function classifyUpstreamError(status: number, body: string): string {
     //     归 auth 会误导用户去翻 API Key（Key 是好的）；归 bad_request 又会被探测
     //     当作「协议路径噪音」压到最低优先级（见 probe.errorRank），真实病因浮不上来。
     //     指纹是「配置缺失」而非「上游故障」：换出口/换协议都无解，必须点名去配。
-    if (/regionerror|not available in your country/i.test(body)) return UPSTREAM.BAD_REQUEST
+    // 地区限制：换出口代理即可解，独立归类（见 ir.UPSTREAM.REGION）。
+    // 归 bad_request 会让用户以为模型下线了，实际是出口 IP 不在可用地区。
+    if (/regionerror|not available in your country/i.test(body)) return UPSTREAM.REGION
     if (/freetiererror|free tier can only be used/i.test(body)) return UPSTREAM.FINGERPRINT
   }
   if (kind === UPSTREAM.RATE_LIMIT && QUOTA_HINT.test(body)) {

@@ -20,12 +20,13 @@ export interface UsageSink {
   insertLog(l: UsageLog): Promise<void> | void
 }
 
-// 失败分类 → 账号冷却时长（限流 1min、耗尽 10min、鉴权/指纹 30min、其他 30s）。
+// 失败分类 → 账号冷却时长（限流 1min、耗尽 10min、鉴权/指纹/地区 30min、其他 30s）。
 // 指纹缺失与鉴权同类：不配好 UA/会话就永远 403，30s 冷却只会让它反复爬起来空撞。
+// 地区限制（REGION）同理：挂上 egress 之前都白试。
 export function cooldownFor(kind: string): number {
   if (kind === UPSTREAM.RATE_LIMIT) return 60_000
   if (kind === UPSTREAM.QUOTA) return 600_000
-  if (kind === UPSTREAM.AUTH || kind === UPSTREAM.FINGERPRINT) return 1_800_000
+  if (kind === UPSTREAM.AUTH || kind === UPSTREAM.FINGERPRINT || kind === UPSTREAM.REGION) return 1_800_000
   return 30_000
 }
 
@@ -82,6 +83,11 @@ export function mapUpstreamError(ue: UpstreamError | undefined, sentEffort?: str
     case UPSTREAM.FINGERPRINT: return irError(ERR.AUTHENTICATION,
       '上游只接受官方客户端指纹（免费档限制）: ' + ue.message
       + '；请在该 Provider 头里配真实 User-Agent 与 x-session-id/x-session-affinity（opencode run --print-logs 取 created id=），或设 ZEN_UA 环境变量；用 opencode 做客户端时自动透传')
+    // 地区限制同理：不是「模型没了」也不是「Key 错了」，而是出口 IP 不在可用地区。
+    // 不给这句指引，用户会以为模型下线了。
+    case UPSTREAM.REGION: return irError(ERR.AUTHENTICATION,
+      '该模型在当前出口地区不可用: ' + ue.message
+      + '；可给该 Provider（或其下这个模型）配置 egress 出口代理后重试')
     default: {
       const hint = ue.kind === UPSTREAM.BAD_REQUEST && (sentEffort ?? '').trim() !== ''
         ? REASONING_PRESET_HINT

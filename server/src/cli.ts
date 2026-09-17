@@ -220,20 +220,31 @@ export async function runServe(args: string[]): Promise<void> {
   // 「网络通」误报成 ready，用户到手才发现 403 FreeTierError（真实假阳性）。
   const zenCallProbe: ZenCallProbe = async (model) => {
     const draft = defaultConfig()
+    // 关键：复用**已配置的 zen Provider**（含用户配的指纹头 UA/ses_ 与 egress 出口），
+    // 而不是凭空造一个裸草稿。
+    //
+    // 曾经的写法用空 headers + 无 egress 去打：用户的指纹和出口全都用不上，
+    // 探针必然被 403（缺指纹）或 403（地区限制）——明明是「探针没带够配置」，
+    // 却报成「模型不可调用」，是典型的假阴性（本轮实测踩到）。
+    // 只有当用户还没配过 zen 时才回落到内置草稿。
+    const configured = providers.list().find((x) => x.state !== 'deleted'
+      && (x.name === 'opencode' || x.name === 'zen' || x.baseUrl.includes('opencode.ai')))
+    const p: Provider = configured
+      ? { ...configured, models: [{ id: model, manual: false, enabled: true, ...(configured.models.find((m) => m.id === model)?.api ? { api: configured.models.find((m) => m.id === model)!.api } : {}) }], probeModel: model }
+      : {
+        providerId: 0, name: 'opencode-zen-probe', state: 'active', displayName: 'probe',
+        accessKind: 'reverse', risk: 'high', riskNote: 'probe', stability: 'beta',
+        api: 'openai-completions', baseUrl: (draft.zenBaseURL ?? 'https://opencode.ai/zen') + '/v1',
+        credential: { apiKeyEnv: 'ZEN_KEY' },
+        headers: {},
+        priority: 1,
+        models: [{ id: model, manual: false, enabled: true }],
+      }
     // 免费档鉴权恒为 Bearer public（ZEN_KEY 的官方取值就是 public）。
-    // 这里把凭据交给 credLookup 解析：真实 ZEN_KEY 优先，未设则回落到 public，
-    // 等价于「一键导入」时 applyCredentialDefaults 落的那个公共 key。
-    // 不能随便引用一个不存在的环境变量名——credentialResolve 失败会抛
-    // 「环境变量未设置」，探针就变成恒错的假阴性（正好是本次要修的毛病）。
-    const p: Provider = {
-      providerId: 0, name: 'opencode-zen-probe', state: 'active', displayName: 'probe',
-      accessKind: 'reverse', risk: 'high', riskNote: 'probe', stability: 'beta',
-      api: 'openai-completions', baseUrl: (draft.zenBaseURL ?? 'https://opencode.ai/zen') + '/v1',
-      credential: { apiKeyEnv: 'ZEN_KEY' },
-      headers: {},
-      priority: 1,
-      models: [{ id: model, manual: false, enabled: true }],
-    }
+    // 把凭据交给 credLookup：真实 ZEN_KEY 优先，未设则回落 public，等价于
+    // 「一键导入」时 applyCredentialDefaults 落的那个公共 key。
+    // 不能引用不存在的环境变量名——credentialResolve 失败会抛「环境变量未设置」，
+    // 探针就变成恒错的假阴性。
     const zenLookup = (name: string): [string, boolean] => {
       if (name !== 'ZEN_KEY') return process.env[name] === undefined ? ['', false] : [process.env[name]!, true]
       return [(process.env.ZEN_KEY ?? 'public'), true]

@@ -165,10 +165,9 @@ describe('streamWithTimeout 非 2xx（探测路径，真实缺陷回归）', () 
 })
 
 describe('上游错误分类细化：RegionError 不是凭据错误', () => {
-  // 真实缺陷：muse 系模型在 /chat/completions 端点回 403 RegionError（出口/端点不匹配），
-  // 宽泛地归为 auth 会挡死协议自动回退——它唯一认的 /responses 永远轮不到。
-  // 分类时应看错误体：RegionError = 端点/出口不匹配 → bad_request（可换协议）。
-  test('403 + RegionError 体 → kind=bad_request（可换协议）', async () => {
+  // 真实缺陷：muse 系模型回 403 RegionError，宽泛地归为 auth 会挡死协议自动回退。
+  // 分类时应看错误体，RegionError 独立成 region（既不是凭据错，也不是「协议路径不对」）。
+  test('403 + RegionError 体 → kind=region（不是 auth，也不是 bad_request）', async () => {
     const { server: s, base: b } = await import('./helpers/one-shot-server.ts').then((m) =>
       m.startOneShot((req, res) => {
         res.writeHead(403, { 'content-type': 'application/json' })
@@ -177,7 +176,7 @@ describe('上游错误分类细化：RegionError 不是凭据错误', () => {
     const u = new Upstream({ credLookup: () => ['', false], noAutoProtocol: true })
     const p = { ...prov({}), baseUrl: b, api: 'anthropic-messages' }
     await expect(u.streamWithTimeout(p, { model: 'm', stream: true, maxTokens: 16, messages: [] } as never, AbortSignal.timeout(5000)))
-      .rejects.toMatchObject({ status: 403, kind: 'bad_request' })
+      .rejects.toMatchObject({ status: 403, kind: 'region' })
     await new Promise<void>((r) => s.close(() => r()))
   })
 
@@ -240,8 +239,12 @@ describe('上游错误分类细化：429 额度用尽 ≠ 429 限流', () => {
     // 指纹缺失单独归类：既不是 Key 错（归 auth 会让人白翻 API Key），
     // 也不是协议路径错（归 bad_request 会被探测当路径噪音压到最低优先级）。
     expect(classifyUpstreamError(403, freeTier)).toBe(UPSTREAM.FINGERPRINT)
-    // 地区限制同理（换出口代理能解，不是 Key 错）
-    expect(classifyUpstreamError(403, '{"error":{"type":"RegionError"}}')).toBe(UPSTREAM.BAD_REQUEST)
+    // 地区限制：换出口代理能解，同样不是 Key 错。独立归类而不是混在 bad_request 里——
+    // 混着会被探测当成「协议路径噪音」压到最低优先级，用户只看到含糊错误，
+    // 以为模型下线了（实际是出口 IP 不在可用地区）。
+    expect(classifyUpstreamError(403, '{"error":{"type":"RegionError"}}')).toBe(UPSTREAM.REGION)
+    expect(classifyUpstreamError(403, '{"error":{"message":"This model is not available in your country."}}'))
+      .toBe(UPSTREAM.REGION)
     // 真正的凭据错误仍归 auth（别把这条顺手改坏了）
     expect(classifyUpstreamError(403, '{"error":{"type":"AuthError","message":"Missing API key."}}'))
       .toBe(UPSTREAM.AUTH)
