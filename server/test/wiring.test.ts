@@ -182,8 +182,22 @@ describe('projects 适配器（对齐 Go adminapi/projects_api.go）', () => {
     const { app } = projectsHarness()
     expect((await app.request('/admin/api/projects/p1/logs')).status).toBe(400)
     const res = await app.request('/admin/api/projects/p1/logs?service=web&tail=10')
-    expect((await res.json() as { log: string }).log).toBe('') // 日志文件不存在 → 空
+    // 日志文件不存在 → 空；新返回带 tail 回显与 truncated 标记
+    const body = await res.json() as { log: string; tail: number; truncated: boolean }
+    expect(body.log).toBe('')
+    expect(body.tail).toBe(10)
+    expect(body.truncated).toBe(false)
     expect((await app.request('/admin/api/projects/p1/logs?service=web', { method: 'DELETE' })).status).toBe(200)
+  })
+
+  test('logs：默认 tail=1000，非法/超限回落与封顶', async () => {
+    const { app } = projectsHarness()
+    const dflt = await app.request('/admin/api/projects/p1/logs?service=web')
+    expect(((await dflt.json()) as { tail: number }).tail).toBe(1000)
+    const bad = await app.request('/admin/api/projects/p1/logs?service=web&tail=abc')
+    expect(((await bad.json()) as { tail: number }).tail).toBe(1000)
+    const huge = await app.request('/admin/api/projects/p1/logs?service=web&tail=999999')
+    expect(((await huge.json()) as { tail: number }).tail).toBe(5000)
   })
 
   test('open：在系统中打开目录（dir留空/非法400，opener可注入）', async () => {

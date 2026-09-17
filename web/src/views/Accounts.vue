@@ -149,6 +149,21 @@ function healthOf(a) {
 }
 
 // ---- 账号测试：用该账号的 API Key 打一次真实请求，结果计入状态 ----
+const checkingIn = reactive(new Set())
+async function checkin(a) {
+  if (checkingIn.has(a.id)) return
+  checkingIn.add(a.id)
+  try {
+    const r = await api.checkinAccount(a.id)
+    if (r.status === 'already_checked_in') ElMessage.info(r.message)
+    else ElMessage.success(r.message)
+  } catch (e) {
+    ElMessage.error(`签到失败：${e.message}`)
+  } finally {
+    checkingIn.delete(a.id)
+  }
+}
+
 const testing = ref('')
 const testModel = ref({}) // accountId → 选中的模型（缺省取该源第一个启用的）
 
@@ -430,6 +445,11 @@ async function setWeight(a, v) {
           <el-switch :model-value="isEnabled(a)" size="small"
             :title="isEnabled(a) ? '启用中：参与轮询，点击停用' : '已停用：不接请求，点击启用'"
             @change="v => toggleEnabled(a, v)" />
+          <button v-if="a.importSource === 'workbuddy'" class="linklike"
+            :disabled="checkingIn.has(a.id)" @click="checkin(a)"
+            title="使用此账号的导入登录态签到一次，不自动重试">
+            {{ checkingIn.has(a.id) ? '签到中…' : '签到' }}
+          </button>
           <button class="linklike" @click="openEdit(a)">编辑</button>
           <button class="linklike danger" @click="remove(a)">删除</button>
         </span>

@@ -1,7 +1,7 @@
 // 项目管理面的后端接线：把 projects 包暴露为 /admin/api/projects/*（薄适配，
 // 对齐 Go internal/adminapi/projects_api.go）。与代理链路无关，独立文件。
 
-import { readFileSync, readdirSync, statSync, truncateSync } from 'node:fs'
+import { openSync, readFileSync, readdirSync, readSync, statSync, truncateSync, closeSync } from 'node:fs'
 import { execFile } from 'node:child_process'
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import { Hono, type Context } from 'hono'
@@ -485,16 +485,53 @@ async function handleLogs(c: Context, m: Manager, isDelete: boolean): Promise<Re
     }
     return c.json({ ok: true })
   }
-  let content = ''
+  // 1k 条滑动窗口：环形读——从文件尾往前扫块，只读够 tail 行需要的字节，
+  // 而不是全量读进内存再 slice。Vite 热更新日志几十万行是常态，全量读会卡死事件循环。
+  // 默认 1000；tail<=0 或非法回落 1000；上限 5000（防一次拖走几十 MB）。
+  const raw = Number(c.req.query('tail'))
+  const tail = Number.isFinite(raw) && raw > 0 ? Math.min(Math.floor(raw), 5000) : 1000
+  const r = readTailLines(path, tail)
+  return c.json({ log: r.text, tail, truncated: r.truncated })
+}
+
+// readTailLines 从文件尾往前取最后 maxLines 行。
+// 实现：按 64KB 块从尾向前读，数 '\n'，凑够 maxLines+1 个换行即停（多一个用来
+// 确认"前面还有"。返回 {text, truncated}：truncated=true 表示文件里还有更早的行没显示。
+// 文件不存在/空/目录/权限等问题 → 空（与旧行为一致：日志缺失不算 500）。
+export function readTailLines(path: string, maxLines: number): { text: string; truncated: boolean } {
+  if (!Number.isInteger(maxLines) || maxLines <= 0) return { text: '', truncated: false }
+  let fd = -1
   try {
-    content = readFileSync(path, 'utf8')
+    const st = statSync(path)
+    if (!st.isFile() || st.size === 0) return { text: '', truncated: false }
+    fd = openSync(path, 'r')
+    const CHUNK = 64 * 1024
+    const buf = Buffer.alloc(CHUNK)
+    let pos = st.size // 已读区间 [pos, size)
+    const chunks: Buffer[] = []
+    let newlines = 0
+    while (pos > 0 && newlines <= maxLines) {
+      const len = Math.min(CHUNK, pos)
+      const n = readSync(fd, buf, 0, len, pos - len)
+      if (n <= 0) break
+      // 必须拷贝：subarray 与 buf 共享内存，下一次 readSync 会把它覆盖。
+      chunks.unshift(Buffer.from(buf.subarray(0, n)))
+      for (let i = n - 1; i >= 0 && newlines <= maxLines; i--) {
+        if (buf[i] === 0x0a) newlines++
+      }
+      pos -= n
+    }
+    const text = Buffer.concat(chunks).toString('utf8')
+    // 尾换行不计一行（与旧 `replace(/\n$/,'')` 语义对齐：`a\n` 与 `a` 都是 1 行）。
+    const stripped = text.endsWith('\n') ? text.slice(0, -1) : text
+    const lines = stripped === '' ? [] : stripped.split('\n')
+    const out = lines.length > maxLines ? lines.slice(lines.length - maxLines) : lines
+    // pos>0 说明文件头没读完 → 一定还有更早的行；读完则按实际行数判。
+    const truncated = pos > 0 || lines.length > maxLines
+    return { text: out.join('\n'), truncated }
   } catch {
-    return c.json({ log: '' }) // 不存在 → 空日志
+    return { text: '', truncated: false }
+  } finally {
+    if (fd >= 0) try { closeSync(fd) } catch { /* 已关闭 */ }
   }
-  // TODO: 日志量大时把“全量读后取尾”换成环形读；当前实现够用（日志有轮转上限前不改）。
-  const tail = Number(c.req.query('tail')) > 0 ? Number(c.req.query('tail')) : 200
-  let lines = content.replace(/\n$/, '').split('\n')
-  if (lines.length === 1 && lines[0] === '') lines = []
-  if (lines.length > tail) lines = lines.slice(lines.length - tail)
-  return c.json({ log: lines.join('\n') })
 }

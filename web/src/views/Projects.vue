@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, onUnmounted, reactive } from 'vue'
+import { ref, computed, onMounted, onUnmounted, reactive, nextTick, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api.js'
 // AI 回填的纯逻辑放 aiFill.ts（可单测；此处只管 DOM 与状态）
@@ -444,18 +444,59 @@ const logOpen = ref(false)
 const logTitle = ref('')
 const logText = ref('')
 const logCtx = ref(null)
+// 1k 滑动窗口：后端默认 tail=1000，前端只做展示侧配合——
+// truncated=true 说明文件里还有更早的行（被窗口裁掉了），给一句提示；
+// 用户往上滚就不自动跟随到底（否则看历史时被新日志顶走），回到最底部恢复跟随。
+const logTruncated = ref(false)
+const logFollow = ref(true)
+const logAuto = ref(false) // 自动刷新开关（默认关：轮询 8s 的列表刷新已够，日志另起 2s 轮询只在弹窗开时跑）
+const logPre = ref(null) // <pre> 滚动容器
+let logTimer = null
 
 async function openLogs(p, s) {
   logCtx.value = { p, s }
   logTitle.value = `${p.name} / ${s.name}`
+  logText.value = '加载中…'
+  logTruncated.value = false
+  logFollow.value = true
   logOpen.value = true
   await refreshLogs()
+  startLogPoll()
+}
+function stopLogPoll() {
+  if (logTimer) { clearInterval(logTimer); logTimer = null }
+}
+function startLogPoll() {
+  stopLogPoll()
+  if (!logAuto.value) return
+  logTimer = setInterval(refreshLogs, 2000)
+}
+// 开关自动刷新：开了立刻刷一次并进轮询，关了停轮询。
+watch(logAuto, () => {
+  if (!logOpen.value) return
+  if (logAuto.value) { refreshLogs(); startLogPoll() } else stopLogPoll()
+})
+watch(logOpen, (open) => {
+  if (!open) { stopLogPoll(); logCtx.value = null }
+})
+// 用户滚动：离底部 >40px 视为"在看历史"，暂停跟随；回到贴底恢复。
+function onLogScroll() {
+  const el = logPre.value
+  if (!el) return
+  logFollow.value = el.scrollHeight - el.scrollTop - el.clientHeight < 40
+}
+function scrollLogBottom() {
+  const el = logPre.value
+  if (el) el.scrollTop = el.scrollHeight
 }
 async function refreshLogs() {
   if (!logCtx.value) return
   try {
-    const r = await api.projectLogs(logCtx.value.p.id, logCtx.value.s.name)
+    const r = await api.projectLogs(logCtx.value.p.id, logCtx.value.s.name, 1000)
     logText.value = r.log || '（暂无日志）'
+    logTruncated.value = !!r.truncated
+    // 跟随到底：新内容进来且用户没在看历史 → 贴底；否则保持滚动位置。
+    if (logFollow.value) await nextTick(scrollLogBottom)
   } catch (e) { logText.value = '读取失败：' + e.message }
 }
 async function clearLogs() {
@@ -755,12 +796,16 @@ async function openDir(s) {
       </div>
     </div>
 
-    <!-- 日志 -->
+    <!-- 日志：1k 滑动窗口（后端 tail=1000 环形读）+ 跟随到底 + 可选自动刷新 -->
     <div v-if="logOpen" class="mask" @click.self="logOpen = false">
       <div class="dialog log-dialog">
         <h3>{{ logTitle }} 的日志</h3>
-        <pre class="log num">{{ logText }}</pre>
-        <div class="dialog-foot">
+        <p v-if="logTruncated" class="log-tip">只显示最后 1000 行，更早的在日志文件里（清空前都在）。</p>
+        <pre ref="logPre" class="log num" @scroll="onLogScroll">{{ logText }}</pre>
+        <div class="dialog-foot log-foot">
+          <label class="log-auto"><input type="checkbox" v-model="logAuto" /> 自动刷新（2s）</label>
+          <span v-if="!logFollow" class="log-paused">已暂停跟随（回到底部恢复）</span>
+          <span class="grow"></span>
           <button class="btn ghost" @click="clearLogs">清空</button>
           <button class="btn ghost" @click="refreshLogs">刷新</button>
           <button class="btn primary" @click="logOpen = false">关闭</button>
@@ -1071,4 +1116,10 @@ h2 { margin: 0; font-size: 18px; }
   max-height: 55vh; overflow: auto; margin: 0 0 4px; padding: 12px;
   font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-all;
 }
+/* 日志窗口提示行：truncated 说明窗口裁掉了更早的行，不是全量 */
+.log-tip { color: var(--dim); font-size: 12px; margin: 6px 0; }
+.log-foot { align-items: center; }
+.log-auto { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 12px; cursor: pointer; }
+.log-auto input { accent-color: var(--accent); }
+.log-paused { color: var(--warn); font-size: 12px; }
 </style>

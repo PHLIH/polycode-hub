@@ -1,7 +1,8 @@
 // 管理面 REST 移植测试（行为锚点对齐 Go internal/adminapi/*_test.go）。
 // 契约冻结源：web/src/api.js（路径/方法/形状一字不差）。
 
-import { afterAll, afterEach, beforeAll, describe, expect, test } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from 'vitest'
+import { workbuddyTokenHash } from '../src/adminapi/discover_api.ts'
 import { mkdtempSync, existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -1491,6 +1492,7 @@ describe('discover/import-account（对齐 Go import_account_test.go）', () => 
       key: 'secret',
       body: { key: 'workbuddy', tokenPath, accountId: 'wb-x', displayName: '副号A', credentialFile: 'config/credentials/wb-jwt-x' },
     })
+
     expect(res.status).toBe(201)
     const acct = await res.json() as Account
     expect(acct.id).toBe('wb-x')
@@ -1540,13 +1542,14 @@ describe('discover/import-account（对齐 Go import_account_test.go）', () => 
 
 // ---- quick-import ----
 
-describe('discover/quick-import（对齐 Go quickimport_test.go）', () => {
-  const qf = (accounts: { nickname: string; tokenPath: string; alive: boolean }[]): Finding => ({
-    key: 'workbuddy', harness: 'WB', status: 'ready', detail: '',
-    suggestedProvider: readyProvider('wb-auto'),
-    suggestedAccounts: accounts.map((a) => ({ nickname: a.nickname, alive: a.alive, tokenPath: a.tokenPath })),
-  })
+// quick-import / checkin 共用的发现项夹具（key=workbuddy，草稿名 wb-auto）。
+const qf = (accounts: { nickname: string; tokenPath: string; alive: boolean }[]): Finding => ({
+  key: 'workbuddy', harness: 'WB', status: 'ready', detail: '',
+  suggestedProvider: readyProvider('wb-auto'),
+  suggestedAccounts: accounts.map((a) => ({ nickname: a.nickname, alive: a.alive, tokenPath: a.tokenPath })),
+})
 
+describe('discover/quick-import（对齐 Go quickimport_test.go）', () => {
   test('一键导入：Provider 入库 + 活账号入池 + 死账号跳过 + 幂等', async () => {
     isolateCwd()
     const a = makeAuthFile('主号')
@@ -1602,6 +1605,59 @@ describe('discover/quick-import（对齐 Go quickimport_test.go）', () => {
     expect(out.imported).toBe(0)
     expect(out.skipped).toBe(2)
     expect(readFileSync(join(process.cwd(), 'config', 'credentials', 'workbuddy-1-jwt'), 'utf8')).toBe(newTok)
+  })
+
+  test('一键导入写入 workbuddy 来源标记与 UID，重导入刷新指纹', async () => {
+    isolateCwd()
+    const a = makeAuthFile('主号')
+    const call = caller(build({ discover: new StubDiscover([
+      qf([{ nickname: '主号', tokenPath: a.tokenPath, alive: true }]),
+    ]) }))
+    const res = await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: { key: 'workbuddy' } })
+    expect(res.status).toBe(200)
+    const list = await call('GET', '/admin/api/accounts', { key: 'secret' })
+    const rows = ((await list.json()) as { accounts: Account[] }).accounts
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.importSource).toBe('workbuddy')
+    expect(rows[0]!.workbuddyUid).toBe('uid-主号')
+    expect(rows[0]!.workbuddyTokenHash).toBe(workbuddyTokenHash(a.token))
+    // token 轮换后重新扫描导入：标记与 UID 原位刷新
+    const raw = JSON.parse(readFileSync(a.tokenPath, 'utf8')) as { auth: { accessToken: string } }
+    raw.auth.accessToken += '-v2'
+    writeFileSync(a.tokenPath, JSON.stringify(raw))
+    await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: { key: 'workbuddy' } })
+    const list2 = await call('GET', '/admin/api/accounts', { key: 'secret' })
+    const rows2 = ((await list2.json()) as { accounts: Account[] }).accounts
+    expect(rows2).toHaveLength(1)
+    expect(rows2[0]!.workbuddyTokenHash).toBe(workbuddyTokenHash(raw.auth.accessToken))
+  })
+
+  test('手工建的账号无来源标记；PATCH/POST 不允许伪造 importSource', async () => {
+    isolateCwd()
+    const a = makeAuthFile('主号')
+    const call = caller(build({ discover: new StubDiscover([
+      qf([{ nickname: '主号', tokenPath: a.tokenPath, alive: true }]),
+    ]) }))
+    // 同名昵称的手工账号：不会被误打标记
+    const mk = await call('POST', '/admin/api/accounts', {
+      key: 'secret', body: { id: 'manual', providerName: 'wb-auto', displayName: '主号', credential: {} },
+    })
+    expect(mk.status).toBe(201)
+    await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: { key: 'workbuddy' } })
+    const list = await call('GET', '/admin/api/accounts', { key: 'secret' })
+    const rows = ((await list.json()) as { accounts: Account[] }).accounts
+    const manual = rows.find((x) => x.id === 'manual')
+    expect(manual).toBeDefined()
+    expect(manual!.importSource).toBeUndefined()
+    expect(manual!.workbuddyUid).toBeUndefined()
+    const patched = await call('PATCH', '/admin/api/accounts/manual', {
+      key: 'secret', body: { importSource: 'workbuddy', workbuddyUid: 'x' },
+    })
+    expect(patched.status).toBe(400)
+    const posted = await call('POST', '/admin/api/accounts', {
+      key: 'secret', body: { id: 'fake', providerName: 'wb-auto', importSource: 'workbuddy', credential: {} },
+    })
+    expect(posted.status).toBe(400)
   })
 
   test('zen 未配 ZEN_KEY：公共 key 自动落凭据文件；已配则不动', async () => {
@@ -1889,8 +1945,7 @@ describe('PUT /admin/api/providers/:pid/models/:model/enabled（对外暴露开�
 })
 
 // 手填错的模型得能摘掉：PATCH models 只增不减，所以删除必须独立端点。
-describe('DELETE /admin/api/providers/:pid/models/:model（删单个模型）', () => {
-  test('删掉指定模型，其余不动；未知 provider/模型 404', async () => {
+describe('DELETE /admin/api/providers/:pid/models/:model（删单个模型）', () => {  test('删掉指定模型，其余不动；未知 provider/模型 404', async () => {
     const p = mkProviderFixed({
       name: 'pz', api: 'anthropic-messages',
       models: [

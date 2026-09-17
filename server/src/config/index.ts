@@ -60,10 +60,141 @@ export function loadConfig(path: string): Config {
     throw new Error(`读取配置失败: ${(err as Error).message}（可 cp config/apps.example.yaml config/apps.yaml 起步，POLYCODE_CONFIG 可覆盖路径）`)
   }
   const raw_ = parse(raw) as Record<string, unknown> | null
-  const cfg = fromRaw(raw_ ?? {})
+  const top = raw_ ?? {}
+  migrateLegacy(top)
+  const cfg = fromRaw(top)
   applyDefaults(cfg)
   validate(cfg)
   return cfg
+}
+
+// ---- 旧结构自动迁移（e95c1d3 废弃 sources / provider.id / source_id）----
+//
+// 背景：config/apps.yaml 是 gitignored 本地文件，`git reset --hard` 盖不掉它。
+// 老文件（顶层 sources + providers[].id/source_id + accounts[].source_id +
+// models[].provider_id）在严格模式下会直接抛 `未知字段 "sources"` 导致进程退出。
+// 这里做只增不减的兼容：识别已知的旧字段，原地迁成新形状 + console.warn 提示改文件。
+// 真正拼错的字段仍然抛错（防拼错 + 凭据不落明文的硬约束不变）。
+// 只做内存迁移，不回写文件（保住用户注释；DB 播种会把迁后的值落库）。
+function migrateLegacy(top: Record<string, unknown>): void {
+  // 1. 顶层 sources：概念已删除，直接忽略。
+  if ('sources' in top) {
+    console.warn('配置兼容：顶层 sources 段已废弃（Provider 改用 name 标识），已忽略该段；建议从配置文件手动删除')
+    delete top.sources
+  }
+  const providers = Array.isArray(top.providers)
+    ? (top.providers as Record<string, unknown>[])
+    : undefined
+  // 先收映射表（删 source_id 之前）：老 source 名 -> 旗下 Provider 名。
+  // 另收老 provider id -> 新 name（id 改名来的）。
+  const sourceToProviders = new Map<string, string[]>()
+  const idToName = new Map<string, string>()
+  if (providers) {
+    for (const p of providers) {
+      if (!p || typeof p !== 'object' || Array.isArray(p)) continue
+      const oldId = typeof p.id === 'string' ? p.id : ''
+      const curName = typeof p.name === 'string' ? p.name : ''
+      if (oldId && !curName) {
+        p.name = oldId
+        console.warn(`配置兼容：providers[].id "${oldId}" 已改名为 providers[].name，已自动迁移；请改文件`)
+        idToName.set(oldId, oldId)
+      } else if (oldId && curName && oldId !== curName) {
+        console.warn(`配置兼容：provider 同时有 id "${oldId}" 与 name "${curName}"，已采用 name；请删除 id`)
+        idToName.set(oldId, curName)
+      } else if (oldId) {
+        idToName.set(oldId, curName)
+      }
+      const sid = typeof p.source_id === 'string' ? p.source_id : ''
+      if (sid) {
+        const key = (typeof p.name === 'string' && p.name) || oldId || sid
+        const arr = sourceToProviders.get(sid) ?? []
+        arr.push(key)
+        sourceToProviders.set(sid, arr)
+      }
+    }
+    // 第二遍：删 source_id、enabled→state、清 models.provider_id。
+    for (const p of providers) {
+      if (!p || typeof p !== 'object' || Array.isArray(p)) continue
+      const pname = (typeof p.name === 'string' && p.name) || (typeof p.id === 'string' && p.id) || '?'
+      if ('source_id' in p) {
+        console.warn(`配置兼容：provider ${pname} 的 source_id 已废弃（sources 概念已删除），已忽略；请删除该行`)
+        delete p.source_id
+      }
+      if ('id' in p) delete p.id // 已迁成 name（或与 name 并存时已取 name），不留脏字段
+      if ('enabled' in p && !('state' in p)) {
+        // 与 adminapi/store.migrateProviders 同口径：enabled===false→paused，其余→active。
+        p.state = p.enabled === false ? 'paused' : 'active'
+        if (p.enabled === false) {
+          console.warn(`配置兼容：provider ${pname} 的 enabled: false 已迁成 state: paused；请改文件`)
+        }
+        delete p.enabled
+      } else if ('enabled' in p) {
+        console.warn(`配置兼容：provider ${pname} 同时有 enabled 与 state，已采用 state；请删除 enabled`)
+        delete p.enabled
+      }
+      if (Array.isArray(p.models)) {
+        for (const m of p.models as Record<string, unknown>[]) {
+          if (!m || typeof m !== 'object' || Array.isArray(m)) continue
+          if ('provider_id' in m) {
+            // 模型嵌在 Provider 下，反向引用冗余，直接丢掉。只在真删掉时告警，避免新配置每次启动刷屏。
+            console.warn(`配置兼容：provider ${pname} 下 models[].provider_id 已废弃（嵌套即归属），已忽略`)
+            delete m.provider_id
+            break
+          }
+        }
+      }
+    }
+  }
+  // 3. 账号归属：老 accounts[].source_id（源名）→ 新 provider（Provider 名）。
+  // 老语义：账号挂在 Source 下；新语义：账号挂在 Provider 下。
+  // 解析顺序：① source_id 值直命中 Provider 名（单源单 Provider 最常见，源名常与 Provider 名相同）；
+  // ② 老 id→name 改名表；③ 该源旗下的 Provider（唯一则取它，多个取首个并告警）。
+  // 都命中不到则留空（下游 cli 会点名该账号不参与轮询，但进程照常启动）。
+  const providerNames = new Set<string>()
+  if (providers) {
+    for (const p of providers) {
+      if (p && typeof p === 'object' && !Array.isArray(p) && typeof p.name === 'string') {
+        providerNames.add(p.name)
+      }
+    }
+  }
+  if (Array.isArray(top.accounts)) {
+    for (const a of top.accounts as Record<string, unknown>[]) {
+      if (!a || typeof a !== 'object' || Array.isArray(a)) continue
+      const aid = (typeof a.id === 'string' && a.id) || '?'
+      // provider_id 写成字符串（老手误把名字填进数字字段）：当名字用。
+      // 与 adminapi/store.migrateAccounts 同口径（两种旧形态都存的是名字，都要查表换 id）。
+      if (typeof a.provider_id === 'string' && !('provider' in a)) {
+        console.warn(`配置兼容：账号 ${aid} 的 provider_id 是字符串，已按 Provider 名处理；请改成 provider: ${a.provider_id}`)
+        a.provider = a.provider_id
+        delete a.provider_id
+      }
+      if (!('source_id' in a)) continue
+      const sid = typeof a.source_id === 'string' ? a.source_id : ''
+      delete a.source_id
+      if ('provider' in a) {
+        console.warn(`配置兼容：账号 ${aid} 同时有 source_id 与 provider，已采用 provider；请删除 source_id`)
+        continue
+      }
+      let resolved = ''
+      if (sid && providerNames.has(sid)) resolved = sid
+      else if (sid && idToName.has(sid)) resolved = idToName.get(sid)!
+      else if (sid && sourceToProviders.has(sid)) {
+        const cands = sourceToProviders.get(sid)!
+        resolved = cands[0]!
+        if (cands.length > 1) {
+          console.warn(`配置兼容：账号 ${aid} 的源 "${sid}" 下有 ${cands.length} 个 Provider（${cands.join('、')}），已暂挂到 ${resolved}；请在文件里明确写 provider: <名> 或去管理面调整`)
+        } else {
+          console.warn(`配置兼容：账号 ${aid} 的 source_id "${sid}" 已迁成 provider: ${resolved}；请改文件`)
+        }
+      }
+      if (resolved) {
+        a.provider = resolved
+      } else if (sid) {
+        console.warn(`配置兼容：账号 ${aid} 的源 "${sid}" 找不到对应 Provider，该账号暂不参与轮询（进程照常启动）；请写 provider: <现有 Provider 名> 或去管理面调整`)
+      }
+    }
+  }
 }
 
 // ---- 严格映射：YAML snake_case → camelCase，未知字段报错 ----

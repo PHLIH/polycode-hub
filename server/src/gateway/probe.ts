@@ -216,7 +216,7 @@ export class Probe {
       const rank = errorRank(kind, r.error)
       if (!best || rank > best.rank) best = { err: r.error, kind, rank }
       // 认证/请求侧硬错误：换协议也没用，早停省时间。
-      if (probeFatalError(r.error)) break
+      if (probeFatalError(r.error, kind)) break
     }
     if (lastUL && lastUL.modelId) {
       void this.usage?.insertLog({ ...lastUL, status: 'upstream_error', latencyMs: lastLatency })
@@ -399,6 +399,12 @@ function probeProtocolOrder(pv: Provider, modelID: string): string[] {
   const all = ['openai-completions', 'openai-responses', 'anthropic-messages']
   const m = pv.models.find((x) => x.id === modelID)
   const first = m?.api || pv.api || ''
+  // 模型级声明最可信（用户/扫描写入的事实）；Provider 级只是默认猜测。
+  // 已知事实：zen 的 muse-spark 系只认 /responses，走 /chat/completions 上游回 500。
+  // Provider 级 api 是 openai-completions 时不要再让它先撞 500——按已知族提前 responses。
+  if (!m?.api && /^muse-spark/i.test(modelID)) {
+    return ['openai-responses', ...all.filter((p) => p !== 'openai-responses')]
+  }
   if (!first) return all
   return [first, ...all.filter((p) => p !== first)]
 }
@@ -418,7 +424,9 @@ function pinModelProtocol(models: Provider['models'], modelID: string, proto: st
 // 回 404 HTML 页）。把它当硬错误会让探测就地终止，唯一能用的 /responses 永远轮不到
 // （muse-spark 真实缺陷）。403 同理有 RegionError 细分，已在 classifyUpstreamError 归为
 // bad_request，不在此早停。
-function probeFatalError(msg: string): boolean {
+function probeFatalError(msg: string, kind = ''): boolean {
+  // 指纹缺失（FreeTierError）：上游只认官方客户端样子，换协议/换出口都无解，早停省时间。
+  if (kind === 'fingerprint') return true
   return msg.includes('http 401')
 }
 
@@ -428,6 +436,9 @@ function probeFatalError(msg: string): boolean {
 // 连冷却时长都会算错（按 bad_request 30s，而非限流 1min / 额度 10min）。
 function errorRank(kind: string, msg: string): number {
   const byKind: Record<string, number> = {
+    // 指纹缺失排最高：它是「上游明确拒绝这个身份」，比额度/限流更能定位问题，
+    // 且绝不能被后续协议的 404/400 路径噪音盖掉。
+    fingerprint: 60,
     quota: 50, rate_limit: 40, auth: 45, server: 20, network: 15, bad_request: 5, unknown: 0,
   }
   const k = byKind[kind] ?? 0

@@ -162,6 +162,7 @@ export const api = {
   testAccount: (id, model) => req('POST', `/admin/api/accounts/${encodeURIComponent(id)}/test`, { model: model || '' }),
   // 重置惩罚（零上游成本）：只清连败与冷却，不探活。
   recheckAccount: (id) => req('POST', `/admin/api/accounts/${encodeURIComponent(id)}/recheck`),
+  checkinAccount: (id) => req('POST', `/admin/api/accounts/${encodeURIComponent(id)}/checkin`, {}, { timeoutMs: 20000 }),
   discover: async () => {
     const data = await req('GET', '/admin/api/discover')
     return Array.isArray(data) ? data : (data && data.findings) || []
@@ -179,7 +180,7 @@ export const api = {
   projectAction: (id, action) => req('POST', `/admin/api/projects/${encodeURIComponent(id)}/${action}`),
   projectServiceAction: (id, sid, action, body) =>
     req('POST', `/admin/api/projects/${encodeURIComponent(id)}/services/${encodeURIComponent(sid)}/${action}`, body),
-  projectLogs: (id, sid, tail = 200) =>
+  projectLogs: (id, sid, tail = 1000) =>
     req('GET', `/admin/api/projects/${encodeURIComponent(id)}/logs?service=${encodeURIComponent(sid)}&tail=${tail}`),
   clearProjectLogs: (id, sid) =>
     req('DELETE', `/admin/api/projects/${encodeURIComponent(id)}/logs?service=${encodeURIComponent(sid)}`),

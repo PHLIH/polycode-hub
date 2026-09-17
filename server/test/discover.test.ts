@@ -5,8 +5,8 @@ import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
-  checkWorkBuddy, checkZCode, checkZen, discoverWorkBuddyAccounts,
-  discoverWorkBuddyModels, workBuddyAuthDirs, workBuddySearchPaths,
+  checkWorkBuddy, checkWorkBuddyWithAccounts, checkZCode, checkZen, discoverWorkBuddyAccounts,
+  discoverWorkBuddyModels, workBuddyAuthDirs, workBuddySearchPaths, searchWorkBuddyAuthFiles,
   Scanner, defaultConfig, type ScanConfig,
 } from '../src/discover/index.ts'
 import { providerValidate, type Provider } from '../src/model/index.ts'
@@ -92,6 +92,45 @@ describe('search paths', () => {
     expect(dirs).toContain('/home/u/Library/Application Support/CodeBuddyExtension/Data/Public/auth')
   })
 
+  // 真实缺陷（2026-09-17）：Windows 只扫了 AppData\Roaming，而桌面端登录态实际落在
+  // AppData\Local\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info
+  // → 已登录的机器一律报 missing（「没登录」的误诊）。Local 必须被覆盖。
+  test('windows 目录候选同时覆盖 Local 与 Roaming', () => {
+    const env = { USERPROFILE: 'C:\\Users\\u' }
+    const dirs = workBuddyAuthDirs('windows', 'C:\\Users\\u', 'C:\\Users\\u', env)
+    // 用 path.join 拼出的分隔符随平台变（本机跑测试是 POSIX），断言按「层级」匹配
+    const norm = dirs.map((d) => d.replace(/\\/g, '/')).join('|')
+    expect(norm).toContain('AppData/Local/CodeBuddyExtension/Data/Public/auth')
+    expect(norm).toContain('AppData/Roaming/CodeBuddyExtension/Data/Public/auth')
+  })
+
+  test('windows 尊重 LOCALAPPDATA/APPDATA 重定向（环境变量优先于 join 猜测）', () => {
+    const env = { USERPROFILE: 'C:\\Users\\u', LOCALAPPDATA: 'D:\\Redir\\Local', APPDATA: 'D:\\Redir\\Roaming' }
+    const paths = workBuddySearchPaths('windows', 'C:\\Users\\u', 'C:\\Users\\u', env)
+    expect(paths.some((p) => p.startsWith('D:\\Redir\\Local'))).toBe(true)
+    expect(paths.some((p) => p.startsWith('D:\\Redir\\Roaming'))).toBe(true)
+  })
+
+  test('CODEBUDDY_DESKTOP_AUTH_DIR 兜底目录被纳入候选', () => {
+    const env = { CODEBUDDY_DESKTOP_AUTH_DIR: 'E:\\Portable\\auth' }
+    const paths = workBuddySearchPaths('windows', 'C:\\Users\\u', 'C:\\Users\\u', env)
+    expect(paths.some((p) => p.startsWith('E:\\Portable\\auth'))).toBe(true)
+  })
+
+  test('智能兜底：只给数据根也能按文件名递归定位登录态', async () => {
+    const root = await tempDir()
+    // 模拟版本号导致的中间目录改名（候选路径猜不到）
+    const nested = join(root, 'CodeBuddyExtension', '2.63.2', 'Data', 'Public', 'auth')
+    await mkdir(nested, { recursive: true })
+    const path = await writeAuthFile(nested, 'workbuddy-desktop.info', craftJWT(new Date(Date.now() + 3600_000)))
+    const found = searchWorkBuddyAuthFiles([root])
+    expect(found).toContain(path)
+    const { finding, ok } = checkWorkBuddyWithAccounts([], [], [root])
+    expect(ok).toBe(true)
+    expect(finding.status).toBe('ready')
+    expect(finding.detail).toContain('智能兜底')
+  })
+
   test('env 覆盖优先', () => {
     vi.stubEnv('CODEBUDDY_DESKTOP_AUTH_FILE', '/custom/a.info')
     try {
@@ -161,6 +200,41 @@ describe('checkZen', () => {
   test('响应非 JSON → unreachable', async () => {
     const f = await checkZen('https://zen.example', (async () => new Response('<html>')) as typeof fetch)
     expect(f.status).toBe('unreachable')
+  })
+
+  // 真实假阳性（2026-09-17 实测）：GET /v1/models 是免指纹端点，71 个模型全列出
+  // 只证明网络通；缺 UA/会话指纹时真正的 chat/completions 回 403 FreeTierError。
+  // 旧实现把「探得到模型」当 ready，用户到手才炸。现在必须真调一次才认 ready。
+  test('列表通但真实调用 403 指纹错 → 不冒充 ready，点名缺指纹', async () => {
+    const f = await checkZen('https://zen.example', fetchOK, 8000, async () => ({
+      ok: false, kind: 'fingerprint',
+      error: "upstream fingerprint (http 403): OpenCode's free tier can only be used from within OpenCode",
+    }))
+    expect(f.status).toBe('unreachable')
+    expect(f.detail).toContain('缺少客户端指纹')
+    expect(f.actions?.some((a) => a.includes('x-session-id'))).toBe(true)
+  })
+
+  test('列表通且真实调用成功 → ready，并标出实测模型', async () => {
+    const fetchFree = (async () => new Response(
+      JSON.stringify({ data: [{ id: 'mimo-v2.5-free' }, { id: 'paid-x' }] }), { status: 200 },
+    )) as typeof fetch
+    let called = ''
+    const f = await checkZen('https://zen.example', fetchFree, 8000, async (model) => {
+      called = model
+      return { ok: true }
+    })
+    expect(f.status).toBe('ready')
+    expect(called).toBe('mimo-v2.5-free') // 优先免费档模型
+    expect(f.detail).toContain('实测')
+  })
+
+  test('列表通但调用非指纹类失败 → unreachable 且保留原因', async () => {
+    const f = await checkZen('https://zen.example', fetchOK, 8000, async () => ({
+      ok: false, error: 'upstream server (http 500): boom',
+    }))
+    expect(f.status).toBe('unreachable')
+    expect(f.detail).toContain('http 500')
   })
 })
 

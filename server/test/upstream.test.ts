@@ -237,7 +237,9 @@ describe('上游错误分类细化：429 额度用尽 ≠ 429 限流', () => {
       type: 'error',
       error: { type: 'FreeTierError', message: "Error from provider (Console): OpenCode's free tier can only be used from within OpenCode" },
     })
-    expect(classifyUpstreamError(403, freeTier)).toBe(UPSTREAM.BAD_REQUEST)
+    // 指纹缺失单独归类：既不是 Key 错（归 auth 会让人白翻 API Key），
+    // 也不是协议路径错（归 bad_request 会被探测当路径噪音压到最低优先级）。
+    expect(classifyUpstreamError(403, freeTier)).toBe(UPSTREAM.FINGERPRINT)
     // 地区限制同理（换出口代理能解，不是 Key 错）
     expect(classifyUpstreamError(403, '{"error":{"type":"RegionError"}}')).toBe(UPSTREAM.BAD_REQUEST)
     // 真正的凭据错误仍归 auth（别把这条顺手改坏了）
@@ -357,6 +359,31 @@ describe('withOpts 派生实例必须继承 egress 表（探测按钮真实缺�
     const up = new Upstream({ credLookup: () => ['', false], egresses: { clash: 'http://127.0.0.1:1' } })
     const derived = up.withOpts({ noAutoProtocol: true })
     expect(await derived.fetchModels(prov({ baseUrl: `${pbase}/v1`, api: 'openai-completions' }))).toEqual(['m'])
+    await new Promise<void>((r) => px.close(() => r()))
+  })
+
+  // 真实缺陷（2026-09-17，验证 zen 探针时现场踩到）：withOpts 硬写
+  // `credLookup: this.credLookup`，调用方传入的 lookup 被**静默丢弃**。
+  // 现象：探针注入了「ZEN_KEY 缺省回落到公共 key public」的 lookup，实际仍走原实例的
+  // env-only 查找 → 恒报「环境变量 ZEN_KEY 未设置」，一个看起来像「没配凭据」的假阴性，
+  // 而真正的病根是派生实例没接受覆盖。凭据这种事静默走错最危险：报错指向完全无关的方向。
+  test('派生实例可覆盖 credLookup（传进来的 lookup 必须生效，不能被静默丢弃）', async () => {
+    const seen: string[] = []
+    const { server: px, base: pbase } = await import('./helpers/one-shot-server.ts').then((m) =>
+      m.startOneShot((req, res) => {
+        seen.push(req.headers.authorization ?? '')
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end('{"object":"list","data":[{"id":"m"}]}')
+      }))
+    // 原实例：找不到任何凭据；派生实例：给出公共 key
+    const up = new Upstream({ credLookup: () => ['', false] })
+    const derived = up.withOpts({ noAutoProtocol: true, credLookup: () => ['public', true] })
+    await derived.fetchModels(prov({ baseUrl: `${pbase}/v1`, api: 'openai-completions', credential: { apiKeyEnv: 'ZEN_KEY' } }))
+    expect(seen[0]).toBe('Bearer public')
+    // 不传 credLookup 时仍继承原实例（默认行为不能被这次修复破坏）
+    await expect(up.withOpts({ noAutoProtocol: true })
+      .fetchModels(prov({ baseUrl: `${pbase}/v1`, api: 'openai-completions', credential: { apiKeyEnv: 'ZEN_KEY' } })))
+      .rejects.toThrow(/ZEN_KEY/)
     await new Promise<void>((r) => px.close(() => r()))
   })
 })

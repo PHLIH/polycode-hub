@@ -244,6 +244,9 @@ export interface Account {
   // 指向数字 id 而非名字：Provider 改名后账号归属自动跟着走，不用迁移。
   providerId: number
   displayName?: string
+  importSource?: 'workbuddy'
+  workbuddyUid?: string
+  workbuddyTokenHash?: string
   credential: CredentialRef
   status: AccountStatus
   fails: number

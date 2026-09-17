@@ -20,11 +20,12 @@ export interface UsageSink {
   insertLog(l: UsageLog): Promise<void> | void
 }
 
-// 失败分类 → 账号冷却时长（限流 1min、耗尽 10min、鉴权 30min、其他 30s）。
+// 失败分类 → 账号冷却时长（限流 1min、耗尽 10min、鉴权/指纹 30min、其他 30s）。
+// 指纹缺失与鉴权同类：不配好 UA/会话就永远 403，30s 冷却只会让它反复爬起来空撞。
 export function cooldownFor(kind: string): number {
   if (kind === UPSTREAM.RATE_LIMIT) return 60_000
   if (kind === UPSTREAM.QUOTA) return 600_000
-  if (kind === UPSTREAM.AUTH) return 1_800_000
+  if (kind === UPSTREAM.AUTH || kind === UPSTREAM.FINGERPRINT) return 1_800_000
   return 30_000
 }
 
@@ -76,6 +77,11 @@ export function mapUpstreamError(ue: UpstreamError | undefined, sentEffort?: str
     case UPSTREAM.AUTH: return irError(ERR.AUTHENTICATION, '上游鉴权失败: ' + ue.message)
     case UPSTREAM.QUOTA: return irError(ERR.RATE_LIMIT, '上游额度耗尽: ' + ue.message)
     case UPSTREAM.NETWORK: return irError(ERR.OVERLOADED, '上游不可达: ' + ue.message)
+    // 指纹缺失不是「上游故障」而是「本地没配」：必须给可执行动作，
+    // 否则用户只拿到一句英文 403，不知道该去 Provider 头里配什么。
+    case UPSTREAM.FINGERPRINT: return irError(ERR.AUTHENTICATION,
+      '上游只接受官方客户端指纹（免费档限制）: ' + ue.message
+      + '；请在该 Provider 头里配真实 User-Agent 与 x-session-id/x-session-affinity（opencode run --print-logs 取 created id=），或设 ZEN_UA 环境变量；用 opencode 做客户端时自动透传')
     default: {
       const hint = ue.kind === UPSTREAM.BAD_REQUEST && (sentEffort ?? '').trim() !== ''
         ? REASONING_PRESET_HINT

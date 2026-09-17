@@ -4,6 +4,7 @@
 // （防任意文件读）；credentialFile 只允许写在 config/credentials/ 下（防路径穿越）。
 
 import { readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { join, normalize, sep } from 'node:path'
 import { writeFile0600 } from './credential_file.ts'
 import { ERR } from '../ir/index.ts'
@@ -43,7 +44,7 @@ export function credentialPathOK(p: string): boolean {
 }
 
 // 读登录态文件并取出 accessToken。
-function readAccessToken(tokenPath: string): string {
+function readSession(tokenPath: string): { token: string; uid?: string } {
   let raw: string
   try {
     raw = readFileSync(tokenPath, 'utf8')
@@ -51,14 +52,17 @@ function readAccessToken(tokenPath: string): string {
     throw new Error((e as Error).message)
   }
   let token = ''
+  let uid: string | undefined
   try {
     const f: unknown = JSON.parse(raw)
-    if (isObj(f) && isObj(f.auth) && typeof f.auth.accessToken === 'string') token = f.auth.accessToken
-  } catch {
-    // 落到下面的空值校验
-  }
+    if (isObj(f) && isObj(f.auth) && typeof f.auth.accessToken === 'string') token = f.auth.accessToken.trim()
+    if (isObj(f) && isObj(f.account) && typeof f.account.uid === 'string') {
+      const value = f.account.uid.trim()
+      if (value.length > 0 && value.length <= 256 && !/[\s\x00-\x1f\x7f]/.test(value)) uid = value
+    }
+  } catch {}
   if (token === '') throw new Error('登录态文件不含有效 accessToken')
-  return token
+  return { token, uid }
 }
 
 export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
@@ -173,7 +177,7 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     // 服务端读 token → 写凭据文件（0600）→ 建 account（只存文件引用）。
     let token: string
     try {
-      token = readAccessToken(tokenPath)
+      token = readSession(tokenPath).token
     } catch (e) {
       const msg = (e as Error).message
       return errRes(c, 400, ERR.INVALID_REQUEST,
@@ -222,23 +226,15 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     let p: Provider
     let created: boolean
     const existing = providers.getByName(suggested.name)
-    if (existing) {
+    if (existing && existing.state !== 'deleted') {
       p = existing
       created = false
     } else {
-      // 幂等第二层：同名且未删除的 Provider 已存在（用户之前手工建过）——
-      // 视为已接管，不重复建。
-      const named = providers.getByName(suggested.name)
-      const sameProvider = named && named.state !== 'deleted' ? named : undefined
-      if (sameProvider) {
-        p = sameProvider
-        created = false
-      } else {
-        providers.put(suggested)
-        changed()
-        p = suggested
-        created = true
-      }
+      suggested.providerId = 0
+      providers.put(suggested)
+      changed()
+      p = suggested
+      created = true
     }
 
     // ② 凭据默认值：ZEN_KEY 未配置时自动落免费档公共 key 凭据文件。
@@ -285,22 +281,34 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     let skipped = 0
     for (const acc of suggested ?? []) {
       if (!acc.alive) continue
-      let tok: string
+      let sess: { token: string; uid?: string }
       try {
-        tok = readAccessToken(acc.tokenPath)
+        sess = readSession(acc.tokenPath)
       } catch (e) {
         warnings.push(`${acc.nickname}：跳过（${(e as Error).message}）`)
         continue
       }
-      if (sourceAccountHasToken(ownerId, tok)) {
+      const tok = sess.token
+      const duplicate = sourceAccountWithToken(ownerId, tok)
+      if (duplicate) {
+        if (key === 'workbuddy') {
+          markWorkbuddySource(duplicate, sess)
+          accounts.put(duplicate)
+          changed()
+        }
         skipped++
         continue
       }
-      // 同身份但 token 变了 = 登录态轮换：原位更新凭据文件，不另建新账号。
-      const same = findSameIdentity(ownerId, acc.nickname)
+      const same = key === 'workbuddy'
+        ? accounts.list().find((a) => a.providerId === ownerId && a.importSource === 'workbuddy'
+          && !!sess.uid && a.workbuddyUid === sess.uid)
+        : findSameIdentity(ownerId, acc.nickname)
       if (same && same.credential.apiKeyFile) {
         try {
           writeFile0600(same.credential.apiKeyFile, tok)
+          if (key === 'workbuddy') markWorkbuddySource(same, sess)
+          accounts.put(same)
+          changed()
           skipped++
           warnings.push(`${acc.nickname}：登录态已刷新（token 轮换）`)
           continue
@@ -323,11 +331,13 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
         warnings.push(`${acc.nickname}：跳过（${(e as Error).message}）`)
         continue
       }
-      accounts.put({
+      const fresh: Account = {
         id, providerId: ownerId, displayName: acc.nickname,
         credential: { apiKeyFile: credFile },
         status: 'available', fails: 0,
-      })
+      }
+      if (key === 'workbuddy') markWorkbuddySource(fresh, { uid: sess.uid, token: tok })
+      accounts.put(fresh)
       imported++
     }
     return { warnings, imported, skipped }
@@ -343,23 +353,31 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
   }
 
   // 同 Provider 账号池里是否已有这个 token（按凭据文件内容比对；读不了视为不重复）。
-  function sourceAccountHasToken(providerId: number, token: string): boolean {
+  function sourceAccountWithToken(providerId: number, token: string): Account | undefined {
     for (const acct of accounts.list()) {
       if (acct.providerId !== providerId || !acct.credential.apiKeyFile) continue
       try {
-        if (readFileSync(acct.credential.apiKeyFile, 'utf8') === token) return true
+        if (readFileSync(acct.credential.apiKeyFile, 'utf8').trim() === token) return acct
       } catch {
         // 读不了视为不重复
       }
     }
-    return false
+    return undefined
   }
 
-  // 同 Provider 且显示名含昵称的账号（昵称是稳定身份，显示名可能带后缀，包含匹配）。
   function findSameIdentity(providerId: number, nickname: string): Account | undefined {
     if (nickname === '') return undefined
-    return accounts.list().find(
-      (a) => a.providerId === providerId && (a.displayName ?? '').includes(nickname))
+    return accounts.list().find((a) => a.providerId === providerId
+      && (a.displayName ?? '').includes(nickname))
+  }
+
+  function markWorkbuddySource(
+    acct: Account, s: { uid?: string; token: string },
+  ): void {
+    acct.importSource = 'workbuddy'
+    if (s.uid) acct.workbuddyUid = s.uid
+    else delete acct.workbuddyUid
+    acct.workbuddyTokenHash = workbuddyTokenHash(s.token)
   }
 }
 
@@ -370,4 +388,8 @@ function cloneProvider(p: Provider): Provider {
 // 账号池 ID 前缀（沿用既有 workbuddy-N 惯例）。
 function shortAccountPrefix(key: string): string {
   return key === 'workbuddy' ? 'workbuddy' : key
+}
+
+export function workbuddyTokenHash(token: string): string {
+  return createHash('sha256').update(token, 'utf8').digest('hex')
 }

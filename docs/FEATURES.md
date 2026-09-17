@@ -167,11 +167,11 @@ SQLite 持久化（`usage/store.ts`，schema v2，`user_version` 前向迁移，
 ## 11. 本地项目管理器（与代理链路解耦）
 
 - 功能：手动录入项目/服务，一键启停、端口冲突检测、经用户同意的端口映射、最长运行时长自动关闭（`projects/store.ts:1-3`）。
-- 数据：定义 `config/projects/projects.json`、运行状态 `config/projects/projects-state.json`（`projects/store.ts:96-102`，dir 由 `cli.ts:142` 传入）、日志 `config/projects/logs/<projectID>-<service>.log`（`projects/store.ts:48-50`，追加写 + 启动分隔线）。定义缺失 = 空表不报错；损坏 = 报错（不能静默当空表，否则后续 save 覆盖用户数据，`:52-71`）。
+- 数据：定义 `config/projects/projects.json`、运行状态 `config/projects/projects-state.json`（`projects/store.ts:96-102`，dir 由 `cli.ts:142` 传入）、日志 `config/projects/logs/<projectID>-<service>.log`（`projects/store.ts:48-50`，追加写 + 启动分隔线）。日志读取是 1k 条滑动窗口：`readTailLines` 从文件尾按 64KB 块往前扫（`projects_app.ts`），Vite 热更新刷出几十万行也不全量进内存；前端弹窗默认拉 1000 条、贴底跟随、往上滚自动暂停跟随、可选 2s 自动刷新。定义缺失 = 空表不报错；损坏 = 报错（不能静默当空表，否则后续 save 覆盖用户数据，`:52-71`）。
 - Service 定义（`projects/store.ts:10-24`）：name / dir / cmd / port（0 = 非网络服务，跳过端口检测）/ portEnv（端口映射方式，缺省 = 端口写死）/ maxRuntimeHours（0/缺省 = 不自动关闭）。
 - 启动：端口被占返回 `ConflictError`（API 转 409），带 suggested/remappable（仅 portEnv 已声明的服务可映射）；`startProject` 冲突不阻断其余服务；`stop` 幂等；`restart = stop + start`；巡检每 60s 一次（`cli.ts:186`），超时 kill 留便签 + 死进程清账（`manager.ts:275 sweep`）。
 - 端口检测：`process.ts:portBusy:134-147`（TCP 连 127.0.0.1 探监听）、`portOwner:159-175`（lsof/netstat 查占用者）、`freePort:150-155`（从 port+1 找 100 个）、`portPids/killPort`（按端口查 pid 并停掉外部进程；网关自身端口拒绝停）。
-- HTTP（`projects_app.ts`，挂载前缀 `/admin/api/projects`）：`GET /` 列表，`POST /` 新建，`PUT /:id` 替换，`DELETE /:id`（先停再删），`POST /:id/start|stop`，`POST /:id/services/:sid/start|stop|restart`（冲突 409），`GET /port-owner?port=`，`POST /port-kill {port, confirm:true}`（停外部占用进程，前端「端口被占用」标签点击二次确认后调用），`POST /open`，`GET /browse|readmes|default-model|reminders`，`POST /ai-fill`（经本网关 chat/completions），`GET|DELETE /:id/logs?service&tail`（默认 tail 200）。
+- HTTP（`projects_app.ts`，挂载前缀 `/admin/api/projects`）：`GET /` 列表，`POST /` 新建，`PUT /:id` 替换，`DELETE /:id`（先停再删），`POST /:id/start|stop`，`POST /:id/services/:sid/start|stop|restart`（冲突 409），`GET /port-owner?port=`，`POST /port-kill {port, confirm:true}`（停外部占用进程，前端「端口被占用」标签点击二次确认后调用），`POST /open`，`GET /browse|readmes|default-model|reminders`，`POST /ai-fill`（经本网关 chat/completions），`GET|DELETE /:id/logs?service&tail`（默认 tail 1000，上限 5000，环形读只扫尾部块；返回 {log, tail, truncated}）。
 
 ## 12. 出口代理（egress）
 

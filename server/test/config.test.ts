@@ -58,6 +58,92 @@ describe('仓库自带示例配置', () => {
   })
 })
 
+// 真实故障（2026-09-17）：config/apps.yaml 是 gitignored 本地文件，`git reset --hard`
+// 盖不掉它；老结构（sources + provider.id/source_id）撞上严格模式直接
+// `未知字段 "sources"` 让进程退出。用户被迫删配置才能起服务。
+describe('旧结构自动迁移（老本地配置必须能启动）', () => {
+  const legacyYaml = (body: string) => write('legacy.yaml', body)
+
+  test('顶层 sources 被忽略，不再让进程退出', () => {
+    const cfg = loadConfig(legacyYaml(`
+sources:
+  - id: company
+    display_name: 公司源
+providers:
+  - id: p1
+    source_id: company
+    access_kind: official
+    risk: low
+    stability: stable
+    base_url: https://x.example
+`))
+    expect(cfg.providers).toHaveLength(1)
+  })
+
+  test('provider.id → name；enabled → state；source_id 被忽略', () => {
+    const cfg = loadConfig(legacyYaml(`
+providers:
+  - id: myprov
+    source_id: s1
+    enabled: false
+    access_kind: official
+    risk: low
+    stability: stable
+    base_url: https://x.example
+    models:
+      - id: m1
+        provider_id: myprov
+        enabled: true
+`))
+    const p = cfg.providers[0]!
+    expect(p.name).toBe('myprov')
+    expect(p.state).toBe('paused') // enabled: false → paused（与库迁移同口径）
+    expect((p.models[0] as { providerId?: unknown }).providerId).toBeUndefined()
+  })
+
+  test('account.source_id → provider（值命中 Provider 名）', () => {
+    const cfg = loadConfig(legacyYaml(`
+providers:
+  - id: zcode
+    access_kind: official
+    risk: low
+    stability: stable
+    base_url: https://x.example
+accounts:
+  - id: a1
+    source_id: zcode
+    credential:
+      api_key_file: config/credentials/k
+`))
+    expect((cfg.accounts[0] as { providerName?: string }).providerName).toBe('zcode')
+  })
+
+  test('account.source_id 走「源 → 旗下 Provider」映射（源名与 Provider 名不同）', () => {
+    const cfg = loadConfig(legacyYaml(`
+sources:
+  - id: company
+providers:
+  - id: company-anthropic
+    source_id: company
+    access_kind: official
+    risk: low
+    stability: stable
+    base_url: https://x.example
+accounts:
+  - id: a1
+    source_id: company
+    credential:
+      api_key_file: config/credentials/k
+`))
+    expect((cfg.accounts[0] as { providerName?: string }).providerName).toBe('company-anthropic')
+  })
+
+  test('拼错字段仍然拒绝（迁移只放行已知旧字段）', () => {
+    expect(() => loadConfig(legacyYaml('source:\n  - id: s1\n')))
+      .toThrow(/未知字段.*source/)
+  })
+})
+
 describe('默认值与跨实体校验', () => {
   test('provider/account 缺省值补齐', () => {
     const path = write('defaults.yaml', `
@@ -88,9 +174,13 @@ accounts: [{ id: a1, provider: p1 }]
     //   会先把 NaN 兜成 3000，因为 !NaN === true。测试只钉真实可达的小数路径。）
     expect(() => loadConfig(bad('gateway: {port: 3000.5}\nproviders: []\n')))
       .toThrow(/port/)
-    // sources 段已废弃：不再被任何实体引用，providers 不再接受 source_id
-    expect(() => loadConfig(bad('providers:\n  - name: p1\n    source_id: s1\n    base_url: https://x\n')))
-      .toThrow(/未知字段.*source_id/)
+    // sources/source_id 已废弃，但老文件必须能启动（config/apps.yaml 是 gitignored 本地
+    // 文件，git reset 盖不掉它）：这类**已知的旧字段**走自动迁移 + 告警，不再抛错。
+    // 真正拼错的字段照旧拒绝（见上面两条，以及下面这条防回归）。
+    const legacy = loadConfig(bad('sources:\n  - id: s1\nproviders:\n  - id: p1\n    source_id: s1\n    base_url: https://x\n'))
+    expect(legacy.providers[0]!.name).toBe('p1') // id → name
+    expect(() => loadConfig(bad('providers:\n  - name: p1\n    source_idd: s1\n    base_url: https://x\n')))
+      .toThrow(/未知字段.*source_idd/)
     expect(() => loadConfig(bad('providers:\n  - name: p1\n    access_kind: official\n    risk: low\n    stability: stable\n    base_url: https://x\n    models: []\n  - name: p1\n    access_kind: official\n    risk: low\n    stability: stable\n    base_url: https://y\n')))
       .toThrow(/重复/)
   })

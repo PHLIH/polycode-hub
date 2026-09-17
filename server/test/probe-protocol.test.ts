@@ -69,6 +69,49 @@ describe('探测协议回退：404 必须换协议继续试', () => {
     expect(r.error ?? '').not.toContain('<!DOCTYPE')
   })
 
+  // 2026-09-17 实测补强：muse-spark 走 /chat/completions 上游回 **500**（不是 404），
+  // 而 Provider 级 api=openai-completions 会让它每次都先撞 500 再回退——虽然最终能探到
+  // responses，但每次扫描都白打一次且慢。已知族（muse-spark*）按事实提前 responses。
+  test('muse-spark 族即使 Provider 级声明 completions，也优先试 responses（不先撞 500）', async () => {
+    const hits: string[] = []
+    server = createServer((req, res) => {
+      hits.push(req.url ?? '')
+      if (req.url?.includes('/responses')) {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' })
+        res.write('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n')
+        res.end()
+        return
+      }
+      res.writeHead(500, { 'Content-Type': 'application/json' })
+      res.end('{"error":{"message":"Internal server error"}}')
+    })
+    await new Promise<void>((r) => server!.listen(0, '127.0.0.1', r))
+    const base = `http://127.0.0.1:${(server!.address() as AddressInfo).port}`
+    const p = mkProv(base) // api: openai-completions（Provider 级一刀切）
+    const probe = new Probe(new Scheduler([p], 'high'), new Upstream({ credLookup: () => ['', false] }), null)
+    const r = await probe.probeWithProtocols(p, 'muse-spark-1.3-contributor-free')
+    expect(r.ok).toBe(true)
+    expect(r.protocol).toBe('openai-responses')
+    expect(hits[0]).toContain('/responses') // 第一次就打对端点，没有先撞 500
+  })
+
+  test('指纹缺失（FreeTierError）就地早停：换协议/换出口都无解', async () => {
+    let count = 0
+    server = createServer((req, res) => {
+      count++
+      res.writeHead(403, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: { type: 'FreeTierError', message: "OpenCode's free tier can only be used from within OpenCode" } }))
+    })
+    await new Promise<void>((r) => server!.listen(0, '127.0.0.1', r))
+    const base = `http://127.0.0.1:${(server!.address() as AddressInfo).port}`
+    const p = mkProv(base)
+    const probe = new Probe(new Scheduler([p], 'high'), new Upstream({ credLookup: () => ['', false] }), null)
+    const r = await probe.probeWithProtocols(p, 'muse-spark-1.3-contributor-free')
+    expect(r.ok).toBe(false)
+    expect(r.kind).toBe('fingerprint')
+    expect(count).toBe(1) // 早停，不再白试其余协议
+  })
+
   test('401 凭据错误仍早停（换协议无意义，不该白试三轮）', async () => {
     let count = 0
     server = createServer((req, res) => {

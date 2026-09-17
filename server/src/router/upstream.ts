@@ -185,8 +185,12 @@ export class Upstream {
   // egresses 必须一并继承：探测路径也走 Provider.egress，丢了会报「egress 未配置」
   // 而真实转发却正常（探测按钮真实缺陷）。
   withOpts(over: Partial<UpstreamOpts>): Upstream {
+    // credLookup 必须可被覆盖（`over.credLookup ?? this.credLookup`）：
+    // 旧写法硬继承 this.credLookup，传进来的 lookup 被静默丢弃——调用方以为
+    // 换成了自己的凭据解析，实际仍走原实例的（zen 公共 key 探针因此恒报
+    // 「环境变量 ZEN_KEY 未设置」的假阴性）。
     const derived = new Upstream({
-      credLookup: this.credLookup,
+      credLookup: over.credLookup ?? this.credLookup,
       noAutoProtocol: over.noAutoProtocol ?? this.noAutoProtocol,
       egresses: over.egresses ?? this.egresses,
     })
@@ -427,15 +431,17 @@ export function classifyUpstreamError(status: number, body: string): string {
   if (kind === UPSTREAM.AUTH) {
     // 403 不等于「你的 Key 错了」。上游用 403 表达很多策略性拒绝，
     // 归成 auth 会把用户引向错误方向（反复去翻/重置 API Key，而 Key 其实是好的）。
-    // 已确认的两类：
+    // 已确认的三类：
     //   RegionError   —— 地区不可用（换出口代理能解）
-    //   FreeTierError —— 免费档只认官方客户端指纹。2026-09-17 实测：
-    //     "OpenCode's free tier can only be used from within OpenCode"，
+    //   FreeTierError —— 免费档只认官方客户端指纹，单独归 FINGERPRINT。
+    //     2026-09-17 实测："OpenCode's free tier can only be used from within OpenCode"，
     //     触发条件是缺 x-session-id/affinity 或带了旧的 x-opencode-* 四件套；
-    //     指纹对上后匿名 Bearer public 照常用。出路按序：先查会话头透传/
-    //     Provider 静态会话是否有效（重收一个 ses_），再考虑换付费档或换上游。
+    //     指纹对上后匿名 Bearer public 照常用。
+    //     归 auth 会误导用户去翻 API Key（Key 是好的）；归 bad_request 又会被探测
+    //     当作「协议路径噪音」压到最低优先级（见 probe.errorRank），真实病因浮不上来。
+    //     指纹是「配置缺失」而非「上游故障」：换出口/换协议都无解，必须点名去配。
     if (/regionerror|not available in your country/i.test(body)) return UPSTREAM.BAD_REQUEST
-    if (/freetiererror|free tier can only be used/i.test(body)) return UPSTREAM.BAD_REQUEST
+    if (/freetiererror|free tier can only be used/i.test(body)) return UPSTREAM.FINGERPRINT
   }
   if (kind === UPSTREAM.RATE_LIMIT && QUOTA_HINT.test(body)) {
     return UPSTREAM.QUOTA

@@ -112,21 +112,21 @@ accounts: []
 #     或设 ZEN_UA 环境变量做项目级默认 UA（静态头优先于 ZEN_UA）。
 # 旧 x-opencode-* 四件套是毒头（必 403），不要加。
 # providers:
-#   - id: "zen-free"
+#   - name: "zen-free"
 #     display_name: "Zen免费档"
 #     access_kind: "reverse"          # 逆向客户端指纹（风险高，见 NOTICE.md 登记）
 #     risk: "high"
 #     risk_note: "逆向客户端指纹；上游可随时变更；免费档按 IP 限速；ses_ 须真实有效（opencode run --print-logs 取 created id=），过期/403 就重收"
 #     stability: "beta"
-#     api: "openai-completions"      # 仅作默认；muse-spark 系实际走 responses，网关自动探测
+#     state: "paused"                # active | paused（旧 enabled: false 等价于 paused）
+#     api: "openai-completions"      # 仅作默认；协议是模型级的，见下方 models[].api
 #     base_url: "https://opencode.ai/zen/v1"
 #     credential:
 #       api_key_env: "ZEN_KEY"       # 值固定为 public
-#     headers:                       # UA：自己抓包取的 opencode 真串；ses_ 与 id 同值
+#     headers:                       # 指纹是能否调用的关键：只有 UA + 真实 ses_ 才不被拒
 #       User-Agent: "opencode/换成抓包取到的真串 ai-sdk/provider-utils/换真串 runtime/bun/换真串"
 #       x-session-id: "ses_换成你自己的真实会话"
 #       x-session-affinity: "ses_换成你自己的真实会话"
-#     enabled: false
 #     priority: 1
 #     models:
 #       - id: "mimo-v2.5-free"
@@ -135,6 +135,14 @@ accounts: []
 #       - id: "nemotron-3-ultra-free"
 #         input: [text]
 #         enabled: true
+#       # 协议必须落到模型级：muse-spark 系只认 /responses，走 /chat/completions 上游直接 500。
+#       # 全继承 Provider 级 openai-completions 就是本次真实缺陷。
+#       - id: "muse-spark-1.3-contributor-free"
+#         api: "openai-responses"
+#         input: [text, image]
+#         enabled: true
+#       # 注意：muse-spark 系在部分地区回 403 RegionError（模型不在本地区可用），
+#       # 需要经出口代理访问（见上方 egresses 段）。这与指纹/协议是两回事。
 
 # ZCode 免费 plan 经本地 sidecar 示例（2026-09-12 已实测打通 GLM-5.3-Flash）：
 # plan 通道要逐请求验证，本网关不内置求解——另起专用反代（如 TriDefender/zcode-api，

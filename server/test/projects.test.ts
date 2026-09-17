@@ -8,7 +8,7 @@ import { basename, join, sep } from 'node:path'
 import { createServer, type AddressInfo } from 'node:net'
 import { spawn } from 'node:child_process'
 import { Store, newID, type Project, type Service } from '../src/projects/store.ts'
-import { validateProject } from '../src/adminapi/projects_app.ts'
+import { createProjectsApp, readTailLines, validateProject } from '../src/adminapi/projects_app.ts'
 import { Manager, isConflictError } from '../src/projects/manager.ts'
 import {
   augmentedPath,
@@ -790,5 +790,102 @@ describe('validateProject', () => {
 
   test('cmd 留空放行到启动时才拦（校验不越权替运行期判断）', () => {
     expect(validateProject(proj({ services: [svc({ cmd: '' })] }))).toBeUndefined()
+  })
+})
+
+// —— 日志 1k 滑动窗口（readTailLines 环形读）——
+// 背景：旧实现全量 readFileSync 再 slice，Vite 热更新日志几十万行时卡死事件循环。
+// 新实现从文件尾按 64KB 块往前扫，只读够 tail 行的字节。
+describe('readTailLines 滑动窗口', () => {
+  const writeLog = (dir: string, name: string, lines: string[]): string => {
+    const p = join(dir, name)
+    writeFileSync(p, lines.join('\n') + (lines.length ? '\n' : ''), { mode: 0o600 })
+    return p
+  }
+
+  test('不足窗口：全量返回，truncated=false', () => {
+    const dir = makeTemp('polycode-tail1-')
+    try {
+      const p = writeLog(dir, 'a.log', ['l1', 'l2', 'l3'])
+      const r = readTailLines(p, 1000)
+      expect(r.text).toBe('l1\nl2\nl3')
+      expect(r.truncated).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('超窗口：只取最后 N 行，truncated=true', () => {
+    const dir = makeTemp('polycode-tail2-')
+    try {
+      const lines = Array.from({ length: 2500 }, (_, i) => `line-${i}`)
+      const p = writeLog(dir, 'a.log', lines)
+      const r = readTailLines(p, 1000)
+      const got = r.text.split('\n')
+      expect(got.length).toBe(1000)
+      expect(got[0]).toBe('line-1500')
+      expect(got[999]).toBe('line-2499')
+      expect(r.truncated).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('无尾换行与有尾换行同语义', () => {
+    const dir = makeTemp('polycode-tail3-')
+    try {
+      const p = join(dir, 'a.log')
+      writeFileSync(p, 'a\nb', { mode: 0o600 })
+      expect(readTailLines(p, 1000).text).toBe('a\nb')
+      writeFileSync(p, 'a\nb\n', { mode: 0o600 })
+      expect(readTailLines(p, 1000).text).toBe('a\nb')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('文件不存在/空文件 → 空，不抛', () => {
+    const dir = makeTemp('polycode-tail4-')
+    try {
+      expect(readTailLines(join(dir, 'nope.log'), 1000)).toEqual({ text: '', truncated: false })
+      const p = join(dir, 'empty.log')
+      writeFileSync(p, '', { mode: 0o600 })
+      expect(readTailLines(p, 1000)).toEqual({ text: '', truncated: false })
+      expect(readTailLines(p, 0)).toEqual({ text: '', truncated: false })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('跨块大文件：多块拼接顺序正确', () => {
+    const dir = makeTemp('polycode-tail5-')
+    try {
+      // 每行 ~200B，3000 行 ~600KB，远超单块 64KB，必须走多块路径
+      const lines = Array.from({ length: 3000 }, (_, i) => `row-${String(i).padStart(4, '0')}-` + 'x'.repeat(180))
+      const p = writeLog(dir, 'big.log', lines)
+      const r = readTailLines(p, 1000)
+      const got = r.text.split('\n')
+      expect(got.length).toBe(1000)
+      expect(got[0]).toBe(lines[2000])
+      expect(got[999]).toBe(lines[2999])
+      expect(r.truncated).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('中文多字节跨块切分不影响行数', () => {
+    const dir = makeTemp('polycode-tail6-')
+    try {
+      const lines = Array.from({ length: 1500 }, (_, i) => `第${i}行-中文日志内容测试-${'啊'.repeat(50)}`)
+      const p = writeLog(dir, 'cjk.log', lines)
+      const r = readTailLines(p, 1000)
+      const got = r.text.split('\n')
+      expect(got.length).toBe(1000)
+      expect(got[999]).toBe(lines[1499])
+      expect(r.truncated).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

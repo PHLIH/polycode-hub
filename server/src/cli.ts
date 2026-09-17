@@ -13,7 +13,7 @@ import { Upstream, egressProxyURI } from './router/upstream.ts'
 import { Proxy } from './gateway/proxy.ts'
 import { Probe } from './gateway/probe.ts'
 import { AccountPool } from './pool/account.ts'
-import type { Account } from './model/index.ts'
+import type { Account, Provider } from './model/index.ts'
 import { Store as UsageStore } from './usage/store.ts'
 import {
   SQLiteEgressStore, SQLiteProviderStore, SQLiteAccountStore,
@@ -27,7 +27,10 @@ import { Sidecar } from './sidecar/sidecar.ts'
 import { Manager } from './projects/manager.ts'
 import { Store as ProjectsStore } from './projects/store.ts'
 import { openLog, startDetached } from './projects/process.ts'
-import { Scanner, defaultConfig, discoverWorkBuddyModels } from './discover/index.ts'
+import {
+  Scanner, defaultConfig, discoverWorkBuddyModelsFrom, workBuddyDataDirs, type ZenCallProbe,
+} from './discover/index.ts'
+import { homedir } from 'node:os'
 import { usageStatsSource } from './adminapi/stats.ts'
 import { providerValidate } from './model/index.ts'
 
@@ -167,9 +170,14 @@ export async function runServe(args: string[]): Promise<void> {
   const fixed = usageStore.resolveProviderIds((n) => named.get(n))
   if (fixed > 0) console.log(`用量归因迁移：${fixed} 个历史 Provider 名已绑定到内部 id`)
 
+  // WorkBuddy 模型痕迹：多平台数据根合并（此前写死 $HOME/.workbuddy，Windows 恒空）。
+  const wbGoos = process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'darwin' : 'linux'
+  const wbHome = homedir()
+  const wbProfile = wbGoos === 'windows' ? (process.env.USERPROFILE || wbHome) : wbHome
+  const wbModelDirs = workBuddyDataDirs(wbGoos, wbHome, wbProfile)
   const probe = new Probe(sched, up, usageStore, acctPool,
     (providerName) => providerName === 'workbuddy'
-      ? discoverWorkBuddyModels(join(process.env.HOME ?? '', '.workbuddy'))
+      ? discoverWorkBuddyModelsFrom(wbModelDirs)
       : [])
 
   // sidecar 管理（网关工作目录推算；端口从 config.yaml 恢复）。
@@ -208,13 +216,53 @@ export async function runServe(args: string[]): Promise<void> {
   }
   syncStores() // 启动即同步一次：DB 里有、配置文件没有的也要进调度
 
+  // zen 可调用性验证：发现页的探针必须真打一次，否则 GET /v1/models（免指纹）会把
+  // 「网络通」误报成 ready，用户到手才发现 403 FreeTierError（真实假阳性）。
+  const zenCallProbe: ZenCallProbe = async (model) => {
+    const draft = defaultConfig()
+    // 免费档鉴权恒为 Bearer public（ZEN_KEY 的官方取值就是 public）。
+    // 这里把凭据交给 credLookup 解析：真实 ZEN_KEY 优先，未设则回落到 public，
+    // 等价于「一键导入」时 applyCredentialDefaults 落的那个公共 key。
+    // 不能随便引用一个不存在的环境变量名——credentialResolve 失败会抛
+    // 「环境变量未设置」，探针就变成恒错的假阴性（正好是本次要修的毛病）。
+    const p: Provider = {
+      providerId: 0, name: 'opencode-zen-probe', state: 'active', displayName: 'probe',
+      accessKind: 'reverse', risk: 'high', riskNote: 'probe', stability: 'beta',
+      api: 'openai-completions', baseUrl: (draft.zenBaseURL ?? 'https://opencode.ai/zen') + '/v1',
+      credential: { apiKeyEnv: 'ZEN_KEY' },
+      headers: {},
+      priority: 1,
+      models: [{ id: model, manual: false, enabled: true }],
+    }
+    const zenLookup = (name: string): [string, boolean] => {
+      if (name !== 'ZEN_KEY') return process.env[name] === undefined ? ['', false] : [process.env[name]!, true]
+      return [(process.env.ZEN_KEY ?? 'public'), true]
+    }
+    const probeUp = up.withOpts({ credLookup: zenLookup })
+    try {
+      const req: import('./ir/index.ts').IrRequest = {
+        model, stream: true, maxTokens: 8,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      }
+      const stream = await probeUp.streamWithTimeout(p, req, AbortSignal.timeout(20_000))
+      // 读到首块即算可调用（不解析内容：探针只验「没被拒」）。
+      const reader = stream.getReader()
+      await reader.read()
+      await reader.cancel().catch(() => {})
+      return { ok: true }
+    } catch (e) {
+      const err = e as { kind?: string; message?: string }
+      return { ok: false, kind: err.kind, error: err.message ?? String(e) }
+    }
+  }
+
   const admin = createAdminApi({
     adminKey: cfg.gateway.adminKey,
     egresses,
     providers,
     accounts,
     stats: usageStatsSource(usageStore),
-    discover: new DiscoverSourceAdapter(new Scanner(defaultConfig())),
+    discover: new DiscoverSourceAdapter(new Scanner({ ...defaultConfig(), zenCallProbe })),
     resetter: { resetAccount: (id: string) => acctPool.resetAccount(id) },
     // 池内惩罚（冷却/连败）是运行时状态，列表页要显示就得现问池子。
     accountRuntime: {

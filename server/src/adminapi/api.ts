@@ -18,7 +18,7 @@ import {
 import type { ProbeResult } from '../gateway/probe.ts'
 import { MemoryAccountStore, MemoryProviderStore, type AccountStore, type EgressStore, type ProviderStore } from './store.ts'
 import { isObj, parseAccount, parseCredential, parseProvider } from './parse.ts'
-import { registerDiscoverRoutes } from './discover_api.ts'
+import { registerDiscoverRoutes, workbuddyTokenHash } from './discover_api.ts'
 import type {
   AccountProber, AccountResetter, AccountRuntime, ChangeNotifier, DiscoverSource, ModelList,
   ProviderModelLister, ProviderModelProber, ProviderProber,
@@ -566,6 +566,9 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
   app.post('/admin/api/accounts', async (c) => {
     const raw = await jsonBody(c)
     if (raw === undefined) return errRes(c, 400, ERR.INVALID_REQUEST, '请求体不是合法 JSON')
+    if (isObj(raw) && ['importSource', 'workbuddyUid', 'workbuddyTokenHash'].some((k) => k in raw)) {
+      return errRes(c, 400, ERR.INVALID_REQUEST, '导入来源与身份字段只读')
+    }
     const ac = parseAccount(raw)
     if (ac.id === '') {
       return errRes(c, 400, ERR.INVALID_REQUEST, 'id 必填')
@@ -703,6 +706,71 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     const model = isObj(body) && typeof body.model === 'string' ? body.model : ''
     const res: ProbeResult = await deps.accountProber.probeAccount(id, model)
     return ok(c, 200, res)
+  })
+
+  const checkins = new Set<string>()
+  app.post('/admin/api/accounts/:id/checkin', async (c) => {
+    const ac = accounts.get(c.req.param('id'))
+    if (!ac) return errRes(c, 404, ERR.NOT_FOUND, '账号不存在')
+    if (ac.importSource !== 'workbuddy') {
+      return errRes(c, 400, ERR.INVALID_REQUEST, '仅支持一键导入的 WorkBuddy 账号')
+    }
+    if (!providerForAccount(ac.providerId)) {
+      return errRes(c, 400, ERR.INVALID_REQUEST, '账号归属 Provider 不存在或已删除')
+    }
+    const uid = ac.workbuddyUid
+    if (!uid || !/^[\x21-\x7e]{1,256}$/.test(uid)) {
+      return errRes(c, 400, ERR.INVALID_REQUEST, '缺少有效 WorkBuddy UID，请重新登录后扫描导入')
+    }
+    const [token, resolved] = credentialResolve(ac.credential, (name) =>
+      process.env[name] === undefined ? ['', false] : [process.env[name]!, true])
+    if (!resolved || !token || workbuddyTokenHash(token) !== ac.workbuddyTokenHash) {
+      return errRes(c, 400, ERR.INVALID_REQUEST, '凭据缺失或已变更，请重新扫描导入以核对身份')
+    }
+    if (checkins.has(uid)) return errRes(c, 409, ERR.INVALID_REQUEST, '该 WorkBuddy 账号正在签到，请勿重复点击')
+    checkins.add(uid)
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 15_000)
+    try {
+      const response = await fetch('https://copilot.tencent.com/billing/meter/daily-checkin', {
+        method: 'POST',
+        redirect: 'error',
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          Authorization: `Bearer ${token}`,
+          'X-User-Id': uid,
+          'X-Domain': 'copilot.tencent.com',
+          'X-IDE-Type': 'WorkBuddy',
+          'X-IDE-Name': 'WorkBuddy',
+          'X-IDE-Version': '5.5.3',
+          'X-Product': 'WorkBuddy',
+          'User-Agent': 'WorkBuddy/5.5.3',
+        },
+        body: '{}',
+      })
+      if (response.status === 401 || response.status === 403) {
+        await response.body?.cancel()
+        return errRes(c, 502, ERR.API, 'WorkBuddy 登录态失效或无权限，请重新登录后导入')
+      }
+      const data: unknown = await response.json().catch(() => undefined)
+      if (response.status === 200 && isObj(data) && data.code === 0 && data.msg === 'OK') {
+        return ok(c, 200, { status: 'accepted', message: 'WorkBuddy 已接受本次签到请求' })
+      }
+      if (response.status === 400 && isObj(data) && data.code === 10001
+        && data.msg === '今天已签到，请明天再来') {
+        return ok(c, 200, { status: 'already_checked_in', message: '今天已签到，请明天再来' })
+      }
+      return errRes(c, 502, ERR.API, 'WorkBuddy 返回未识别的签到结果，请在客户端核对；未自动重试')
+    } catch {
+      return errRes(c, 502, ERR.API, controller.signal.aborted
+        ? '签到请求超时，结果未确认；请在客户端核对，未自动重试'
+        : '签到请求失败，结果未确认；请在客户端核对，未自动重试')
+    } finally {
+      clearTimeout(timer)
+      checkins.delete(uid)
+    }
   })
 
   // ---- stats ----

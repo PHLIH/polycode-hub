@@ -41,6 +41,11 @@ export const UPSTREAM = {
   QUOTA: 'quota',
   BAD_REQUEST: 'bad_request',
   SERVER: 'server',
+  // 指纹缺失：上游按策略拒绝「非官方客户端」流量（如 zen 的 FreeTierError）。
+  // 既不是凭据错（Key 是好的）也不是协议路径错（换端点照样 403），必须独立分类：
+  // 归 auth 会让人去翻 API Key，归 bad_request 又会被探测当成「路径噪音」压到最低优先级，
+  // 真实病因（缺 UA/会话指纹）在报错里永远浮不上来。
+  FINGERPRINT: 'fingerprint',
   UNKNOWN: 'unknown',
 } as const
 
