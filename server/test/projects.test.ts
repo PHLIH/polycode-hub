@@ -662,18 +662,80 @@ describe('外部占用端口：状态如实反映，不是一句「未启动」'
     }
   }, 15_000)
 
-  test('stopService 拦下「停止自己」并给出可执行指引', async () => {
+  // 语义已改（用户明确要求「项目管理模块要能关闭自己」）：
+  // 以前 stop 自己会被硬拦成 500，导致用户没法重启自己的网关（网关本身就是
+  // 项目列表里的一项）。现在允许停，但**顺序**必须对：重启要先安排"重开"再退出，
+  // 否则进程没了，后面的 start 不会执行 —— 用户看到的是"重启完再也起不来"。
+  // 这里不真的杀测试进程，用注入的替身断言编排是否正确。
+  test('停「自己」是允许的：标记待退出 + 重启时先安排重开', async () => {
     const dir = makeTemp('polycode-self2-')
     const port = await freePortForTest()
-    // 用一次性 Manager（不进 managers 数组）：这个用例故意造一条 pid = 本进程 的状态，
-    // 而 afterAll 会 killTree 所有 state 里的活 pid —— 混进去会把测试 worker 自己杀掉。
-    const m = new Manager(new Store(makeTemp('polycode-selfmgr-')))
+    let restarts = 0
+    // victim 扮演"网关自己"：用独立子进程的 pid，killTree 杀它不会影响测试进程。
+    // selfPid 注入成它 → 既能走 self 分支，又不会真的自杀。
+    const victim = spawn(process.execPath, ['-e', 'setTimeout(()=>{},60000)'], { detached: true, stdio: 'ignore' })
+    victim.unref()
+    const m = new Manager(new Store(makeTemp('polycode-selfmgr-')), {
+      selfRestart: () => { restarts++; return true },
+      exitSelf: () => { /* 替身：不真的退出测试进程 */ },
+      selfPid: victim.pid!,
+    })
     const id = addProject(m, { name: 'self', dir, cmd: 'npm start', port })
-    // 等价于"管理台认领了自己"：state 里记着当前进程的 pid
-    m.state.set(`${id}/self`, { pid: process.pid, startedAt: new Date().toISOString() })
-    await expect(m.stopService(id, 'self')).rejects.toThrow(/不能从这里停止/)
-    // 关键：守卫真的拦住了（进程还活着，没有被 killTree）
-    expect(m.state.has(`${id}/self`)).toBe(true)
+    try {
+      m.state.set(`${id}/self`, { pid: victim.pid!, startedAt: new Date().toISOString() })
+      // 普通 stop：允许，且不假装要重启
+      await m.stopService(id, 'self')
+      expect(m.state.has(`${id}/self`)).toBe(false)
+      expect(restarts).toBe(0)
+      // 停掉的确实是那个子进程
+      await vi.waitUntil(() => !pidAlive(victim.pid!), { timeout: 5000, interval: 50 })
+    } finally {
+      try { process.kill(victim.pid!, 'SIGKILL') } catch { /* 已死 */ }
+    }
+  }, 15_000)
+
+  test('restart 自己：先安排重开再退出（顺序错了就再也起不来）', async () => {
+    const dir = makeTemp('polycode-self3-')
+    const port = await freePortForTest()
+    let restarts = 0
+    const victim = spawn(process.execPath, ['-e', 'setTimeout(()=>{},60000)'], { detached: true, stdio: 'ignore' })
+    victim.unref()
+    const m = new Manager(new Store(makeTemp('polycode-selfmgr3-')), {
+      selfRestart: () => { restarts++; return true },
+      exitSelf: () => { /* 替身，不真的退出 */ },
+      selfPid: victim.pid!,
+    })
+    const id = addProject(m, { name: 'self', dir, cmd: 'npm start', port })
+    try {
+      m.state.set(`${id}/self`, { pid: victim.pid!, startedAt: new Date().toISOString() })
+      // 走 restart：必须安排重启，且**不**原地 start（进程马上要没了，start 没意义）
+      const conflict = await m.restartService(id, 'self')
+      expect(conflict).toBeNull()
+      expect(restarts).toBe(1)
+      // 旧 pid 记录必须清掉：留着会让新进程起来后显示成幽灵"运行中"
+      expect(m.state.has(`${id}/self`)).toBe(false)
+    } finally {
+      try { process.kill(victim.pid!, 'SIGKILL') } catch { /* 已死 */ }
+    }
+  }, 15_000)
+
+  test('无法自动重启时如实报错，不假装成功', async () => {
+    const dir = makeTemp('polycode-self4-')
+    const port = await freePortForTest()
+    const victim = spawn(process.execPath, ['-e', 'setTimeout(()=>{},60000)'], { detached: true, stdio: 'ignore' })
+    victim.unref()
+    const m = new Manager(new Store(makeTemp('polycode-selfmgr4-')), {
+      selfRestart: () => false, // 部署方式不支持自动重启
+      exitSelf: () => { /* 替身 */ },
+      selfPid: victim.pid!,
+    })
+    const id = addProject(m, { name: 'self', dir, cmd: 'npm start', port })
+    try {
+      m.state.set(`${id}/self`, { pid: victim.pid!, startedAt: new Date().toISOString() })
+      await expect(m.restartService(id, 'self')).rejects.toThrow(/无法自动重启/)
+    } finally {
+      try { process.kill(victim.pid!, 'SIGKILL') } catch { /* 已死 */ }
+    }
   }, 15_000)
 
   // 反面：dir 不匹配的占用者不该被认领（误认会让用户停掉无关进程）

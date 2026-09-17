@@ -26,6 +26,7 @@ import { createProjectsApp } from './adminapi/projects_app.ts'
 import { Sidecar } from './sidecar/sidecar.ts'
 import { Manager } from './projects/manager.ts'
 import { Store as ProjectsStore } from './projects/store.ts'
+import { openLog, startDetached } from './projects/process.ts'
 import { Scanner, defaultConfig, discoverWorkBuddyModels } from './discover/index.ts'
 import { usageStatsSource } from './adminapi/stats.ts'
 import { providerValidate } from './model/index.ts'
@@ -177,7 +178,27 @@ export async function runServe(args: string[]): Promise<void> {
   sidecarSvc.loadPort(sidecarSvc.workDir)
 
   // 本地项目管理器（与代理无关的独立板块）。
-  const projectsMgr = new Manager(new ProjectsStore(join(cwd, 'config', 'projects')))
+  //
+  // selfRestart：让用户能从管理台重启网关自己（网关本身也是项目列表里的一项）。
+  // 必须在**本进程退出之后**才能重新启动，否则新进程会撞上还没释放的端口
+  // （EADDRINUSE 直接死掉，用户看到的就是"重启完再也起不来"）。
+  // 做法：派一个脱离本进程的 shell，先 sleep 等我们退干净，再原地拉起同一条命令。
+  const projectsMgr = new Manager(new ProjectsStore(join(cwd, 'config', 'projects')), {
+    selfRestart: () => {
+      try {
+        const fd = openLog(join(cwd, 'config', 'projects', 'self-restart.log'))
+        // argv 原样复用（含 --port 等自定义参数），换个进程重新执行同一条命令。
+        // 单引号转义防路径带空格/特殊字符把命令拆坏。
+        const args = process.argv.slice(1).map((a) => `'${a.replace(/'/g, `'\\''`)}'`)
+        const cmd = `sleep 2; exec '${process.execPath}' ${args.join(' ')}`
+        startDetached(cwd, cmd, [], fd)
+        return true
+      } catch (e) {
+        console.error('projects: 安排自我重启失败:', e)
+        return false
+      }
+    },
+  })
 
   // store 是唯一真相源：全量同步调度（惩罚状态按 ID 合并保留）。
   const syncStores = () => {

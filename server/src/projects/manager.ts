@@ -94,6 +94,16 @@ export type ProjectView = Project & {
 export interface ManagerOptions {
   // now 可被测试替换（巡检到期判定用）。
   now?: () => Date
+  // selfRestart 注入"如何重启网关自己"。返回 true 表示已安排好（重启命令已派出），
+  // 之后本进程会自行退出；返回 false/未注入 → 不安排，按普通停止处理。
+  // 注入而不是写死命令，是为了可测试、也为了让部署方式（裸进程 / launchd /
+  // 自定义启动脚本）各自决定怎么把自己拉起来。
+  selfRestart?: () => boolean
+  // exitSelf 退出本进程（注入以便测试断言，不真的退出测试进程）。
+  exitSelf?: (code: number) => void
+  // selfPid 是"本进程"的 pid，用于识别"停/重启的是网关自己"。
+  // 默认真实 process.pid；测试注入一个替身 pid 才能既走 self 分支又不自杀。
+  selfPid?: number
 }
 
 // Manager 编排服务启停与巡检。
@@ -103,11 +113,20 @@ export class Manager {
   // 公开供测试拨动 StartedAt / afterAll 清理（Go 测试直接触达 m.state，同理）。
   readonly state: Map<string, ServiceState>
   private readonly now: () => Date
+  private readonly selfRestart: () => boolean
+  private readonly exitSelf: (code: number) => void
+  // 本进程 pid（可注入，测试用替身走 self 分支而不真的自杀）
+  private readonly selfPid: number
+  // 停自己时标记，供上层在响应写完之后再退出（立刻退出会让请求拿不到响应）。
+  private pendingSelfStop = false
 
   // 装配并清理孤儿状态（pid 已死的记录直接清掉）。
   constructor(store: Store, opts: ManagerOptions = {}) {
     this.store = store
     this.now = opts.now ?? (() => new Date())
+    this.selfRestart = opts.selfRestart ?? (() => false)
+    this.exitSelf = opts.exitSelf ?? ((code) => process.exit(code))
+    this.selfPid = opts.selfPid ?? process.pid
     this.state = store.loadState()
     for (const [key, st] of this.state) {
       if (st.pid > 0 && !pidAlive(st.pid)) {
@@ -341,15 +360,12 @@ export class Manager {
       if (pid === 0) return
       ownGroup = false
     }
-    // 拦「停止自己」：管理台就跑在网关进程里，而网关正是项目列表里的一项。
-    // 杀掉自己会让这个请求拿不到响应（用户看到的是请求挂死，不是"已停止"），
-    // 而且网关没有守护进程，不会再起来——一次误点等于永久宕机。
-    // 想停它请用 ./update.sh（先起新的再切）或在终端操作。
-    if (pid === process.pid) {
-      throw new Error(
-        'projects: 不能从这里停止正在提供管理台的进程本身（会立刻失联且不会自动重启）。'
-        + '请用 ./update.sh 重启，或在终端里操作。')
-    }
+    // 停「自己」是**允许**的（用户明确要求：项目管理模块要能关闭自己）。
+    // 管理台就跑在网关进程里，而网关本身也是项目列表里的一项——想重启自己的
+    // 项目就得能停自己。之前这里硬拦成 500，等于用户没法管理自己的网关。
+    // 唯一的真实约束是**顺序**：重启必须先安排好"重开"，再退出。
+    const isSelf = pid === this.selfPid
+    if (isSelf) this.pendingSelfStop = true
     try {
       await killTree(pid, 5000, ownGroup)
     } catch (e) {
@@ -360,9 +376,51 @@ export class Manager {
   }
 
   // restartService = stop + start（映射需重新征询，冲突语义同 start）。
+  //
+  // 重启「自己」必须先安排重开再退出，不能在进程内 stop 完再 start ——
+  // 进程已经没了，后面的 start 根本不会执行，用户看到的是"重启完就再也起不来了"。
+  // 所以：先派一个脱离本进程的延迟重启命令，把响应留出返回时间，再退出本进程。
   async restartService(projectID: string, service: string): Promise<ConflictError | null> {
+    const key = this.key(projectID, service)
+    const st = this.state.get(key)
+    const selfPid = st && st.pid > 0 ? st.pid : 0
+    const isSelf = selfPid === this.selfPid
+      || (selfPid === 0 && await this.claimsSelf(projectID, service))
+    if (isSelf) {
+      // 安排重启（注入的实现负责"延迟到本进程退出后再拉起"）。
+      const scheduled = this.selfRestart()
+      // 清掉自己的 pid 记录：新进程起来时会重新登记，留着旧 pid 会显示成幽灵运行中。
+      this.state.delete(key)
+      this.saveState()
+      if (!scheduled) {
+        throw new Error(
+          'projects: 这台机器的启动方式无法自动重启（未配置重启命令）。'
+          + '进程即将退出，请手动再启动一次（./update.sh 或终端里的启动命令）。')
+      }
+      // 不在这里退出：让调用方把 204/200 响应写回浏览器之后再退，
+      // 否则前端只会看到请求失败，以为是操作出错。
+      this.pendingSelfStop = true
+      return null
+    }
     await this.stopService(projectID, service)
     return this.startService(projectID, service, 0)
+  }
+
+  // 判断这个服务当前是否就是本进程（认领场景：state 里没有 pid，但端口上是我们）。
+  private async claimsSelf(projectID: string, service: string): Promise<boolean> {
+    const found = this.find(projectID, service)
+    if (!found || !found.svc.port) return false
+    const pid = await this.claimPortOwner(found.svc, found.svc.port)
+    return pid === this.selfPid
+  }
+
+  // 响应已写回后由上层调用：若刚停了/重启了自己，在这里退出。
+  // 拆成两步是为了让 HTTP 响应有机会发出去（立刻 process.exit 会让请求挂死）。
+  finishPendingSelfStop(): void {
+    if (!this.pendingSelfStop) return
+    this.pendingSelfStop = false
+    // 留一点时间让 socket flush（同步调用方通常已写完响应）。
+    setTimeout(() => this.exitSelf(0), 200).unref?.()
   }
 
   // startProject 启动项目全部服务，冲突不阻断其余服务的启动。

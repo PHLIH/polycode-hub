@@ -156,6 +156,8 @@ export function createProjectsApp(
       } catch (e) {
         return err(c, 500, (e as Error).message)
       }
+      // 该项目可能就包含网关自己（管理台跑在网关里）：响应先写回再退出。
+      m.finishPendingSelfStop()
       return c.json({ ok: true })
     }
     return err(c, 404, '未知动作（支持: start|stop）')
@@ -185,6 +187,9 @@ export function createProjectsApp(
     }
     if (conflict) return c.json({ conflict }, 409)
     if (failure) return err(c, 400, failure)
+    // 停/重启的是网关自己时：响应先写回，再退出本进程。
+    // 顺序不能反——立刻 process.exit 会让浏览器只看到请求失败，用户以为操作出错。
+    m.finishPendingSelfStop()
     return c.json({ ok: true })
   })
 
