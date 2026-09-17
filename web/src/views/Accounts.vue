@@ -231,8 +231,21 @@ onMounted(load)
 // 按归属 Provider 分组是本页的结构：账号永远挂在它绑定的 Provider 下面；
 // 每组自带的「添加账号」直接预绑定 providerId。组内按失败率降序（运维第一眼：哪个号在出问题）。
 const groups = computed(() => {
+  // 只看「归属 Provider 还在」的账号：删掉的 Provider 是软删（行留在库里给历史用量
+  // 归因用），它名下的账号却会一直留在账号池里 —— 反复「删掉 workbuddy 再一键导入」
+  // 就会攒下一堆同身份的旧账号，看起来像很多个号，其实早就不参与轮询了。
+  // 已删除渠道的那批不再展示（后端列表也同步过滤，这里是同一口径的兜底）。
+  // providersErr 非空 = Provider 列表没拉到，此时不能拿「空集合」去过滤账号
+  // （那会把整页账号全隐藏，看起来像账号池空了）。后端已按同一口径过滤，
+  // 这里只在拿到 Provider 列表时才兜底。
+  const liveIds = new Set(
+    providers.value.filter(p => p.state !== 'deleted').map(p => String(p.providerId))
+  )
   const bySource = {}
-  for (const a of list.value) (bySource[String(a.providerId)] ||= []).push(a)
+  for (const a of list.value) {
+    if (!providersErr.value && !liveIds.has(String(a.providerId))) continue
+    ;(bySource[String(a.providerId)] ||= []).push(a)
+  }
   // 分组键一律是 providerId 字符串（账号归属本来就是 providerId），显示名经 nameById 映射。
   // 以前这里把 sourceOptions（Provider 名）和 id 字符串混进同一个数组：有账号的分组键是 "3"，
   // 分组头的「＋添加账号」就把 "3" 当 providerName 预填 → 保存 400「没有名为 3 的 Provider」，

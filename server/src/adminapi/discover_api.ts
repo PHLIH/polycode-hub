@@ -290,11 +290,17 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
       return `模型目录为空：请到 Providers 页点「扫描可用性」获取真实模型（未接线，无法自动扫描）`
     }
     let ids: string[] = []
+    // 上游慢/网络差时 fetchModelsWithProtocols 可能挂很久——导入响应绝不能被它拖住
+    // （provider 在前面的 put 就已落库，模型补全晚到只损失「自动发现模型」这一项）。
+    // 8s 竞速：超时走 catch 分支给指引，用户可稍后手动「扫描可用性」。
     try {
-      const list = await lister.listProviderModels(p.providerId)
-      ids = list.models
+      const list = await Promise.race([
+        lister.listProviderModels(p.providerId),
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error('模型自动扫描超时（8s）')), 8000)),
+      ])
+      ids = (list as { models: string[] }).models
     } catch (e) {
-      return `模型目录为空且自动扫描失败（${(e as Error).message}）：请到 Providers 页点「扫描可用性」或手动添加模型`
+      return `模型目录为空且自动扫描未完成（${(e as Error).message}）：请到 Providers 页点「扫描可用性」或手动添加模型`
     }
     if (ids.length === 0) {
       return `模型目录为空且未能自动发现模型：请到 Providers 页点「扫描可用性」或手动添加模型`
@@ -344,32 +350,37 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
         continue
       }
       const tok = sess.token
-      const duplicate = sourceAccountWithToken(ownerId, tok)
-      if (duplicate) {
-        if (key === 'workbuddy') {
-          markWorkbuddySource(duplicate, sess)
-          accounts.put(duplicate)
-          changed()
+      const same = key === 'workbuddy'
+        ? findSameWorkbuddyIdentity(sess)
+        : findSameIdentity(ownerId, acc.nickname)
+      if (same) {
+        // 复用而不是新建：原本挂在一条已删除 Provider 记录上的账号，直接改挂到当前
+        // Provider 名下（就这一个号，不因为换了个 providerId 又建一行）。
+        const prevOwner = providers.list().find((p) => p.providerId === same.providerId)
+        if (!prevOwner || prevOwner.state === 'deleted') same.providerId = ownerId
+        if (key === 'workbuddy') markWorkbuddySource(same, sess)
+        // 凭据就地刷新（token 轮换）：文件型引用原路径覆盖；连引用都没有的补一个。
+        let refreshed = false
+        if (same.credential.apiKeyFile) {
+          try {
+            writeFile0600(same.credential.apiKeyFile, tok)
+            refreshed = true
+          } catch { /* 写失败就保留原凭据 */ }
+        } else if (!same.credential.apiKeyEnv) {
+          const f = join('config', 'credentials', `${same.id}-jwt`)
+          try {
+            writeFile0600(f, tok)
+            same.credential = { apiKeyFile: f }
+            refreshed = true
+          } catch { /* 同上 */ }
         }
+        warnings.push(refreshed
+          ? `${acc.nickname}：登录态已刷新（token 轮换）`
+          : `${acc.nickname}：已在账号池（已归到当前 Provider）`)
+        accounts.put(same)
+        changed()
         skipped++
         continue
-      }
-      const same = key === 'workbuddy'
-        ? accounts.list().find((a) => a.providerId === ownerId && a.importSource === 'workbuddy'
-          && !!sess.uid && a.workbuddyUid === sess.uid)
-        : findSameIdentity(ownerId, acc.nickname)
-      if (same && same.credential.apiKeyFile) {
-        try {
-          writeFile0600(same.credential.apiKeyFile, tok)
-          if (key === 'workbuddy') markWorkbuddySource(same, sess)
-          accounts.put(same)
-          changed()
-          skipped++
-          warnings.push(`${acc.nickname}：登录态已刷新（token 轮换）`)
-          continue
-        } catch {
-          // 写失败则落到新建分支
-        }
       }
       let id = ''
       for (let n = 1; ; n++) {
@@ -415,6 +426,36 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
         if (readFileSync(acct.credential.apiKeyFile, 'utf8').trim() === token) return acct
       } catch {
         // 读不了视为不重复
+      }
+    }
+    return undefined
+  }
+
+  // 同一个 WorkBuddy 身份（账号池里已存在的那一行）。
+  //
+  // 判据必须**跨 Provider**：反复「删掉 workbuddy 再一键导入」时，每次导入都会
+  // 新建一条 Provider 记录（新 providerId），而账号归属判等是
+  // `a.providerId === ownerId`，老账号因此永远匹配不上 → 每删导一轮就多出一整批。
+  // 表面看是「好多 workbuddy 账号」，其实是同一个号被复制了 N 份。
+  // 所以这里按身份（UID 优先，token 指纹兜底）全局找，不按 providerId 找。
+  function findSameWorkbuddyIdentity(sess: { token: string; uid?: string }): Account | undefined {
+    // 认 WorkBuddy 的行：UID 精确命中优先——它是跨删除/重建唯一稳定的身份凭据。
+    if (sess.uid) {
+      const byUid = accounts.list().find((a) => a.workbuddyUid === sess.uid)
+      if (byUid) return byUid
+    }
+    // 老行是早期版本导进来的、UID 没落库：token 指纹命中才算同一个身份。
+    // 只在已打标记的 workbuddy 行里比指纹，避免拿 zen/zcode 的行当账号认。
+    const hash = workbuddyTokenHash(sess.token)
+    const byHash = accounts.list().find((a) => a.workbuddyTokenHash === hash)
+    if (byHash) return byHash
+    // 同上：只对 workbuddy 来源的行比凭据原文，宁漏不错配。
+    for (const acct of accounts.list()) {
+      if (acct.importSource !== 'workbuddy' || !acct.credential.apiKeyFile) continue
+      try {
+        if (readFileSync(acct.credential.apiKeyFile, 'utf8').trim() === sess.token) return acct
+      } catch {
+        // 读不了视为不匹配
       }
     }
     return undefined

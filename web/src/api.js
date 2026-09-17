@@ -169,7 +169,10 @@ export const api = {
     const data = await req('GET', `/admin/api/discover${refresh ? '?refresh=1' : ''}`)
     return Array.isArray(data) ? data : (data && data.findings) || []
   },
-  quickImport: (key) => req('POST', '/admin/api/discover/quick-import', { key }),
+  // 一键导入要等后端「采用+入池+模型自动扫描」，慢是正常的，但必须给上限
+  // （没超时的 fetch 挂住，按钮永远停在「导入中…」，用户只能刷新页面——provider
+  //  其实早已落库，这正是「导入后没显示、刷新才有」的体感来源之一）。60s 足够。
+  quickImport: (key) => req('POST', '/admin/api/discover/quick-import', { key }, { timeoutMs: 60000 }),
   adopt: (key, id) => req('POST', '/admin/api/discover/adopt', id ? { key, id } : { key }),
   // —— 本地项目管理器（与代理无关的独立板块） ——
   projects: async () => {

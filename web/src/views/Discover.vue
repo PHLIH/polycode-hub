@@ -215,16 +215,28 @@ async function importAccount(f, a) {
 
 // 已在账号池的账号（避免重复导入）
 const pool = ref([])
+const liveProviderIds = ref(new Set())
 async function loadPool() {
   try {
     pool.value = (await api.accounts()) || []
   } catch { /* 忽略 */ }
+  try {
+    const ps = await api.providers()
+    liveProviderIds.value = new Set(
+      (ps || []).filter(p => p.state !== 'deleted').map(p => p.providerId)
+    )
+  } catch { /* 拉不到就退化为按整个账号池判定 */ }
 }
 onMounted(loadPool)
 onMounted(loadProviderNames)
 
 function imported(a) {
-  return pool.value.some(x => x.displayName === a.nickname)
+  // 后端列表已过滤孤儿账号；这里再按「归属 Provider 还在」兜一层，防止前端
+  // 拿着缓存的旧 pool 让按钮一直显示「已在账号池」而实际导不进来。
+  const rows = liveProviderIds.value.size
+    ? pool.value.filter(x => liveProviderIds.value.has(x.providerId))
+    : pool.value
+  return rows.some(x => x.displayName === a.nickname)
 }
 
 function nextAccountId() {

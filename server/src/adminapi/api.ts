@@ -548,9 +548,18 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
 
   // 列表：DB 记录 + 池内运行时（冷却/连败）。没有池子时退化为纯 DB 状态。
   // 运行时与 DB 冲突时以运行时为准——池子才是真正在调度的那个对象。
+  //
+  // 只下发「归属 Provider 还在」的账号：
+  // 删掉一个 Provider 只是软删（行留着给历史用量回溯），而账号表里的行不会跟着消失。
+  // 于是「删 workbuddy → 重新一键导入」反复几轮后，账号池里全是历史 Provider 留下的
+  // 同身份账号——它们早就不参与轮询了（归属对不上任何活跃 Provider），却还挂在列表里，
+  // 看起来像「一堆 workbuddy 账号」，其实大多是同一个号。已经删掉的那批不再展示。
   app.get('/admin/api/accounts', (c) => {
     const now = new Date()
-    const rows = accounts.list().map((a) => {
+    const liveIDs = new Set(
+      providers.list().filter((p) => p.state !== 'deleted').map((p) => p.providerId),
+    )
+    const rows = accounts.list().filter((a) => liveIDs.has(a.providerId)).map((a) => {
       const rt = deps.accountRuntime?.runtime(a.id)
       if (!rt) return { ...a, health: accountHealth(a, now) }
       const merged = { ...a, status: (rt.status || a.status) as Account['status'], fails: rt.fails }
