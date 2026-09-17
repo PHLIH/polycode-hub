@@ -266,9 +266,10 @@ function applyDefaults(c: Config): void {
     p.models ??= [] // Go 侧 nil 切片语义等价空目录
     for (const m of p.models) {
       if (!m.input || m.input.length === 0) m.input = ['text'] // 手动添加的模型默认纯文本
-      // 推理预设收敛小写；非法值留给 validate() 点名报错，不在这里静默吞掉。
+      // 推理预设只去首尾空格：大小写原样保留（某些上游大小写敏感），
+      // 超长等非法值留给 validate()（providerValidate）点名报错，不在这里静默吞掉。
       if (typeof m.reasoningEffort === 'string' && m.reasoningEffort.trim() !== '') {
-        m.reasoningEffort = m.reasoningEffort.trim().toLowerCase()
+        m.reasoningEffort = m.reasoningEffort.trim()
       }
     }
   }

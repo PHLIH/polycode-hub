@@ -41,9 +41,10 @@ function parseModel(v: unknown): Model | undefined {
   if (typeof v.displayName === 'string') m.displayName = v.displayName
   if (typeof v.note === 'string' && v.note !== '') m.note = v.note
   if (typeof v.egress === 'string' && v.egress !== '') m.egress = v.egress
-  // 推理预设只收敛大小写：非法值原样保留，由 providerValidate 点名报错，不静默吞掉。
+  // 推理预设只去首尾空格：大小写原样保留，非法值（超长）原样保留，
+  // 由 providerValidate 点名报错，不静默吞掉。
   if (typeof v.reasoningEffort === 'string' && v.reasoningEffort.trim() !== '') {
-    m.reasoningEffort = v.reasoningEffort.trim().toLowerCase()
+    m.reasoningEffort = v.reasoningEffort.trim()
   }
   if (typeof v.contextWindow === 'number') m.contextWindow = v.contextWindow
   if (typeof v.maxOutputTokens === 'number') m.maxOutputTokens = v.maxOutputTokens

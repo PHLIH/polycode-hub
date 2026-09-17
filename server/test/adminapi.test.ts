@@ -1811,17 +1811,19 @@ describe('PUT /admin/api/providers/:pid/models/:model/reasoning-effort（模型�
     const pz = mk()
     const call = caller(build({ providers: [pz] }))
     const set = await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/reasoning-effort`, {
-      key: 'secret', body: { reasoningEffort: 'HIGH' },
+      key: 'secret', body: { reasoningEffort: ' high ' },
     })
     expect(set.status).toBe(200)
-    // 大小写收敛
+    // 只去首尾空格，大小写与拼写原样保留（各家档位名不通用，网关不改写）
     expect(((await set.json()) as { reasoningEffort?: string }).reasoningEffort).toBe('high')
 
-    await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/reasoning-effort`, {
-      key: 'secret', body: { reasoningEffort: 'low' },
+    // 网关自定义拼写不被拦
+    const custom = await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/reasoning-effort`, {
+      key: 'secret', body: { reasoningEffort: 'ultra' },
     })
+    expect(custom.status).toBe(200)
     const list = await (await call('GET', '/admin/api/providers', { key: 'secret' })).json() as { providers: Provider[] }
-    expect(list.providers[0]!.models[0]!.reasoningEffort).toBe('low')
+    expect(list.providers[0]!.models[0]!.reasoningEffort).toBe('ultra')
 
     // 清空 → 字段消失（不是留个空串）
     const clear = await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/reasoning-effort`, {
@@ -1832,11 +1834,11 @@ describe('PUT /admin/api/providers/:pid/models/:model/reasoning-effort（模型�
     expect(after.providers[0]!.models[0]!.reasoningEffort).toBeUndefined()
   })
 
-  test('非法档位 400；未知模型/provider 404；非法请求体 400', async () => {
+  test('超长 400；未知模型/provider 404；非法请求体 400', async () => {
     const pz = mk()
     const call = caller(build({ providers: [pz] }))
     expect((await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/reasoning-effort`, {
-      key: 'secret', body: { reasoningEffort: 'ultra' },
+      key: 'secret', body: { reasoningEffort: 'x'.repeat(33) },
     })).status).toBe(400)
     expect((await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/reasoning-effort`, {
       key: 'secret', body: {},

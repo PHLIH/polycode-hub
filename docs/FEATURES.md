@@ -32,7 +32,7 @@
 
 - **支持的协议**：`anthropic-messages` / `openai-completions` / `openai-responses`（协议表 `ir/index.ts:5-9`）。
 - **转换方式**：统一经 **IR 中间表示**中转——3 个入站解析器 + 3 个出站序列化器，不做 N×N 两两直转（`ir/codec.ts:2`）。三 codec 均双向注册：`codec/anthropicmessages.ts:642-643`、`codec/openaicompletions.ts:969-970`、`codec/openairesponses.ts:1074-1075`。
-- **IR 词汇表**以 Anthropic Messages 为基准（`ir/types.ts:1-3`）：`IrRequest` 字段见 `ir/types.ts:50-62`（model / system / messages / tools / toolChoice / maxTokens / temperature / topP / stopSequences / stream）；Block 类型 `text | image | tool_use | tool_result | thinking`（`ir/types.ts:8`）；图片源 `base64 | url`（`ir/types.ts:10-16`）；流事件以 Anthropic SSE 事件集为规范形态（`ir/types.ts:105-130`）。
+- **IR 词汇表**以 Anthropic Messages 为基准（`ir/types.ts:1-3`）：`IrRequest` 字段见 `ir/types.ts`（model / system / messages / tools / toolChoice / maxTokens / temperature / topP / stopSequences / reasoningEffort / thinkingBudget / stream）；推理强度三协议互转（completions `reasoning_effort` / responses `reasoning.effort` / anthropic `thinking` + `output_config.effort`，未知档位原样透传）；Block 类型 `text | image | tool_use | tool_result | thinking`（`ir/types.ts:8`）；图片源 `base64 | url`（`ir/types.ts:10-16`）；流事件以 Anthropic SSE 事件集为规范形态（`ir/types.ts:105-130`）。
 - **工具调用**：三向均支持 `tool_use` / `tool_result`，但线上传输形态不同（OpenAI Completions 的 arguments 是 JSON 字符串，转换时须 parse/serialize，`ir/types.ts:22`；Responses 用 function_call / function_call_output；Anthropic 直译）。Responses 的 tool_choice 不支持会抛错；Completions 未知 tool_choice 容忍为 undefined。
 - **已知丢弃点**（如实列出，非缺陷隐瞒）：
   - OpenAI Completions 非流式响应序列化丢弃 thinking（`codecov` 位置：`codec/openaicompletions.ts:491`），`blocksToParts` 只收 text/image（`:348-357`）。
@@ -129,7 +129,7 @@
 - egresses：`GET /admin/api/egresses`，`PUT /admin/api/egresses/:id`（body `{kind:http|https, addr}`），`DELETE`（`api.ts:146-170`）。
 - providers：`GET` 列表，`POST` 新建（`parse.ts` 收敛解析 + `providerValidate`，冲突 409），`PATCH /:id`（白名单 `enabled/priority/streamOnly/displayName/riskNote/credential/models/probeModel/egress`，models 只增不减），`DELETE /:id`（builtin 禁删 403，成功 204）。
 - accounts：`GET /admin/api/accounts`（DB + 池内冷却/连败合并，过期冷却复位），`POST` 新建（id/providerId 必填，归属 Provider 必须存在；重名 409；新建只许 available/disabled），`PATCH /:id`（白名单 status/displayName/credential/weight），`DELETE /:id`，`POST /:id/recheck`（零上游成本，只清惩罚），`POST /:id/test`（真实请求，可传 `{model}`，成功清冷却归零）。
-- 模型：`POST /providers/:id/test`（最小真实请求），`POST /providers/:id/scan`（探到协议写回），`PUT /providers/:id/models/:model/{protocol,egress,note,enabled}`（note 限 200 字，空串删字段），`DELETE /providers/:id/models/:model`（PATCH 删不掉故独立端点），`GET /providers/:id/models`（lister 报错转 502）。
+- 模型：`POST /providers/:id/test`（最小真实请求），`POST /providers/:id/scan`（探到协议写回），`PUT /providers/:id/models/:model/{protocol,egress,note,enabled,reasoning-effort}`（note 限 200 字，空串删字段；reasoning-effort 为模型级推理强度预设，强制覆盖客户端档位，空串 = 跟随客户端），`DELETE /providers/:id/models/:model`（PATCH 删不掉故独立端点），`GET /providers/:id/models`（lister 报错转 502）。
 - stats：`GET /admin/api/stats`（全量），`GET /admin/api/breakdown?days|since|until&account_id`（默认 365 天），`GET /admin/api/usage/accounts`（账号维度）。
 - discover（`discover_api.ts`）：`GET /admin/api/discover`（未接线返回空列表），`POST /discover/adopt {key,id?}`（须 ready 否则 400，幂等），`POST /discover/import-account`（必填 key/tokenPath/accountId/credentialFile，服务端 0600 落盘，token 不经前端），`POST /discover/quick-import {key}`（全量导入存活登录态）。
 - sidecar / projects 以 Hono 子应用注入（`api.ts:646-653`），未注入对应端点 501。
@@ -144,7 +144,7 @@
 | `zcode` | 仅 `statSync` 安装目录存在即 unknown（`checkZCode:222-239`，`zCodeSearchDirs:87-91`）；登录态无法本地判定，指引走 OAuth。 |
 | `opencode-zen` | 连通探针 `GET {base}/v1/models` 带 `Bearer public`（`checkZen:264-297`），200 即 ready；默认 `https://opencode.ai/zen`。 |
 
-一键导入的 Provider 草稿：WorkBuddy（`wb-auto`，openai-completions，`copilot.tencent.com/v2`，`headers X-Product/X-Domain`，模型 `hy3-preview`）与 Zen（`zen-auto`，openai-completions，`zen/v1`，真机指纹 `User-Agent` + `x-session-id`/`x-session-affinity`，模型 `mimo-v2.5-free` / `nemotron-3-ultra-free`）——见 `discover/index.ts:136-148,243-261`。注意：旧 `x-opencode-*` 四头自 2026-09 起是毒头（带了必 403），已移除，见 `router/upstream.ts applyZenFingerprint`。
+一键导入的 Provider 草稿：WorkBuddy（`wb-auto`，openai-completions，`copilot.tencent.com/v2`，`headers X-Product/X-Domain`，模型 `hy3-preview`）与 Zen（`zen-auto`，openai-completions，`zen/v1`，会话头 `x-session-id`/`x-session-affinity`，模型 `mimo-v2.5-free` / `nemotron-3-ultra-free`）——见 `discover/index.ts:136-148,243-261`。注意：① 旧 `x-opencode-*` 四头自 2026-09 起是毒头（带了必 403），已移除，见 `router/upstream.ts applyZenFingerprint`；② UA 网关不内置版本号（通用项目不写死个人环境版本）：opencode 做客户端时透传它的真 UA，其他客户端配 Provider 静态头或 `ZEN_UA` 环境变量，优先级 静态 > 透传 > `ZEN_UA`，全无则如实不发。
 
 ## 9. 用量统计口径
 

@@ -41,25 +41,52 @@ type Lookup = (name: string) => [string, boolean]
 const defaultLookup: Lookup = (name) =>
   process.env[name] === undefined ? ['', false] : [process.env[name]!, true]
 
-// ---- OpenCode Zen 反代指纹（2026-09-17 实测结论） ----
+// ---- OpenCode Zen 反代指纹 ----
 //
 // 上游免费档只认「官方客户端样子」的请求（否则 403 FreeTierError）：
-//   User-Agent: opencode/<ver> ai-sdk/provider-utils/<ver> runtime/bun/<ver>
-//   x-session-id / x-session-affinity: 官方客户端会话 ID（ses_…）
+//   User-Agent：官方客户端的真串（三段式 opencode/<ver> ai-sdk/… runtime/…，
+//     版本号随官方发版变）
+//   x-session-id / x-session-affinity：官方客户端会话 ID（ses_…）
 // 2026-09 前用的 x-opencode-client/project/request/session 四件套现在是毒头——
 // 带了必回 403（"can only be used from within OpenCode"），真机抓包确认官方
-// 客户端（1.18.29）根本不发这四个头。
+// 客户端根本不发这四个头。
+//
+// 网关是通用项目，不内置任何版本号、不伪造 UA，只做「诚实透传 + 配置兜底」：
+//   UA 缺省时的补位优先级（已配的不覆盖——显式配置优先于隐式透传）：
+//     1. Provider 静态头里的 User-Agent（运维自己抓包取的真串；删掉即回到透传）；
+//     2. 客户端透传：opencode 做客户端时它的真 UA 直达上游
+//        （见 proxy.sessionHintFromHeaders，来什么透什么，网关不改写）；
+//     3. ZEN_UA 环境变量（项目级默认，同样由运维提供真串）；
+//     4. 全都没有——如实不发，不编版本号。403 时按 FreeTierError 指引去配真串。
+//   注意 UA 与会话头的优先级是反的（会话是 透传 > 静态）：会话的静态值会过期，
+//   活的永远比配的真；UA 的静态值是运维抓包 curated 的，客户端带来的反而可能是
+//   curl/Cherry Studio 之类非官方串——静态优先能保住配好的指纹不被冲掉。
+//   注入安全：透传/配置的 UA 只收单行可打印 ASCII（防 CR/LF 头注入），
+//   超长（>512）截断；会话 token 仍走 validSessionToken 白名单（非法不写头）。
 //
 // 会话 ID 必须来自一次真实的官方客户端运行（`opencode run --print-logs` 输出的
 // created id=ses_…），跨模型、跨端点可复用；本地随机编一个通不过。
 // opencode 自己做客户端时网关直接透传它的会话头（见 proxy.sessionHintFromHeaders），
-// 其他客户端则用 Provider 静态头里的那一份。
-export const ZEN_REAL_UA = 'opencode/1.18.29 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14'
+// 其他客户端则用 Provider 静态头里的那一份；都没有就不硬凑。
+
+// 单行可打印 ASCII 才配做 UA（防 CR/LF 头注入）；超长截断到 512。
+// 空/含控制字符/含非 ASCII → undefined（调用方视为无可用 UA，不硬凑）。
+export function sanitizeUA(s: string | undefined): string | undefined {
+  if (!s) return undefined
+  const t = s.trim()
+  if (t === '') return undefined
+  if (/[\r\n]/.test(t)) return undefined
+  if (!/^[\x20-\x7E]+$/.test(t)) return undefined
+  return t.length > 512 ? t.slice(0, 512) : t
+}
 
 // client 透传/静态配置的会话提示：id 缺省时 affinity 取 id（真机行为：两者同值）。
+// userAgent 是客户端原样带来的 UA（proxy.sessionHintFromHeaders 透传，
+// 来什么透什么，网关不判断是不是 opencode）；落头前由 sanitizeUA 把关。
 export interface SessionHint {
   id?: string
   affinity?: string
+  userAgent?: string
 }
 
 function isZenUpstream(baseUrl: string): boolean {
@@ -83,15 +110,26 @@ function validSessionToken(s: string): boolean {
 }
 
 // zen 指纹校准（导出供测试）：去毒头、落实会话头（透传 > 静态）；
-// defaultUA=true（即 opencode.ai 上游）且缺 UA 时补真实 UA。
+// UA 缺省时补位（静态头已配的不动——显式配置优先；缺时按 透传 > ZEN_UA 补，
+// 全无则不发），拒绝伪造版本。
+// zen=true（即 opencode.ai 上游）才补位——非 zen 上游缺 UA 就是缺，不碰。
 // 去毒头不限 host：x-opencode-* 是本网关早期逆向的臆测头，官方客户端从不发送，
 // 发给任何上游都没有意义，只会触发 zen 系网关的免费档拒绝。
-export function applyZenFingerprint(h: Record<string, string>, session?: SessionHint, defaultUA = true): void {
+// envUA 是 ZEN_UA 的可注入替身（测试用，生产走 process.env.ZEN_UA）：
+// 传了（哪怕空串）就用它，不再读环境——测试不碰运行环境。
+export function applyZenFingerprint(
+  h: Record<string, string>, session?: SessionHint, zen = true, envUA?: string,
+): void {
   for (const n of ['x-opencode-client', 'x-opencode-project', 'x-opencode-request', 'x-opencode-session']) {
     const k = findHeaderKey(h, n)
     if (k !== undefined) delete h[k]
   }
-  if (findHeaderKey(h, 'user-agent') === undefined && defaultUA) h['User-Agent'] = ZEN_REAL_UA
+  // UA 补位：Provider 静态头已配的不动（buildHeaders 里静态头先落头，
+  // 显式配置优先）；缺时按 透传 > ZEN_UA 补；全都没有就不发（不编版本号）。
+  if (zen && findHeaderKey(h, 'user-agent') === undefined) {
+    const ua = sanitizeUA(session?.userAgent) ?? sanitizeUA(envUA ?? process.env.ZEN_UA)
+    if (ua !== undefined) h['User-Agent'] = ua
+  }
   const staticId = findHeaderKey(h, 'x-session-id') !== undefined
     ? (h[findHeaderKey(h, 'x-session-id')!] ?? '').trim() : ''
   const sid = (session?.id ?? '').trim() || staticId

@@ -8,11 +8,10 @@ import {
   credentialResolve,
   looksFree,
   modelEffAPI,
-  normalizeReasoningEffort,
   providerValidate,
   riskAllowed,
+  sanitizeReasoningEffort,
   supportsImage,
-  validReasoningEffort,
   forgetProtocol,
   autoProtocol,
   rememberProtocol,
@@ -111,18 +110,21 @@ describe('Model 目录条目', () => {
     expect(supportsImage(m({ input: ['text', 'image'] }))).toBe(true)
   })
 
-  test('推理预设校验：大小写收敛、非法值拒绝', () => {
-    expect(validReasoningEffort('high')).toBe(true)
-    expect(validReasoningEffort('HIGH')).toBe(true)
-    expect(validReasoningEffort('ultra')).toBe(false)
-    expect(normalizeReasoningEffort(' High ')).toBe('high')
-    expect(normalizeReasoningEffort('ultra')).toBeUndefined()
-    expect(normalizeReasoningEffort('')).toBeUndefined()
+  test('推理预设不做白名单：去空格限长、原样保留（各家档位名不通用，合法性由上游判定）', () => {
+    expect(sanitizeReasoningEffort(' high ')).toBe('high')
+    // 网关自定义拼写不被误杀
+    expect(sanitizeReasoningEffort('ultra')).toBe('ultra')
+    expect(sanitizeReasoningEffort('extra_high')).toBe('extra_high')
+    expect(sanitizeReasoningEffort('')).toBeUndefined()
+    expect(sanitizeReasoningEffort('   ')).toBeUndefined()
+    expect(sanitizeReasoningEffort('x'.repeat(33))).toBeUndefined()
+    expect(sanitizeReasoningEffort(123)).toBeUndefined()
   })
 
-  test('providerValidate 点名非法规模型预设', () => {
+  test('providerValidate 只拦超长预设，不拦未知档位名', () => {
     expect(providerValidate(p({ models: [m({ reasoningEffort: 'high' })] }))).toBeUndefined()
-    expect(providerValidate(p({ models: [m({ id: 'm9', reasoningEffort: 'ultra' })] }))).toMatch(/m9/)
+    expect(providerValidate(p({ models: [m({ reasoningEffort: 'ultra' })] }))).toBeUndefined()
+    expect(providerValidate(p({ models: [m({ id: 'm9', reasoningEffort: 'x'.repeat(33) })] }))).toMatch(/m9/)
   })
 
   test('applyReasoningPreset：有预设强制覆盖并清 budget，无预设跟随客户端', () => {

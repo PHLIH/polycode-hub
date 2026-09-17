@@ -2,7 +2,8 @@ import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createServer, type Server } from 'node:http'
 import { AddressInfo } from 'node:net'
 import { Hono } from 'hono'
-import { Proxy, noCandidateMessage, sessionHintFromHeaders } from '../src/gateway/proxy.ts'
+import { Proxy, noCandidateMessage, sessionHintFromHeaders, mapUpstreamError } from '../src/gateway/proxy.ts'
+import { UpstreamError, UPSTREAM } from '../src/ir/index.ts'
 import { DEFAULT_FIRST_BYTE_TIMEOUT_MS, DEFAULT_STREAM_IDLE_TIMEOUT_MS } from '../src/config/index.ts'
 import { Scheduler } from '../src/router/scheduler.ts'
 import { Upstream } from '../src/router/upstream.ts'
@@ -624,17 +625,44 @@ describe('noCandidateMessage：诊断要说出真实原因', () => {
   })
 })
 
-describe('sessionHintFromHeaders（opencode 会话透传，zen 指纹）', () => {
+describe('sessionHintFromHeaders（客户端指纹透传，zen 指纹）', () => {
   const get = (m: Record<string, string>) => (n: string) => m[n]
-  test('双头同值透传；缺 affinity 时跟 id', () => {
+  test('会话双头同值透传；缺 affinity 时跟 id；UA 一并透传', () => {
     expect(sessionHintFromHeaders(get({ 'x-session-id': 'ses_a', 'x-session-affinity': 'ses_a' })))
       .toEqual({ id: 'ses_a', affinity: 'ses_a' })
     expect(sessionHintFromHeaders(get({ 'x-session-id': 'ses_a' })))
       .toEqual({ id: 'ses_a', affinity: 'ses_a' })
+    expect(sessionHintFromHeaders(get({
+      'x-session-id': 'ses_a', 'user-agent': 'opencode/1.2.3 live',
+    }))).toEqual({ id: 'ses_a', affinity: 'ses_a', userAgent: 'opencode/1.2.3 live' })
   })
-  test('无头 / 脏值 → undefined（不透传垃圾）', () => {
+  test('无会话但有 UA：照透 UA（网关不判断、落头前 sanitize）', () => {
+    expect(sessionHintFromHeaders(get({ 'user-agent': 'opencode/1.2.3 live' })))
+      .toEqual({ userAgent: 'opencode/1.2.3 live' })
+  })
+  test('全无 / 会话脏值且无 UA → undefined（不透传垃圾）', () => {
     expect(sessionHintFromHeaders(get({}))).toBeUndefined()
     expect(sessionHintFromHeaders(get({ 'x-session-id': 'has space!' }))).toBeUndefined()
     expect(sessionHintFromHeaders(get({ 'x-session-id': '' }))).toBeUndefined()
+  })
+})
+
+describe('mapUpstreamError：推理参数 400 带指引', () => {
+  test('bad_request 且上游点名 reasoning_effort → 附核对预设的指引', () => {
+    const e = mapUpstreamError(new UpstreamError(400, UPSTREAM.BAD_REQUEST,
+      "reasoning_effort 'minimal' is not supported for this model"))
+    expect(e.type).toBe('api_error')
+    expect(e.httpStatus).toBe(500)
+    expect(e.message).toContain('推理强度预设')
+  })
+
+  test('bad_request 但与推理无关 → 不带指引（别狼来了）', () => {
+    const e = mapUpstreamError(new UpstreamError(404, UPSTREAM.BAD_REQUEST, '404 Route Not Found'))
+    expect(e.message).not.toContain('推理强度预设')
+  })
+
+  test('其它 kind 不受影响', () => {
+    expect(mapUpstreamError(new UpstreamError(429, UPSTREAM.RATE_LIMIT, 'slow')).type).toBe('rate_limit_error')
+    expect(mapUpstreamError(undefined).message).toBe('无可用上游')
   })
 })

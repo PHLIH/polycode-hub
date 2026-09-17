@@ -41,6 +41,7 @@ providers:
         context_window: 200000    # 未知则不填 → 放行 + warn（默认不做预检）
         max_output_tokens: 8192
         input: [text]             # 纯文本；支持图片须显式 [text, image]
+        # reasoning_effort: "high"  # 模型级推理强度预设（强制覆盖客户端档位；不填=跟随客户端）
         enabled: true
 
   # 同一上游若还讲 openai-completions 协议，另建一个 Provider（base_url 含 /v1）：
@@ -104,8 +105,12 @@ accounts: []
 #         input: [text]
 #         enabled: true
 
-# OpenCode Zen 免费档示例（2026-09-17 更新：旧 x-opencode-* 四件套已变毒头，必 403；
-# 真机指纹 = 真实 UA + 真实 ses_ 会话，opencode 做客户端时网关自动透传它的）：
+# OpenCode Zen 免费档示例（通用指纹机制：网关不内置版本号、不伪造 UA）：
+# 指纹 = 真实 UA + 真实 ses_ 会话。
+#   - opencode 做客户端时：它的真 UA + 会话头自动透传，零配置；
+#   - 其他客户端经网关调用时：按下配静态 UA（自己抓包取 opencode 真串）+ 静态 ses_，
+#     或设 ZEN_UA 环境变量做项目级默认 UA（静态头优先于 ZEN_UA）。
+# 旧 x-opencode-* 四件套是毒头（必 403），不要加。
 # providers:
 #   - id: "zen-free"
 #     display_name: "Zen免费档"
@@ -117,8 +122,8 @@ accounts: []
 #     base_url: "https://opencode.ai/zen/v1"
 #     credential:
 #       api_key_env: "ZEN_KEY"       # 值固定为 public
-#     headers:                       # 真机指纹：UA + 会话头（与 id 同值）；不要加 x-opencode-*（毒头）
-#       User-Agent: "opencode/1.18.29 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"
+#     headers:                       # UA：自己抓包取的 opencode 真串；ses_ 与 id 同值
+#       User-Agent: "opencode/换成抓包取到的真串 ai-sdk/provider-utils/换真串 runtime/bun/换真串"
 #       x-session-id: "ses_换成你自己的真实会话"
 #       x-session-affinity: "ses_换成你自己的真实会话"
 #     enabled: false

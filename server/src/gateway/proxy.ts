@@ -42,19 +42,32 @@ export function bearerMatch(authHeader: string | undefined, key: string): boolea
   return timingSafeEqual(got, want)
 }
 
-// opencode 客户端的会话透传（zen 免费档指纹的一部分）。
-// opencode 发出的每个请求都带 x-session-id/x-session-affinity（同值 ses_…）；
-// 网关把它原样递给上游，上游才认这是"官方客户端内部"流量。非 opencode 客户端
-// 不带这两个头时返回 undefined，上游侧回退到 Provider 静态头里的那一份。
-// 只收字母数字/下划线/连字符（≤128）：透传的是上游鉴别依据，不收脏值。
+// 客户端指纹透传（zen 免费档指纹的一部分）：会话头 + UA 原样带给上游。
+// opencode 发出的每个请求都带 x-session-id/x-session-affinity（同值 ses_…），
+// 网关原样递给上游，上游才认这是"官方客户端内部"流量；它的 UA 本来就是真串，
+// 透传即指纹，无需网关伪造。非 opencode 客户端不带会话头时 hint 为 undefined，
+// 上游侧回退到 Provider 静态头里的那一份。
+// 通用原则：来什么透什么，网关不判断、不改写、不伪造（UA 的合法性由
+// upstream.sanitizeUA 在落头前把关，防 CR/LF 注入）。
+// id 只收字母数字/下划线/连字符（≤128）：透传的是上游鉴别依据，不收脏值；
+// UA 无会话时也照透（opencode 客户端的 UA 本身就是有效指纹的一部分）。
 export function sessionHintFromHeaders(get: (name: string) => string | undefined): SessionHint | undefined {
   const id = (get('x-session-id') ?? '').trim()
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)) return undefined
+  const ua = (get('user-agent') ?? '').trim()
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)) {
+    // 无可用会话：只剩 UA 可透时也返回（调用方按会话/UA 各自决定用不用）。
+    return ua !== '' ? { userAgent: ua } : undefined
+  }
   const aff = (get('x-session-affinity') ?? '').trim()
-  return { id, affinity: /^[A-Za-z0-9_-]{1,128}$/.test(aff) ? aff : id }
+  const hint: SessionHint = { id, affinity: /^[A-Za-z0-9_-]{1,128}$/.test(aff) ? aff : id }
+  if (ua !== '') hint.userAgent = ua
+  return hint
 }
 
 // 把最后一个上游错误映射为对 client 的规范错误。
+// bad_request 且上游原文提到推理参数时多半是档位不在上游枚举里：
+// 网关只透传不校验，配错只能在这里点名（管理台测试按钮同样带预设实测，先在那里验）。
+const REASONING_PARAM_HINT = /reasoning_effort|reasoning effort|unsupported[^.]{0,40}effort|effort[^.]{0,40}support|budget_tokens|thinking[^.]{0,40}budget/i
 export function mapUpstreamError(ue: UpstreamError | undefined): IrError {
   if (!ue) return irError(ERR.API, '无可用上游')
   switch (ue.kind) {
@@ -62,7 +75,12 @@ export function mapUpstreamError(ue: UpstreamError | undefined): IrError {
     case UPSTREAM.AUTH: return irError(ERR.AUTHENTICATION, '上游鉴权失败: ' + ue.message)
     case UPSTREAM.QUOTA: return irError(ERR.RATE_LIMIT, '上游额度耗尽: ' + ue.message)
     case UPSTREAM.NETWORK: return irError(ERR.OVERLOADED, '上游不可达: ' + ue.message)
-    default: return irError(ERR.API, '上游错误: ' + ue.message)
+    default: {
+      const hint = ue.kind === UPSTREAM.BAD_REQUEST && REASONING_PARAM_HINT.test(ue.message)
+        ? '（疑似模型推理强度预设不在上游枚举里：到 Providers 页展开该模型核对档位，或清空预设跟随客户端）'
+        : ''
+      return irError(ERR.API, '上游错误: ' + ue.message + hint)
+    }
   }
 }
 

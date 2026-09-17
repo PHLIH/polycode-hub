@@ -6,7 +6,6 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { Provider } from '../model/index.ts'
-import { ZEN_REAL_UA } from '../router/upstream.ts'
 import type { Finding } from '../adminapi/types.ts'
 
 // 状态枚举的唯一定义是 adminapi/types.ts 的 DiscoverStatus（Finding.status 用的就是它）。
@@ -250,9 +249,11 @@ function zenSuggestedProvider(baseURL: string): Provider {
     baseUrl: baseURL.replace(/\/+$/, '') + '/v1',
     credential: { apiKeyEnv: 'ZEN_KEY' },
     headers: {
-      // 真机指纹：官方客户端只发 UA + 会话头，不发 x-opencode-*（那是毒头，见 upstream.applyZenFingerprint）。
-      // 会话头优先透传客户端的；其他客户端经网关调用时用这里配的静态值。
-      'User-Agent': ZEN_REAL_UA,
+      // 指纹靠「诚实透传 + 配置兜底」，草稿里不预填任何 UA（网关不内置版本号）：
+      // opencode 做客户端时自动透传它的真 UA；其他客户端经网关调用时，
+      // 在 Provider 头里配一个自己抓包取的真串，或设 ZEN_UA 环境变量。
+      // 会话头同样优先透传客户端的；其他客户端经网关调用时用这里配的静态值。
+      // 不要加 x-opencode-*（毒头，见 upstream.applyZenFingerprint）。
     },
     priority: 1,
     models: [

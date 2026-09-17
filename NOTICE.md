@@ -17,7 +17,7 @@ polycode-hub 是**独立实现**：自有架构（IR 中间表示 + 三种协议
 |---|---|---|
 | `deepseek-ai/deepseek-harness`（DSH） | **配置模型**：① 三种上游协议划分 `openai-completions` / `openai-responses` / `anthropic-messages`（见 `server/src/ir/`）；② 一个 Provider 只说一种协议；③ Provider ID 不可改；④ baseURL 停在操作路径之前，由调用方拼具体操作路径；⑤ 模型能力显式声明（`contextWindow` / `maxOutputTokens` / `input: [text, image]`）；⑥ 手填模型默认纯文本，未声明图片时在发请求前拒绝并点名；⑦ 凭据分离，配置只存环境变量名引用，不落明文 | **MIT** ✅ |
 | `deepseek-ai/deepseek-harness`（DSH） | **TPS 指标口径**：① ratio-of-averages 聚合（总输出 ÷ 总耗时），非逐条再平均；② 分母取**生成段**、扣除 TTFT；③ `sampled` 守卫——timing 或 outputTokens 缺失的条目不参与统计；④ 无样本时**不产出指标**（显示 —，不假装 0）。见 `server/src/usage/store.ts` | **MIT** ✅ |
-| OpenCode Zen 免费档（社区整理 + 2026-09-17 真机抓包） | zen 免费档上游 `opencode.ai/zen/v1`；鉴权 `Authorization: Bearer public`（由 `ZEN_KEY` 环境变量提供）；必需请求头：真实 `User-Agent`（`opencode/1.18.29 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14`）+ `x-session-id` / `x-session-affinity`（真实官方 ses_ 会话；opencode 做客户端时网关透传）。旧 `x-opencode-*` 四头已变毒头（带了必 403），不要再发。见 `server/src/router/upstream.ts` | 协议事实（端点与请求头），**未复制代码** |
+| OpenCode Zen 免费档（社区整理 + 2026-09-17 真机抓包） | zen 免费档上游 `opencode.ai/zen/v1`；鉴权 `Authorization: Bearer public`（由 `ZEN_KEY` 环境变量提供）；必需请求头：官方客户端真 `User-Agent`（三段式 `opencode/<ver> ai-sdk/… runtime/…`，版本号随官方发版变，网关不内置——opencode 做客户端时自动透传，其他客户端配 Provider 静态头或 `ZEN_UA` 环境变量）+ `x-session-id` / `x-session-affinity`（真实官方 ses_ 会话；opencode 做客户端时网关透传）。旧 `x-opencode-*` 四头已变毒头（带了必 403），不要再发。见 `server/src/router/upstream.ts` | 协议事实（端点与请求头），**未复制代码** |
 | WorkBuddy / CodeBuddy 桌面端（社区整理） | 复用**已登录桌面端的 auth 文件**而非另存明文 token：读 `CODEBUDDY_DESKTOP_AUTH_FILE` 等环境变量定位，请求时按次读取再下发。见 `server/src/discover/index.ts` | 协议事实（环境变量与 auth 文件用法），**未复制代码** |
 
 ---

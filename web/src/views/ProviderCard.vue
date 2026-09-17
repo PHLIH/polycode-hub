@@ -14,8 +14,9 @@ const emit = defineEmits(['test', 'reload', 'models', 'edit', 'remove'])
 const open = ref(false)
 
 const PROTOCOLS = ['openai-completions', 'openai-responses', 'anthropic-messages']
-// 推理强度预设档位（DSH 档位体系）：空 = 跟随客户端，off = 强制关闭思考，
-// 其余强制覆盖客户端档位。网关原样透传给上游，不校验上游是否接受。
+// 推理强度预设建议值（各家档位名不通用：DeepSeek 认 low/high/max，OpenAI 看模型，
+// Anthropic 新式认 low/medium/high/max，另有网关自定义拼写）：下拉只给快捷项，
+// 可手输任意短字符串，网关原样透传给上游。空 = 跟随客户端，off = 强制关闭思考。
 const EFFORTS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 const KIND_LABELS = {
   official: '官方 API',
@@ -379,8 +380,8 @@ async function toggle() {
           </el-select>
 
           <el-select :model-value="effortValue(p, m.id)" size="small" class="lane-sel sm"
-            placeholder="强度·跟随" :title="effortValue(p, m.id) ? `推理强度预设 ${effortValue(p, m.id)}（强制覆盖客户端）` : '推理强度：跟随客户端'"
-            clearable filterable @change="v => setModelEffort(p, m.id, v || '')">
+            placeholder="强度·跟随" :title="effortValue(p, m.id) ? `推理强度预设 ${effortValue(p, m.id)}（强制覆盖客户端，按上游文档填）` : '推理强度：跟随客户端（可手输上游支持的档位名）'"
+            clearable filterable allow-create default-first-option @change="v => setModelEffort(p, m.id, (v || '').trim())">
             <el-option v-for="e in EFFORTS" :key="e" :value="e" :label="e" />
           </el-select>
 

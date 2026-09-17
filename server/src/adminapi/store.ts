@@ -41,7 +41,7 @@ function cleanModel(m: Model): Model {
   if (typeof m.note === 'string' && m.note !== '') out.note = m.note
   if (typeof m.egress === 'string' && m.egress !== '') out.egress = m.egress
   if (typeof m.reasoningEffort === 'string' && m.reasoningEffort.trim() !== '') {
-    out.reasoningEffort = m.reasoningEffort.trim().toLowerCase()
+    out.reasoningEffort = m.reasoningEffort.trim()
   }
   if (typeof m.contextWindow === 'number') out.contextWindow = m.contextWindow
   if (typeof m.maxOutputTokens === 'number') out.maxOutputTokens = m.maxOutputTokens

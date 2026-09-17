@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createServer, type Server } from 'node:http'
 import { AddressInfo } from 'node:net'
-import { Upstream, joinURL, probeOrder, shouldTryOtherProtocol, resolveProtocol, egressProxyURI, buildRequestURL, classifyUpstreamError, applyZenFingerprint, ZEN_REAL_UA } from '../src/router/upstream.ts'
+import { Upstream, joinURL, probeOrder, shouldTryOtherProtocol, resolveProtocol, egressProxyURI, buildRequestURL, classifyUpstreamError, applyZenFingerprint, sanitizeUA } from '../src/router/upstream.ts'
 import { UpstreamError } from '../src/ir/index.ts'
 import { forgetProtocol, rememberProtocol } from '../src/model/index.ts'
 import type { Provider } from '../src/model/index.ts'
@@ -338,8 +338,9 @@ test('setEgresses 热更新：换表并清 dispatcher 缓存（旧表引用失�
   await new Promise<void>((r) => px.close(() => r()))
 })
 
-// zen 指纹校准（2026-09-17 真机抓包回归）：上游免费档只认官方客户端指纹，
-// 旧 x-opencode-* 四件套是毒头（带了必 403 FreeTierError），必须删；
+// zen 指纹校准（通用机制：网关不内置版本号、不伪造 UA）：
+// 去毒头（旧 x-opencode-* 四件套带了必 403 FreeTierError）必须删；
+// UA 缺省时按 静态 > 透传 > ZEN_UA 补位，全无则如实不发；
 // 会话头按 透传 > 静态 落实，affinity 缺省跟 id。
 describe('zen 指纹校准 applyZenFingerprint', () => {
   test('去毒头：x-opencode-* 四件套一律删除（大小写不敏感）', () => {
@@ -353,16 +354,40 @@ describe('zen 指纹校准 applyZenFingerprint', () => {
     expect(h['Content-Type']).toBe('application/json') // 无关头不动
   })
 
-  test('缺 UA 时补真实 UA；已有 UA 不覆盖；非 zen 可关默认', () => {
-    const h1: Record<string, string> = {}
-    applyZenFingerprint(h1)
-    expect(h1['User-Agent']).toBe(ZEN_REAL_UA)
-    const h2: Record<string, string> = { 'user-agent': 'custom/1.0' }
-    applyZenFingerprint(h2)
-    expect(h2['user-agent']).toBe('custom/1.0')
+  test('UA 补位：静态优先（已配不动）；缺时透传；再缺用 ZEN_UA；全无不发', () => {
+    // 静态已配：透传也冲不掉（显式配置优先）
+    const h1: Record<string, string> = { 'User-Agent': 'opencode/9.9.9 static' }
+    applyZenFingerprint(h1, { userAgent: 'opencode/1.2.3 live' }, true, 'opencode/0.0.0 env')
+    expect(h1['User-Agent']).toBe('opencode/9.9.9 static')
+    // 缺静态：透传补上
+    const h2: Record<string, string> = {}
+    applyZenFingerprint(h2, { userAgent: 'opencode/1.2.3 live' }, true, 'opencode/0.0.0 env')
+    expect(h2['User-Agent']).toBe('opencode/1.2.3 live')
+    // 无透传：ZEN_UA 补上
     const h3: Record<string, string> = {}
-    applyZenFingerprint(h3, undefined, false)
-    expect(h3['User-Agent']).toBeUndefined()
+    applyZenFingerprint(h3, { id: 'ses_x' }, true, 'opencode/0.0.0 env')
+    expect(h3['User-Agent']).toBe('opencode/0.0.0 env')
+    // 全都没有：如实不发，不编版本号
+    const h4: Record<string, string> = {}
+    applyZenFingerprint(h4, { id: 'ses_x' }, true, '')
+    expect(h4['User-Agent']).toBeUndefined()
+    // 大小写不敏感：已有小写 user-agent 也算已配
+    const h5: Record<string, string> = { 'user-agent': 'custom/1.0' }
+    applyZenFingerprint(h5, { userAgent: 'opencode/1.2.3 live' }, true, 'opencode/0.0.0 env')
+    expect(h5['user-agent']).toBe('custom/1.0')
+    // 非 zen 上游：缺 UA 也不补
+    const h6: Record<string, string> = {}
+    applyZenFingerprint(h6, { userAgent: 'opencode/1.2.3 live' }, false, 'opencode/0.0.0 env')
+    expect(h6['User-Agent']).toBeUndefined()
+  })
+
+  test('sanitizeUA：只收单行可打印 ASCII；空/CRLF/非ASCII 不要；超长截断', () => {
+    expect(sanitizeUA('opencode/1.2.3 live')).toBe('opencode/1.2.3 live')
+    expect(sanitizeUA(undefined)).toBeUndefined()
+    expect(sanitizeUA('  ')).toBeUndefined()
+    expect(sanitizeUA('a\r\nb')).toBeUndefined()
+    expect(sanitizeUA('中文UA')).toBeUndefined()
+    expect(sanitizeUA('x'.repeat(600))?.length).toBe(512)
   })
 
   test('会话头：透传覆盖静态；affinity 缺省跟 id；静态保留', () => {

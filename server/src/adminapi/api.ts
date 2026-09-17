@@ -10,8 +10,8 @@ import { join } from 'node:path'
 import { writeFile0600 } from './credential_file.ts'
 import { ERR, validProtocol } from '../ir/index.ts'
 import {
-  providerValidate, accountHealth, validAccessKind, validRisk, validReasoningEffort,
-  REASONING_EFFORTS,
+  providerValidate, accountHealth, validAccessKind, validRisk, sanitizeReasoningEffort,
+  REASONING_EFFORT_MAX_LEN,
   credentialResolve, forgetProtocol,
   type Account, type CredentialRef, type Model, type Provider,
 } from '../model/index.ts'
@@ -861,6 +861,7 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
 
   // 模型推理强度预设（强制覆盖语义）：{"reasoningEffort": "high"} 配上就听模型的，
   // 客户端传什么档位都会被替换；空串 = 清掉预设，回到跟随客户端透传。
+  // 取值按上游文档填（各家档位名不通用，网关原样透传不校验，只限长防填错）。
   app.put('/admin/api/providers/:pid/models/:model/reasoning-effort', async (c) => {
     const raw = c.req.param('pid')
     const pid = parsePid(raw)
@@ -871,15 +872,15 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     if (!isObj(body) || typeof body.reasoningEffort !== 'string') {
       return errRes(c, 400, ERR.INVALID_REQUEST, '请求体须为 {"reasoningEffort": string}（空串 = 清掉预设，跟随客户端）')
     }
-    const effort = body.reasoningEffort.trim().toLowerCase()
-    if (effort !== '' && !validReasoningEffort(effort)) {
+    const trimmed = body.reasoningEffort.trim()
+    if (trimmed !== '' && sanitizeReasoningEffort(trimmed) === undefined) {
       return errRes(c, 400, ERR.INVALID_REQUEST,
-        `reasoningEffort 只允许 ${REASONING_EFFORTS.join(' / ')}，或空串表示跟随客户端`)
+        `reasoningEffort 过长（>${REASONING_EFFORT_MAX_LEN} 字符）：按上游文档填短档位名（如 low / high / max）`)
     }
     const m = p.models.find((x) => x.id === modelID)
     if (!m) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 下没有模型 ${modelID}`)
-    if (effort === '') delete m.reasoningEffort
-    else m.reasoningEffort = effort
+    if (trimmed === '') delete m.reasoningEffort
+    else m.reasoningEffort = trimmed
     providers.put(p)
     changed()
     return ok(c, 200, m)

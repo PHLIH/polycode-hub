@@ -1,7 +1,7 @@
 // Provider 测试与模型发现（对齐 Go internal/gateway/proxy.go 后半段）。
 // 管理面 SetProber/SetModelLister/SetModelProber 的实现。
 
-import { getOutbound, UpstreamError, type StreamEvent } from '../ir/index.ts'
+import { getOutbound, UpstreamError, type IrRequest, type StreamEvent } from '../ir/index.ts'
 import {
   autoProtocol, rememberProtocol, looksFree, accountEffectiveStatus,
   type Provider, type UsageLog,
@@ -237,6 +237,8 @@ export class Probe {
   // 对指定模型打一次最小真实流式请求。不抛错，失败如实返回。
   // 注意与 Stream 的协议解析不完全一致：此处只看模型级/ Provider 级声明，
   // 不读 autoProtocol 进程内缓存（探测即重探，避免缓存掩盖真相）。
+  // 推理预设同样带上：测试按钮测的就是真实转发会发的东西，预设配错（上游枚举外）
+  // 在这里直接现形，而不是测试通过、业务请求再挂。
   private async probeOne(pv: Provider, bare: string): Promise<ProbeOutcome> {
     const m = pv.models.find((x) => x.id === bare)
     const proto = m?.api || pv.api
@@ -252,13 +254,16 @@ export class Probe {
     const probeUp = this.up.withOpts({ noAutoProtocol: true })
     let stream: ReadableStream<Uint8Array> | undefined
     let err: unknown
+    const preset = pv.models.find((x) => x.id === bare)?.reasoningEffort?.trim()
+    const probeReq: IrRequest = {
+      model: bare, stream: true, maxTokens: 16,
+      ...(preset ? { reasoningEffort: preset } : {}),
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    }
     // 上游抖动重试：免费档按 IP 限速且会间歇 503，打一次就报「不通」会误判成配置错误。
     for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
       try {
-        stream = await probeUp.streamWithTimeout(pv, {
-          model: bare, stream: true, maxTokens: 16,
-          messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
-        }, AbortSignal.timeout(PROBE_TIMEOUT_MS))
+        stream = await probeUp.streamWithTimeout(pv, probeReq, AbortSignal.timeout(PROBE_TIMEOUT_MS))
         err = undefined
         break
       } catch (e) {
