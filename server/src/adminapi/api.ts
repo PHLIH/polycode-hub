@@ -508,6 +508,26 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     return c.body(null, 204)
   })
 
+  // 彻底清理已删除的 Provider（物理删行）。
+  // 为什么要有这个端点：DELETE 是软删（保留行让历史用量能回溯到 providerId），
+  // 但删掉的记录会**永久堆在库里**，而它又不出现在列表里——用户既看不到也管不了。
+  // 代价必须说清：物理删掉后，那批历史用量的归因会退回「未知来源」。
+  // 因此只允许删已经处于 deleted 的行：想清一条正在用的通道，必须先正常删除。
+  app.delete('/admin/api/providers/:pid/purge', (c) => {
+    const raw = c.req.param('pid')
+    const p = findProvider(providers, raw)
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
+    if (p.state !== 'deleted') {
+      return errRes(c, 400, ERR.INVALID_REQUEST,
+        `provider #${raw}（${p.name}）还在使用中（state=${p.state}），先删除它再清理`)
+    }
+    if (!providers.delete(p.providerId)) {
+      return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
+    }
+    changed()
+    return c.body(null, 204)
+  })
+
   // ---- accounts ----
 
   // 账号的「归属」= Provider.providerId（数字，永不变）。前端传来的是名字

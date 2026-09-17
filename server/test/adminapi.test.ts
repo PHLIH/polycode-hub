@@ -297,6 +297,34 @@ describe('providers CRUD（对齐 Go TestProviderCRUD/PatchReadonly/Validation�
     expect((await call('DELETE', '/admin/api/providers/99999', { key: 'secret' })).status).toBe(404)
   })
 
+  // 回归：软删的行会**永久堆在库里**（历史用量靠 providerId 回溯，不能随手物理删），
+  // 而它又不出现在主列表里 —— 用户既看不到也管不了。purge 给一个真的清干净的出口，
+  // 但必须只允许删已经 deleted 的行，否则等于绕过"先删除"的保护。
+  test('purge：只能彻底清理已删除的行；在用的一律 400', async () => {
+    const call = caller(build())
+    const created = await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })
+    const p = await created.json() as Provider
+
+    // 正在用 → 拒绝（不许绕过软删直接把通道抹掉）
+    const early = await call('DELETE', `/admin/api/providers/${p.providerId}/purge`, { key: 'secret' })
+    expect(early.status).toBe(400)
+    expect(await early.json()).toMatchObject({ error: { message: expect.stringContaining('还在使用中') } })
+    // 拒绝后行必须还在
+    expect((await call('GET', `/admin/api/providers/${p.providerId}/credential`, { key: 'secret' })).status).toBe(200)
+
+    // 先软删 → 再 purge 才允许
+    expect((await call('DELETE', `/admin/api/providers/${p.providerId}`, { key: 'secret' })).status).toBe(204)
+    expect((await call('DELETE', `/admin/api/providers/${p.providerId}/purge`, { key: 'secret' })).status).toBe(204)
+    // 物理删除后彻底消失（连软删行都不在）
+    const left = (await call('GET', '/admin/api/providers', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ providers: Provider[] }>)).providers
+    expect(left.find((x) => x.providerId === p.providerId)).toBeUndefined()
+    // 再 purge 同一条 → 404
+    expect((await call('DELETE', `/admin/api/providers/${p.providerId}/purge`, { key: 'secret' })).status).toBe(404)
+    // 非法 pid → 404（与其余 :pid 路由同口径）
+    expect((await call('DELETE', '/admin/api/providers/abc/purge', { key: 'secret' })).status).toBe(404)
+  })
+
   test('重名规则：与 deleted 同名可复用（拿到新 providerId）', async () => {
     const call = caller(build())
     const first = await call('POST', '/admin/api/providers', { key: 'secret', body: providerBody })

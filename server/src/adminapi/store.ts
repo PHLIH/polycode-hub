@@ -7,7 +7,7 @@ import { dirname } from 'node:path'
 import { createRequire } from 'node:module'
 // node:sqlite 经 createRequire 加载（vite-node 不认识该内置模块，见 usage/store.ts）。
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite')
-import type { Account, Provider } from '../model/index.ts'
+import type { Account, Model, Provider } from '../model/index.ts'
 
 export interface ProviderStore {
   list(): Provider[]
@@ -27,8 +27,28 @@ export interface AccountStore {
   delete(id: string): boolean
 }
 
+// cloneProvider 是所有读写经过的咽喉点：这里顺带把模型对象收敛到 Model 的合法字段。
+//
+// 为什么必须在存储层做（而不是只靠 parse.ts 的入参收敛）：
+// Model 接口没有 providerId 字段，但历史写入（早期夹具/迁移/某次 PATCH 把整条旧对象
+// 带回）把 `providerId: ""` 塞进了 models，之后每次 PATCH 都会把这条脏对象原样写回，
+// **永远洗不掉**——实测 6 个 Provider 的模型全带这个字段，其中 senseaudio 37 条全中。
+// 入参收敛管不到"已经在库里的"，只有存储层的读/写都过一遍才能自愈。
+// 白名单与 parse.ts 的 parseModel 保持一致；新增 Model 字段时两处都要加。
+function cleanModel(m: Model): Model {
+  const out: Model = { id: m.id, manual: m.manual === true, enabled: m.enabled === true }
+  if (typeof m.displayName === 'string') out.displayName = m.displayName
+  if (typeof m.note === 'string' && m.note !== '') out.note = m.note
+  if (typeof m.egress === 'string' && m.egress !== '') out.egress = m.egress
+  if (typeof m.contextWindow === 'number') out.contextWindow = m.contextWindow
+  if (typeof m.maxOutputTokens === 'number') out.maxOutputTokens = m.maxOutputTokens
+  if (Array.isArray(m.input) && m.input.length > 0) out.input = [...m.input]
+  if (typeof m.api === 'string' && m.api !== '') out.api = m.api
+  return out
+}
+
 function cloneProvider(p: Provider): Provider {
-  return { ...p, models: p.models.map((m) => ({ ...m })) }
+  return { ...p, models: (p.models ?? []).map(cleanModel) }
 }
 
 // ---- 内存实现（并发安全：JS 单线程，方法内无 await 即原子）----
@@ -231,7 +251,10 @@ export class SQLiteProviderStore implements ProviderStore {
   private rowToProvider(r: { provider_id: number; name: string; state: string; data: string }): Provider | undefined {
     const body = parseRow<Omit<Provider, 'providerId' | 'name' | 'state'>>(r.data)
     if (!body) return undefined
-    return { ...body, providerId: r.provider_id, name: r.name, state: r.state as Provider['state'] }
+    // 必须同样过一遍 cleanModel：SQLite 路径不经过 cloneProvider，
+    // 只在内存实现里收敛会让真实库的脏字段（models[].providerId）永远洗不掉。
+    const p = { ...body, providerId: r.provider_id, name: r.name, state: r.state as Provider['state'] }
+    return { ...p, models: (p.models ?? []).map(cleanModel) }
   }
 
   list(): Provider[] {

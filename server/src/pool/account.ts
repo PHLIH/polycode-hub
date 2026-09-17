@@ -8,6 +8,11 @@ import { accountEffectiveStatus, type Account, type AccountStatus } from '../mod
 export type Persister = (a: Account) => void
 const noPersist: Persister = () => {}
 
+// 显式重置（操作者点「重置」/「启用」）落盘钩子：与 Persister 分开，因为语义不同——
+// 普通惩罚回写绝不允许改写操作者设的 disabled，而显式重置必须能解除它。
+// 分开成两个回调而不是共用 Persister 加标志位：行为差异显式写在类型里，不靠隐式状态。
+export type ResetPersister = (a: Account) => void
+
 // 该源无可用账号（全部冷却/禁用/不存在）的哨兵错误。
 export class ErrNoAccount extends Error {
   constructor() { super('pool: no available account') }
@@ -20,10 +25,13 @@ export class AccountPool {
   private rr = new Map<number, number>() // providerId → 加权轮询计数（单调递增，总权重取模）
   // 惩罚状态回写存储（fails/cooldownUntil）。未注入则不落盘（测试/只读场景照旧）。
   private persist: Persister = noPersist
+  // 显式重置回写（允许解除 disabled）。未注入则退化为 persist。
+  private persistReset: ResetPersister = noPersist
 
-  constructor(accounts: Account[], persist: Persister = noPersist) {
+  constructor(accounts: Account[], persist: Persister = noPersist, persistReset: ResetPersister = persist) {
     this.accounts = accounts.map((a) => ({ ...a }))
     this.persist = persist
+    this.persistReset = persistReset
   }
 
   // 报告该 Provider 是否配置了账号（哪怕全部冷却）：
@@ -67,6 +75,17 @@ export class AccountPool {
     const a = this.accounts.find((x) => x.id === id)
     if (!a) return
     if (ok) {
+      // 人工停用（disabled）是操作者意图，成功也不能推翻：只有显式「启用」才解开。
+      // 没有这道闸，一次成功就把操作者刚关掉的号重新拉进轮询。
+      // 但惩罚仍要清并落盘——「测试」是人工验证手段，已验证可用就不该再顶着连败计数；
+      // 不落盘的话重启后又把陈年 fails 读回来（池内 0 / DB 6 的分叉）。
+      if (a.status === 'disabled') {
+        a.fails = 0
+        a.cooldownUntil = undefined
+        a.lastUsed = now
+        this.persist(a)
+        return
+      }
       // 只在真有惩罚时写：避免每次成功都白落一次盘。
       if (a.status !== 'available' || a.fails !== 0) {
         a.status = 'available'
@@ -163,7 +182,8 @@ export class AccountPool {
     a.fails = 0
     a.status = 'available' as AccountStatus
     a.cooldownUntil = undefined
-    this.persist(a)
+    // 显式重置是操作者意图，允许解除 disabled——走 persistReset（普通 persist 不放行）。
+    this.persistReset(a)
     return true
   }
 }

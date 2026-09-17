@@ -13,6 +13,7 @@ import { Upstream, egressProxyURI } from './router/upstream.ts'
 import { Proxy } from './gateway/proxy.ts'
 import { Probe } from './gateway/probe.ts'
 import { AccountPool } from './pool/account.ts'
+import type { Account } from './model/index.ts'
 import { Store as UsageStore } from './usage/store.ts'
 import {
   SQLiteEgressStore, SQLiteProviderStore, SQLiteAccountStore,
@@ -118,14 +119,25 @@ export async function runServe(args: string[]): Promise<void> {
   //   exhausted —— 必须把 status 一起写进去。额度用尽不会自己好，重启后得停在
   //                耗尽态，否则一夜之间所有号又爬起来空转；
   //   恢复（重置/测试成功）—— 把 DB 里的 exhausted 抹回 available，否则永远解不开。
-  const acctPool = new AccountPool(cfg.accounts, (a) => {
+  //   disabled —— 操作者显式停用，任何自动惩罚都不得覆盖；池内若已按成功清惩罚，
+  //               也不能据此把 DB 的 disabled 改成 available（只有「启用」能解）。
+  const writePenalty = (a: Account) => {
     const cur = accounts.get(a.id)
     if (!cur) return
     const next = { ...cur, fails: a.fails, cooldownUntil: a.cooldownUntil }
-    if (a.status === 'exhausted') next.status = 'exhausted'
+    // disabled 是操作者意图，惩罚回写不改写它（避免「测试通过→静默启用」式漂移）。
+    if (cur.status === 'disabled') next.status = 'disabled'
+    else if (a.status === 'exhausted') next.status = 'exhausted'
     else if (cur.status === 'exhausted' && a.status === 'available') next.status = 'available'
     accounts.put(next)
-  })
+  }
+  // 显式重置（操作者点「重置」）允许解除 disabled：这是唯一能把号从停用态放出来的自动路径。
+  const writeReset = (a: Account) => {
+    const cur = accounts.get(a.id)
+    if (!cur) return
+    accounts.put({ ...cur, status: a.status, fails: a.fails, cooldownUntil: a.cooldownUntil })
+  }
+  const acctPool = new AccountPool(cfg.accounts, writePenalty, writeReset)
   px.setAccountPool(acctPool)
 
   seedProvidersIfEmpty(providers, cfg.providers)

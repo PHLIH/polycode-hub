@@ -20,7 +20,7 @@ const declaredEgresses = ref([])
 const egressOptions = computed(() => {
   const seen = new Map()
   for (const e of declaredEgresses.value) seen.set(e.id, e)
-  for (const p of list.value) if (p.egress) seen.set(p.egress, { id: p.egress, kind: 'http', addr: '' })
+  for (const p of list.value) if (p.state !== 'deleted' && p.egress) seen.set(p.egress, { id: p.egress, kind: 'http', addr: '' })
   return [...seen.values()]
 })
 
@@ -39,6 +39,32 @@ const modelsTarget = ref(null)
 
 // exposedModels 是「模型」按钮里勾选的那批模型——唯一的真相源。
 // 卡片展示它、测试下拉取它、/v1/models 也只列它：三处必须同一份集合。
+// 列表只显示「还在用」的 Provider（active / paused）。
+// deleted 是软删标记：行留在库里只为历史用量归因能回溯到 providerId，
+// **不是**给用户看的条目。以前不过滤，删掉的那条仍以卡片形式留在页面上，
+// 带着开关和删除按钮 —— 用户点完删除看到它还杵在那儿，完全就是"只关了个开关"。
+const visibleProviders = computed(() => (list.value || []).filter(p => p.state !== 'deleted'))
+// 已删除的行：不在主列表里，但给一个折叠区能看到/清理，否则它们永远堆在库里且用户无感。
+const deletedProviders = computed(() => (list.value || []).filter(p => p.state === 'deleted'))
+const deletedOpen = ref(false)
+
+// 彻底清理已删记录：物理删掉那一行。
+// 代价是它的历史用量归因会退回「未知来源」——所以必须二次确认，且默认不做。
+async function purge(p) {
+  try {
+    await ElMessageBox.confirm(
+      `彻底清理已删除的「${p.name}」（#${p.providerId}）？\n\n`
+      + `这条记录会从库里物理删除，无法恢复。\n`
+      + `代价：它过去的用量记录仍在，但归因会显示为「未知来源」（认不出是哪个 Provider 了）。`,
+      '彻底清理', { type: 'warning', confirmButtonText: '彻底清理', dangerouslyUseHTMLString: false })
+  } catch { return }
+  try {
+    await api.purgeProvider(p.providerId)
+    ElMessage.success(`已彻底清理 #${p.providerId}`)
+    load()
+  } catch (e) { ElMessage.error(e.message) }
+}
+
 const exposedModels = (p) => (p && p.models ? p.models.filter(m => m.enabled) : [])
 
 const APIS = [
@@ -269,11 +295,17 @@ async function remove(p) {
   try {
     await ElMessageBox.confirm(
       `删除 Provider「${p.name}」（#${p.providerId}）？\n\n`
-      + `用它模型 ID 的客户端（如 ${p.name}/xxx）会收到明确报错。\n`
-      + `历史用量归因保留；该名字可以被新建的 Provider 复用。`,
+      + `· 它将立刻从列表和路由里消失，用 ${p.name}/xxx 调用的客户端会收到明确报错\n`
+      + `· 历史用量归因会保留（仍能看到它过去用掉多少），所以库里会留一条 deleted 记录\n`
+      + `· 名字被释放，可以再建一个同名 Provider（会拿到新的 #id）\n\n`
+      + `这条已删记录可在页面底部「已删除」区查看和彻底清理。`,
       '确认删除', { type: 'warning', dangerouslyUseHTMLString: false })
   } catch { return }
-  try { await api.deleteProvider(p.providerId); ElMessage.success('已删除'); load() }
+  try {
+    await api.deleteProvider(p.providerId)
+    ElMessage.success(`已删除「${p.name}」（历史用量归因保留）`)
+    load()
+  }
   catch (e) { ElMessage.error(e.message) }
 }
 
@@ -565,15 +597,37 @@ async function adoptModels() {
     </div>
   </section>
 
-  <div v-if="!list.length && !err" class="empty">
+  <div v-if="!visibleProviders.length && !err" class="empty">
     <p class="empty-title">还没有 Provider</p>
     <p class="empty-body">先从上面的一键导入拿本机已登录的 harness，或者手动添加一家外部 API。</p>
     <button class="btn" @click="openCreate">添加外部 API</button>
   </div>
 
-  <ProviderCard v-for="p in list" :key="p.providerId" :p="p" :egresses="egressOptions"
+  <ProviderCard v-for="p in visibleProviders" :key="p.providerId" :p="p" :egresses="egressOptions"
     :testing="testing === p.providerId" :test-res="testRes[p.providerId]"
     @test="test" @reload="load" @models="openModels" @edit="openEdit" @remove="remove" />
+
+  <!-- 已删除：软删的行不在主列表里，但会永久留在库中（历史用量靠 providerId 回溯）。
+       给一个折叠区让用户看得到、也能真的清掉——否则它们只增不减且完全不可见。 -->
+  <section v-if="deletedProviders.length" class="deleted-zone">
+    <button class="deleted-head" @click="deletedOpen = !deletedOpen">
+      <span class="caret-tri" :class="{ open: deletedOpen }" aria-hidden="true" />
+      已删除 {{ deletedProviders.length }} 个（历史用量归因仍在保留）
+    </button>
+    <div v-if="deletedOpen" class="deleted-body">
+      <p class="dim deleted-hint">
+        这些记录已不再参与路由。保留它们只为让历史用量能认出是谁用掉的；
+        彻底清理后那批用量的来源会显示为「未知来源」。
+      </p>
+      <div v-for="p in deletedProviders" :key="p.providerId" class="deleted-row">
+        <span class="mono pid">#{{ p.providerId }}</span>
+        <span class="deleted-name">{{ p.name }}</span>
+        <span class="dim">{{ (p.models || []).length }} 个模型</span>
+        <span class="grow" />
+        <button class="act danger" @click="purge(p)">彻底清理</button>
+      </div>
+    </div>
+  </section>
 
   <el-dialog v-model="clashDlg" title="Clash 出口" width="480px">
     <el-form label-width="90px">
@@ -828,6 +882,23 @@ async function adoptModels() {
 .empty { border: 1px dashed var(--line); border-radius: var(--r-box); padding: 28px 20px; text-align: center; margin-bottom: 16px; }
 .empty-title { margin: 0 0 6px; font-size: 14px; font-weight: 600; }
 .empty-body { margin: 0 0 14px; font-size: 12px; color: var(--dim); }
+
+/* 已删除区：软删行不在主列表里，但得让用户看得到、能清理（否则只增不减且不可见） */
+.deleted-zone { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 12px; }
+.deleted-head {
+  display: flex; align-items: center; gap: 6px; background: none; border: 0; cursor: pointer;
+  color: var(--dim); font-size: 12px; padding: 4px 0;
+}
+.deleted-head:hover { color: var(--text); }
+.deleted-body { margin-top: 6px; }
+.deleted-hint { font-size: 12px; margin: 0 0 10px; }
+.deleted-row {
+  display: flex; align-items: center; gap: 10px; padding: 7px 10px;
+  border: 1px solid var(--line); border-radius: var(--r-ctl); margin-bottom: 6px;
+  font-size: 12px; opacity: .75;
+}
+.deleted-row .grow { flex: 1; }
+.deleted-name { color: var(--text); font-weight: 600; }
 
 /* ---- 出口代理状态 chip（挂在顶部入口按钮旁，全页唯一一处） ---- */
 .eg-chip {

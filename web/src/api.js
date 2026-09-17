@@ -93,6 +93,9 @@ export const api = {
   // 路径参数是 Provider 的内部 id（数字）；name 可改，id 不变。
   updateProvider: (pid, patch) => req('PATCH', `/admin/api/providers/${encodeURIComponent(pid)}`, patch),
   deleteProvider: (pid) => req('DELETE', `/admin/api/providers/${encodeURIComponent(pid)}`),
+  // 彻底清理已删除的 Provider（物理删行）。DELETE 是软删、行会永久留在库里，
+  // 这个端点给用户一个真的清干净的出口（代价：历史用量归因退回「未知来源」）。
+  purgeProvider: (pid) => req('DELETE', `/admin/api/providers/${encodeURIComponent(pid)}/purge`),
   // 凭证明文按需查看（列表只下发引用，明文走这个显式端点）。
   providerCredential: (pid) => req('GET', `/admin/api/providers/${encodeURIComponent(pid)}/credential`),
   testProvider: (pid) => req('POST', `/admin/api/providers/${encodeURIComponent(pid)}/test`),

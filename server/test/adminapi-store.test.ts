@@ -81,6 +81,38 @@ describe('SQLite 存储（admin.db 两表 + 内存实现）', () => {
     expect(as.delete('a1')).toBe(true)
   })
 
+  // 回归（真实脏数据）：Model 接口没有 providerId 字段，但历史写入把它塞进了
+  // models，之后每次 PATCH 都会把这条脏对象原样写回、**永远洗不掉**——
+  // 实测 6 个 Provider 共 46 条模型全带 `providerId: ""`（senseaudio 37 条全中）。
+  // 入参收敛（parse.ts）管不到"已经在库里的"，必须在存储层的读/写咽喉点收敛。
+  test('存储层收敛模型字段：库里的脏字段读出来就被洗掉（内存 + SQLite）', async () => {
+    const dirty = {
+      id: 'm', enabled: true, manual: false,
+      providerId: '', // ← 脏字段（Model 接口里没有）
+      bogus: { nested: true }, // ← 任何未知字段都不该透出
+    }
+    // 内存实现
+    const mem = new MemoryProviderStore([
+      { ...provider, models: [dirty as never] },
+    ])
+    for (const m of mem.get(1)!.models) {
+      expect(m).not.toHaveProperty('providerId')
+      expect(m).not.toHaveProperty('bogus')
+      expect(m.id).toBe('m')
+    }
+    // SQLite 实现（走 rowToProvider，不经过 cloneProvider —— 曾漏在这里）
+    const path = join(dir, 'sanitize.db')
+    const ps = await SQLiteProviderStore.open(path)
+    const row: Provider = { ...provider, providerId: 0, models: [dirty as never] }
+    ps.put(row)
+    const got = ps.get(row.providerId)!
+    expect(got.models[0]).not.toHaveProperty('providerId')
+    expect(got.models[0]).not.toHaveProperty('bogus')
+    // 合法字段一个都不能丢
+    expect(got.models[0]).toEqual({ id: 'm', enabled: true, manual: false })
+    ps.close()
+  })
+
   test('仅空库播种；非空不覆盖运行时变更', async () => {
     const path = join(dir, 'seed.db')
     const ps = await SQLiteProviderStore.open(path)
