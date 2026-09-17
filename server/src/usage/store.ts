@@ -138,6 +138,11 @@ export class Store {
       first_token_ms INTEGER NOT NULL DEFAULT 0,
       error_kind TEXT NOT NULL DEFAULT ''
     )`)
+    // ts 索引必须在建表后**无条件**创建：它原先只写在「重建表」那个分支里，
+    // 于是全新安装的库从来没有这个索引 —— 而 summarize/breakdown/
+    // accountBreakdown/recent 全部按 ts 过滤或排序，数据量上来后就是全表扫。
+    // IF NOT EXISTS 保证重建分支再建一次也无副作用。
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_usage_ts ON usage_logs(ts)`)
     migrate(db)
     return new Store(db)
   }
@@ -170,7 +175,8 @@ export class Store {
     return resolveProviderIds(this.db, lookup)
   }
 
-  rowToLog(r: Record<string, unknown>): UsageLog {
+  // 数据库行 → UsageLog。仅本类内部使用（recent/查询都走它），不需要对外暴露。
+  private rowToLog(r: Record<string, unknown>): UsageLog {
     return {
       id: r.id as number,
       ts: new Date(r.ts as number),
@@ -197,10 +203,13 @@ export class Store {
   }
 
   // 按时间倒序返回最近 limit 条。
+  // limit 必须钳制：SQLite 里 LIMIT -1 表示**不限量**，负数/NaN/超大值一旦从
+  // HTTP 参数透进来就是全表返回（当前无外部入口，但接上 API 即变 DoS）。
   async recent(limit: number): Promise<UsageLog[]> {
+    const n = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 1000) : 50
     const rows = this.db.prepare(
       `SELECT * FROM usage_logs ORDER BY ts DESC, id DESC LIMIT ?`,
-    ).all(limit) as unknown as Record<string, unknown>[]
+    ).all(n) as unknown as Record<string, unknown>[]
     return rows.map((r) => this.rowToLog(r))
   }
 
@@ -260,6 +269,9 @@ export class Store {
   // 但本机现行流量 100% OpenAI 系（全库无 read>input），YAGNI 不做语义分支；
   // 若日后 Anthropic 流量出现（read>input），再加 protocol 列分支。
   // reasoning 已含于 output，不重复计。
+  // 注意第三个形参 cacheCreationTokens **故意不参与计算**（下划线前缀 = 有意忽略）：
+  // 上面的注释解释了为什么加它会重复计数。保留形参而不是删掉，是为了让所有
+  // 调用点统一传「同三个 token 桶」，将来真要按协议分支时不必再改每一处调用。
   private static totalOf(
     inputTokens: number, outputTokens: number, _cacheCreationTokens = 0,
   ): number {
@@ -269,6 +281,7 @@ export class Store {
   // 命中率 = 缓存读取 / 总输入（用户口径：命中了多少输入）。
   // OpenAI 系 input（prompt_tokens）已含 cached → 总输入 = input 本身。
   // 无输入返回 null（缺数据不产出 0.0，前端显示 —）。
+  // 同 totalOf：cacheCreationTokens 有意不参与（见上），保留形参统一调用口径。
   private hitRate(
     inputTokens: number, cacheReadTokens: number, _cacheCreationTokens = 0,
   ): number | null {

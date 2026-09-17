@@ -327,6 +327,10 @@ export class Manager {
     const key = this.key(projectID, service)
     const st = this.state.get(key)
     let pid = st && st.pid > 0 ? st.pid : 0
+    // 自己起的进程是 setsid 组长，可以按进程组杀（连带它的子孙）；
+    // 认领来的外部进程不保证是组长，只能杀它自己 —— 否则 kill(-pid) 会打向
+    // 它的整个进程组，可能是网关自己的组或用户的 shell 组。
+    let ownGroup = pid > 0
     if (pid === 0) {
       // 没有 state = 不是本管理器起的。但占端口的可能就是本服务（外部命令拉的），
       // 认出它才能停——否则这里静默 return，用户看到的是"点了停止没反应"，
@@ -335,6 +339,7 @@ export class Manager {
       if (!found) return
       pid = await this.claimPortOwner(found.svc, found.svc.port)
       if (pid === 0) return
+      ownGroup = false
     }
     // 拦「停止自己」：管理台就跑在网关进程里，而网关正是项目列表里的一项。
     // 杀掉自己会让这个请求拿不到响应（用户看到的是请求挂死，不是"已停止"），
@@ -346,7 +351,7 @@ export class Manager {
         + '请用 ./update.sh 重启，或在终端里操作。')
     }
     try {
-      await killTree(pid)
+      await killTree(pid, 5000, ownGroup)
     } catch (e) {
       throw new Error(`projects: 停止失败: ${(e as Error).message}`)
     }

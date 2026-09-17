@@ -74,7 +74,16 @@ export async function runServe(args: string[]): Promise<void> {
   let portOverride = 0
   for (let i = 0; i < args.length - 1; i++) {
     if (args[i] === '--config') configPath = args[i + 1]!
-    if (args[i] === '--port') portOverride = Number(args[i + 1])
+    // --port 必须显式校验：Number('abc') 得 NaN，而 `NaN > 0` 为 false，
+    // 旧写法会**静默忽略**这个参数、悄悄用配置文件里的端口 ——
+    // 用户以为改了端口，实际没改，且没有任何提示。
+    if (args[i] === '--port') {
+      const n = Number(args[i + 1])
+      if (!Number.isInteger(n) || n <= 0 || n > 65535) {
+        fatal(new Error(`--port 须为 1-65535 的整数（收到 "${args[i + 1]}"）`))
+      }
+      portOverride = n
+    }
   }
   const cfg = loadOrDefault(configPath)
   ensureAdminKey(cfg)

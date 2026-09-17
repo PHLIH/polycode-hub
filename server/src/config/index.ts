@@ -281,8 +281,11 @@ function validate(c: Config): void {
   if (!validRisk(c.gateway.riskMax)) {
     throw new Error(`gateway.risk_max "${c.gateway.riskMax}" 非法（low | medium | high）`)
   }
-  if (c.gateway.port <= 0 || c.gateway.port > 65535) {
-    throw new Error(`gateway.port ${c.gateway.port} 非法`)
+  // 必须用 Number.isInteger 而不是范围比较：NaN 与任何数比较都是 false，
+  // `NaN <= 0` 为 false、`NaN > 65535` 也为 false —— 旧写法让 NaN **同时躲过两边**
+  // 一路进 serve({port: NaN})。3.5 这类小数同样能蒙过去。
+  if (!Number.isInteger(c.gateway.port) || c.gateway.port <= 0 || c.gateway.port > 65535) {
+    throw new Error(`gateway.port ${c.gateway.port} 非法（须为 1-65535 的整数）`)
   }
   const egressIDs = new Set(c.egresses.map((e) => e.id))
   const providers = new Set<string>()

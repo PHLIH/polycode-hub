@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Store } from '../src/usage/store.ts'
@@ -60,6 +61,36 @@ describe('usage store（schema/总量口径 = 上游 wire 总量）', () => {
     expect(old.accountId).toBe('a1')
     expect(old.firstTokenMs).toBe(120)
     await store.close()
+  })
+
+  // 回归：SQLite 里 LIMIT -1 表示**不限量**。limit 一旦从 HTTP 参数透进来，
+  // 负数/NaN 就是全表返回（当前无外部入口，接上 API 即变 DoS）。
+  test('recent 钳制非法 limit（负数/NaN/0 不得变成全表返回）', async () => {
+    const store = await Store.open(join(dir, 'usage-limit.db'))
+    for (let i = 0; i < 5; i++) await store.insertLog(log({ requestId: `r${i}` }))
+    // 负数不得等于「不限量」：旧实现会返回全部 5 条，钳制后走默认 50（仍是 5 条上限内）
+    expect((await store.recent(-1)).length).toBe(5)
+    expect((await store.recent(0)).length).toBe(5)
+    expect((await store.recent(NaN)).length).toBe(5)
+    // 正常值照常生效
+    expect((await store.recent(2)).length).toBe(2)
+    await store.close()
+  })
+
+  // 回归：idx_usage_ts 原先只写在「重建表」分支，全新安装的库从来没有这个索引，
+  // 而所有查询都按 ts 过滤/排序。
+  test('新建库即带 ts 索引（不依赖重建分支）', async () => {
+    const path = join(dir, 'usage-idx.db')
+    const store = await Store.open(path)
+    await store.close()
+    // node:sqlite 必须走 createRequire（vite-node 不认识该内置模块，见 store.ts 顶部注释）
+    const req = createRequire(import.meta.url)
+    const { DatabaseSync } = req('node:sqlite') as typeof import('node:sqlite')
+    const raw = new DatabaseSync(path, { readOnly: true })
+    const idx = raw.prepare(
+      `SELECT name FROM sqlite_master WHERE type='index' AND name='idx_usage_ts'`).all()
+    expect(idx.length).toBe(1)
+    raw.close()
   })
 
   test('breakdown：totals + cacheHitRate + byModel 降序', async () => {

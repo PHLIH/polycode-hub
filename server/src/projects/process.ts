@@ -2,7 +2,7 @@
 // 跨平台进程处理：detach 启动（posix setsid / windows 新进程组）、进程组终止、
 // 端口探测与占用者识别。
 
-import { execFile, spawn } from 'node:child_process'
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { closeSync, mkdirSync, openSync, readdirSync, writeSync } from 'node:fs'
 import { dirname } from 'node:path'
 import net from 'node:net'
@@ -62,18 +62,24 @@ export function startDetached(dir: string, shellCmd: string, env: string[], logF
     const i = kv.indexOf('=')
     if (i > 0) envObj[kv.slice(0, i)] = kv.slice(i + 1)
   }
-  const child = spawn(shell, [flag, shellCmd], {
-    cwd: dir,
-    env: envObj,
-    // detached：posix 新会话（setsid，子进程成为组长，整组可杀）；
-    // windows 新进程组 + 隐藏窗口，脱离父进程生命周期。
-    detached: true,
-    stdio: ['ignore', logFd, logFd],
-    ...(process.platform === 'win32' ? { windowsHide: true } : {}),
-  })
+  // spawn 会**同步抛错**（cwd 不存在 → ENOENT），此时下面的 closeSync 根本执行不到，
+  // logFd 就泄漏了（反复启动失败会累积 fd）。用 try/finally 保证任何路径都关掉。
+  let child: ChildProcess
+  try {
+    child = spawn(shell, [flag, shellCmd], {
+      cwd: dir,
+      env: envObj,
+      // detached：posix 新会话（setsid，子进程成为组长，整组可杀）；
+      // windows 新进程组 + 隐藏窗口，脱离父进程生命周期。
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
+      ...(process.platform === 'win32' ? { windowsHide: true } : {}),
+    })
+  } finally {
+    try { closeSync(logFd) } catch { /* 已关闭 */ } // 子进程已复制 fd
+  }
   child.unref()
   child.on('error', () => { /* 启动失败由 pid 探活兜底 */ })
-  try { closeSync(logFd) } catch { /* 已关闭 */ } // 子进程已复制 fd
   return child.pid ?? 0
 }
 
@@ -109,9 +115,17 @@ function trySignal(pid: number, sig: NodeJS.Signals): boolean {
   }
 }
 
-// killTree 对进程组 TERM，宽限 5s 后 KILL（子进程是 setsid 组长，整组覆盖其
-// fork 出的孙进程）。windows 用 taskkill /T /F（无优雅宽限语义）。
-export async function killTree(pid: number, graceMs = 5000): Promise<void> {
+// killTree 终止进程（posix）。windows 用 taskkill /T /F（无优雅宽限语义）。
+//
+// group 参数区分两种 pid 语义，**不能混**：
+//   · group=true  —— pid 来自 startDetached（detached:true，子进程 setsid 成为组长），
+//                    发 -pid 能覆盖它拉起的整棵进程树（npm start 底下的 node 等）。
+//   · group=false —— pid 是「认领」来的外部进程（claimPortOwner 只保证
+//                    「端口上恰好一个监听者 + cwd 匹配」，**不保证它是组长**）。
+//                    对非组长 pid 发 kill(-pid) 会打向**它的整个进程组**，
+//                    可能是网关自己的组或用户的 shell 组 → 误杀一大片。
+// 宽限 graceMs 后仍存活则 KILL（同样遵守 group 语义）。
+export async function killTree(pid: number, graceMs = 5000, group = true): Promise<void> {
   if (process.platform === 'win32') {
     await new Promise<void>((resolve) => {
       execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { timeout: 10_000 }, () => resolve())
@@ -120,13 +134,13 @@ export async function killTree(pid: number, graceMs = 5000): Promise<void> {
   }
   if (!pidAlive(pid)) return
   trySignal(pid, 'SIGTERM')
-  trySignal(-pid, 'SIGTERM') // 负 pid = 整个进程组
+  if (group) trySignal(-pid, 'SIGTERM') // 负 pid = 整个进程组（仅限自启的组长）
   const deadline = Date.now() + graceMs
   while (pidAlive(pid) && Date.now() < deadline) {
     await sleep(100)
   }
   if (pidAlive(pid)) {
-    trySignal(-pid, 'SIGKILL')
+    if (group) trySignal(-pid, 'SIGKILL')
     trySignal(pid, 'SIGKILL')
   }
 }

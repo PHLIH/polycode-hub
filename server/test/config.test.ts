@@ -81,6 +81,13 @@ accounts: [{ id: a1, provider: p1 }]
       .toThrow(/risk_max/)
     expect(() => loadConfig(bad('gateway: {port: 99999}\nproviders: []\n')))
       .toThrow(/port/)
+    // 回归：旧判据是 `port <= 0 || port > 65535`，而 NaN 与任何数比较都是 false
+    // ——**同时躲过两边**。小数 3000.5 也不满足任一条件，能一路进 serve()。
+    // 现在改用 Number.isInteger 拦住。
+    // （注：NaN 路径实际不可达——applyDefaults 的 `if (!port) port = 3000`
+    //   会先把 NaN 兜成 3000，因为 !NaN === true。测试只钉真实可达的小数路径。）
+    expect(() => loadConfig(bad('gateway: {port: 3000.5}\nproviders: []\n')))
+      .toThrow(/port/)
     // sources 段已废弃：不再被任何实体引用，providers 不再接受 source_id
     expect(() => loadConfig(bad('providers:\n  - name: p1\n    source_id: s1\n    base_url: https://x\n')))
       .toThrow(/未知字段.*source_id/)
