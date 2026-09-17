@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onUnmounted, onBeforeUnmount } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api } from '../api.js'
 import { shareOf, shareTitle } from '../share'
@@ -107,17 +107,53 @@ function pct(v) {
 //   ① 不展示星期维度（行标去掉）——格子只表达「某天用了多少」；
 //   ② 今天恒在右下角最后一格；每过一天整体左移一格，格子总数恒定；
 //   ③ 月份标签跟随真实月份：某列的日期跨进新月份就在该列上方标出来。
-// 做法：列优先铺满 ROWS 行（idx → 列 = idx/7，行 = idx%7），固定 COLS×ROWS 格。
-const heatDays = 365 // 热力图固定近一年
-const HEAT_ROWS = 7
-const HEAT_COLS = Math.ceil(heatDays / HEAT_ROWS) // 53 列
-const HEAT_CELLS = HEAT_COLS * HEAT_ROWS          // 371 格
+// 做法：列优先铺满 ROWS 行（idx → 列 = idx/rows，行 = idx%rows），固定 COLS×ROWS 格。
+//
+// 行数自适应（2026-09-17，用户要求「横向铺满；正方形等比放大会让那一栏不够高时，
+// 减少每列的正方形数量」）：
+//   格子是正方形且横向铺满 → 边长 s 由容器宽度定，整块高度 = rows*s + (rows-1)*gap。
+//   宽度越大 s 越大、整块越高。超过高度上限就减少 rows（列数相应增加），
+//   这样既铺满横向、又不把面板撑高。
+//   上限 HEAT_MAX_H 是「这块热力图最多占多高」的产品选择，不是硬约束。
+// 目标天数：格子数 = cols × rows，取整后实际覆盖 365~371 天（略微多于一年，不会少）——
+// 「近一年」是语义，不追求恰好 365 格：多出的几格是最早那几天，不影响「今天在右下角」。
+const heatDays = 365
+const HEAT_MAX_H = 168 // 高度上限（px）：超过就减行数换更多列
+const GAP_PX = 3       // 与 CSS 的 gap 一致（格子间距）
+
+// 容器可用宽度。用 ResizeObserver 实测——CSS 里是 flex 均分，
+// 纯算术推不出（受侧栏折叠、滚动条、padding 影响）。
+const heatWrapEl = ref(null)
+const heatWidth = ref(0)
+let heatRO = null
+// 实测宽度 → 选行数：在「铺满宽度」的前提下，取满足高度上限的最大行数。
+const heatRows = computed(() => {
+  const W = heatWidth.value
+  if (!W || W < 100) return 7 // 未测到（首帧）：用默认 7 行，避免闪跳
+  // 给定 rows，列数 = ceil(days/rows)，边长 s = (W - (cols-1)*gap)/cols，高度 = rows*s + (rows-1)*gap
+  const heightFor = (rows) => {
+    const cols = Math.ceil(heatDays / rows)
+    const s = (W - (cols - 1) * GAP_PX) / cols
+    return rows * s + (rows - 1) * GAP_PX
+  }
+  // 从 7 行（一周的直觉）起，过高就减；也允许在极宽屏增高到上限（最多 10 行）。
+  let best = 1
+  for (let rows = 1; rows <= 10; rows++) {
+    if (heightFor(rows) <= HEAT_MAX_H) best = rows
+  }
+  return best
+})
+const heatCols = computed(() => Math.ceil(heatDays / heatRows.value))
+const heatCellsN = computed(() => heatCols.value * heatRows.value)
 
 const WEEKS = computed(() => {
   const daily = (heatBd.value && heatBd.value.daily) || []
   const byDay = new Map(daily.map(d => [d.day, d]))
   const today = new Date()
   today.setHours(0, 0, 0, 0)
+  const rows = heatRows.value
+  const cols = heatCols.value
+  const HEAT_CELLS = heatCellsN.value
 
   // 最后一格恒 = 今天；往前依次回推，铺满 HEAT_CELLS 格。
   // 这样每天整体左移一格、格数不变，今天永远落在右下角。
@@ -140,12 +176,27 @@ const WEEKS = computed(() => {
       errors: rec ? rec.errors : 0
     })
   }
-  // 切成 COLS 列 × ROWS 行（列优先）
+  // 切成 cols 列 × rows 行（列优先）
   const out = []
-  for (let c = 0; c < HEAT_COLS; c++) {
-    out.push(cells.slice(c * HEAT_ROWS, c * HEAT_ROWS + HEAT_ROWS))
+  for (let c = 0; c < cols; c++) {
+    out.push(cells.slice(c * rows, c * rows + rows))
   }
   return out
+})
+
+// 容器宽度实测：CSS 是 flex 均分，纯算术推不准（侧栏折叠/滚动条/padding 都会变）。
+// 用 ResizeObserver 跟踪，宽度变化即重算行数 → 始终铺满且不超高度上限。
+onMounted(() => {
+  if (!heatWrapEl.value || typeof ResizeObserver === 'undefined') return
+  heatRO = new ResizeObserver((entries) => {
+    const w = entries[0]?.contentRect?.width ?? 0
+    if (w > 0) heatWidth.value = w
+  })
+  heatRO.observe(heatWrapEl.value)
+  heatWidth.value = heatWrapEl.value.clientWidth || 0
+})
+onBeforeUnmount(() => {
+  if (heatRO) { heatRO.disconnect(); heatRO = null }
 })
 
 function localDay(d) {
@@ -636,7 +687,7 @@ function ttftText(m) {
       <h3>用量热力图</h3>
     </div>
 
-    <div class="heat-wrap">
+    <div class="heat-wrap" ref="heatWrapEl">
       <div class="heat-months">
         <span v-for="(m, i) in MONTH_LABELS" :key="i" class="heat-month">{{ m }}</span>
       </div>
@@ -929,15 +980,22 @@ function ttftText(m) {
    已删；现在 — 单元格靠 title 提供原因，不再假装有可悬停样式。 */
 
 /* ---- 热力图 ----
+   横向铺满整栏（用户拍板，2026-09-17）：
+   格子用 flex:1 均分整栏宽度，不再设 max-width——曾经的 19px 上限让宽屏下
+   只占中间一条（1920 屏两侧白掉 500px），既浪费空间也显得没对齐。
+
+   高度：格子 aspect-ratio:1，行数随容器宽高比自适应（见 heatRows）——
+   宽度越宽格子越大、整块越高；若过高则减少每列格数（列数相应增加），
+   从而在铺满宽度的同时不把面板撑得过高。
+
    对齐契约（改一个要同步改其余）：
-   月份行与网格同为 53 列 flex:1 + max-width:19px，节距恒一致（无左侧行标列，
-   故月份行不再需要 margin-left）。格子 aspect-ratio 撑正方形，随面板宽度拉伸
-   （上限 19px 防止格子过大）。 */
+   月份行与网格同列数、同 flex 策略，节距恒一致（无左侧行标列，
+   故月份行不再需要 margin-left）。 */
 .heat-wrap { overflow-x: auto; padding-bottom: 4px; }
 .heat-months { display: flex; gap: 3px; height: 14px; margin-bottom: 3px; }
-.heat-month { font-size: 10px; color: var(--dim); flex: 1; min-width: 0; max-width: 19px; white-space: nowrap; }
+.heat-month { font-size: 10px; color: var(--dim); flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; }
 .heat-grid { display: flex; gap: 3px; }
-.heat-week { flex: 1; min-width: 0; max-width: 19px; display: flex; flex-direction: column; gap: 3px; }
+.heat-week { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .heat-week .heat-cell {
   width: auto; height: auto; aspect-ratio: 1;
   transition: transform .1s ease, box-shadow .1s ease;
