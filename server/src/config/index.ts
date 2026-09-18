@@ -202,7 +202,7 @@ function migrateLegacy(top: Record<string, unknown>): void {
 type FieldSpec =
   | { kind: 'string' | 'number' | 'boolean' }
   | { kind: 'array'; item: FieldSpec }
-  | { kind: 'map' } // 自由键值（provider.headers）
+  | { kind: 'map' } // 自由键值（provider.headers，值收敛成字符串）
   | { kind: 'object'; spec: Record<string, [string, FieldSpec]> }
 
 // [tsKey, spec]
@@ -226,7 +226,6 @@ const MODEL: Record<string, [string, FieldSpec]> = {
   input: ['input', { kind: 'array', item: { kind: 'string' } }],
   api: ['api', { kind: 'string' }],
   egress: ['egress', { kind: 'string' }],
-  reasoning_effort: ['reasoningEffort', { kind: 'string' }],
   note: ['note', { kind: 'string' }],
   manual: ['manual', { kind: 'boolean' }],
   enabled: ['enabled', { kind: 'boolean' }],
@@ -397,11 +396,6 @@ function applyDefaults(c: Config): void {
     p.models ??= [] // Go 侧 nil 切片语义等价空目录
     for (const m of p.models) {
       if (!m.input || m.input.length === 0) m.input = ['text'] // 手动添加的模型默认纯文本
-      // 推理预设只去首尾空格：大小写原样保留（某些上游大小写敏感），
-      // 超长等非法值留给 validate()（providerValidate）点名报错，不在这里静默吞掉。
-      if (typeof m.reasoningEffort === 'string' && m.reasoningEffort.trim() !== '') {
-        m.reasoningEffort = m.reasoningEffort.trim()
-      }
     }
   }
   for (const a of c.accounts) {

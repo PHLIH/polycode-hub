@@ -163,6 +163,88 @@ describe('streamWithTimeout 非 2xx（探测路径，真实缺陷回归）', () 
       .rejects.toMatchObject({ status: 429 })
     await new Promise<void>((r) => s429.close(() => r()))
   })
+
+  test('内部一律流式：客户端要非流式，落线 body 仍是 stream:true', async () => {
+    // 非流式端点残缺的上游（workbuddy 404、zen 403）全靠这条才对客户端透明。
+    let seen = ''
+    const { server: s, base: b } = await import('./helpers/one-shot-server.ts').then((m) =>
+      m.startOneShot((req, res) => {
+        let raw = ''
+        req.on('data', (c: Buffer) => { raw += c.toString() })
+        req.on('end', () => { seen = raw; res.writeHead(429); res.end('{"error":"rate"}') })
+      }))
+    const u = new Upstream()
+    const p = { ...prov({}), baseUrl: b, api: 'openai-completions' }
+    await expect(u.streamWithTimeout(p, { model: 'm', stream: false, maxTokens: 16, messages: [] } as never, AbortSignal.timeout(5000)))
+      .rejects.toMatchObject({ status: 429 })
+    expect(JSON.parse(seen).stream).toBe(true)
+    await new Promise<void>((r) => s.close(() => r()))
+  })
+
+  test('瞬时 500 同条件重试一次：第二次 200 即返回（共命中 2 次）', async () => {
+    let hits = 0
+    const { server: s, base: b } = await import('./helpers/one-shot-server.ts').then((m) =>
+      m.startOneShot((req, res) => {
+        req.resume()
+        req.on('end', () => {
+          hits++
+          if (hits === 1) { res.writeHead(500); res.end('oops'); return }
+          res.writeHead(200, { 'Content-Type': 'text/event-stream' })
+          res.end('data: [DONE]\n\n')
+        })
+      }))
+    const u = new Upstream()
+    const p = { ...prov({}), baseUrl: b, api: 'openai-completions' }
+    const st = await u.stream(p, { model: 'm', stream: true, maxTokens: 16, messages: [] } as never)
+    await st.cancel().catch(() => {})
+    expect(hits).toBe(2)
+    await new Promise<void>((r) => s.close(() => r()))
+  })
+
+  test('401 不重试（确定性拒绝，打一次就抛）', async () => {
+    let hits = 0
+    const { server: s, base: b } = await import('./helpers/one-shot-server.ts').then((m) =>
+      m.startOneShot((req, res) => {
+        req.resume()
+        req.on('end', () => { hits++; res.writeHead(401); res.end('nope') })
+      }))
+    const u = new Upstream()
+    const p = { ...prov({}), baseUrl: b, api: 'openai-completions' }
+    await expect(u.stream(p, { model: 'm', stream: true, maxTokens: 16, messages: [] } as never))
+      .rejects.toMatchObject({ status: 401 })
+    expect(hits).toBe(1)
+    await new Promise<void>((r) => s.close(() => r()))
+  })
+
+  test('慢 500 不重试（5s 后才回说明上游在挣扎，直接抛不等第二轮）', async () => {
+    let hits = 0
+    const { server: s, base: b } = await import('./helpers/one-shot-server.ts').then((m) =>
+      m.startOneShot((req, res) => {
+        req.resume()
+        req.on('end', () => {
+          hits++
+          setTimeout(() => { res.writeHead(500); res.end('oops') }, 5500)
+        })
+      }))
+    // noAutoProtocol：钉死单协议，避免协议自动回退把 5.5s 复制三遍（那是另一条既有逻辑）
+    const u = new Upstream({ noAutoProtocol: true })
+    const p = { ...prov({}), baseUrl: b, api: 'openai-completions' }
+    await expect(u.stream(p, { model: 'm', stream: true, maxTokens: 16, messages: [] } as never))
+      .rejects.toMatchObject({ status: 500 })
+    expect(hits).toBe(1)
+    await new Promise<void>((r) => s.close(() => r()))
+  }, 15000)
+
+  test('连接被拒重试一次仍失败才抛（两次耗时 ≥ 一次退避）', async () => {
+    // 127.0.0.1:9（discard 端口）恒拒连：第一次 ECONNREFUSED → 退避 500ms →
+    // 第二次仍拒连才抛 NETWORK。服务端无命中可数，用耗时证明“打了两次”。
+    const u = new Upstream()
+    const p = { ...prov({}), baseUrl: 'http://127.0.0.1:9', api: 'openai-completions' }
+    const t0 = Date.now()
+    await expect(u.stream(p, { model: 'm', stream: true, maxTokens: 16, messages: [] } as never))
+      .rejects.toMatchObject({ kind: 'network' })
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(400)
+  })
 })
 
 describe('上游错误分类细化：RegionError 不是凭据错误', () => {
@@ -405,8 +487,9 @@ test('setEgresses 热更新：换表并清 dispatcher 缓存（旧表引用失�
 
 // zen 指纹校准（与真客户端对齐：发 x-opencode-* 四件套，不删）：
 // 2026-09-18 真机取证推翻了旧的“毒头”假设——官方客户端本来就发四件套，
-// 删掉才会 403。会话取值 透传 > 静态 x-opencode-session > 旧 x-session-id 晋升；
-// UA 缺省时按 静态 > 透传 > ZEN_UA 补位，全无则如实不发；
+// 删掉才会 403。会话取值 静态 x-opencode-session > 旧 x-session-id 晋升；
+// UA 缺省时按 静态 > ZEN_UA 补位，全无则如实不发；客户端透传一律忽略
+// （网关权威：第三方 harness 的会话/UA 上游不认，照透必 403）。
 describe('zen 指纹校准 applyZenFingerprint', () => {
   test('x-opencode-* 四件套保留并补全（大小写不敏感，不再删除）', () => {
     const h: Record<string, string> = {
@@ -415,7 +498,7 @@ describe('zen 指纹校准 applyZenFingerprint', () => {
       'Content-Type': 'application/json',
     }
     applyZenFingerprint(h, { id: 'ses_real' }, true, '')
-    expect(h['x-opencode-session']).toBe('ses_real') // 透传覆盖静态
+    expect(h['x-opencode-session']).toBe('ses_x') // 客户端透传不再覆盖静态
     expect(h['x-opencode-request']).toBe('msg_x') // 静态 request 保留（真机一次会话内稳定）
     expect(h['Content-Type']).toBe('application/json') // 无关头不动
     // 大小写不敏感：X-OpenCode-Project 就地识别，不新增重复键
@@ -446,15 +529,15 @@ describe('zen 指纹校准 applyZenFingerprint', () => {
     expect(h2['x-session-id']).toBeUndefined()
   })
 
-  test('UA 补位：静态优先（已配不动）；缺时透传；再缺用 ZEN_UA；全无不发', () => {
-    // 静态已配：透传也冲不掉（显式配置优先）
+  test('UA 补位：静态优先（已配不动）；缺时用 ZEN_UA；全无不发；客户端 UA 永不采用', () => {
+    // 静态已配：谁也冲不掉（显式配置优先）
     const h1: Record<string, string> = { 'User-Agent': 'opencode/9.9.9 static' }
     applyZenFingerprint(h1, { userAgent: 'opencode/1.2.3 live' }, true, 'opencode/0.0.0 env')
     expect(h1['User-Agent']).toBe('opencode/9.9.9 static')
-    // 缺静态：透传补上
+    // 缺静态：用 ZEN_UA（客户端透传不再补位）
     const h2: Record<string, string> = {}
     applyZenFingerprint(h2, { userAgent: 'opencode/1.2.3 live' }, true, 'opencode/0.0.0 env')
-    expect(h2['User-Agent']).toBe('opencode/1.2.3 live')
+    expect(h2['User-Agent']).toBe('opencode/0.0.0 env')
     // 无透传：ZEN_UA 补上
     const h3: Record<string, string> = {}
     applyZenFingerprint(h3, { id: 'ses_x' }, true, 'opencode/0.0.0 env')
@@ -482,15 +565,15 @@ describe('zen 指纹校准 applyZenFingerprint', () => {
     expect(sanitizeUA('x'.repeat(600))?.length).toBe(512)
   })
 
-  test('会话头：透传覆盖静态；affinity 缺省跟 id；静态保留', () => {
+  test('会话头：静态为准，affinity 恒跟 sid；客户端透传一律忽略', () => {
     const h1: Record<string, string> = { 'x-session-id': 'ses_static', 'x-session-affinity': 'ses_static' }
     applyZenFingerprint(h1, { id: 'ses_live', affinity: 'ses_live' })
-    expect(h1['x-session-id']).toBe('ses_live')
-    expect(h1['x-session-affinity']).toBe('ses_live')
+    expect(h1['x-session-id']).toBe('ses_static')
+    expect(h1['x-session-affinity']).toBe('ses_static')
     const h2: Record<string, string> = {}
     applyZenFingerprint(h2, { id: 'ses_live' })
-    expect(h2['x-session-id']).toBe('ses_live')
-    expect(h2['x-session-affinity']).toBe('ses_live') // 缺省跟 id（真机行为）
+    expect(h2['x-session-id']).toBeUndefined()
+    expect(h2['x-session-affinity']).toBeUndefined() // 无静态可退：不硬凑
     const h3: Record<string, string> = { 'x-session-id': 'ses_static' }
     applyZenFingerprint(h3) // 无透传：静态保留并补 affinity
     expect(h3['x-session-id']).toBe('ses_static')
@@ -505,6 +588,30 @@ describe('zen 指纹校准 applyZenFingerprint', () => {
     applyZenFingerprint(h2, { id: '' })
     expect(h2['x-session-id']).toBeUndefined()
     expect(h2['x-session-affinity']).toBeUndefined()
+  })
+
+  test('非 ses_ 透传直接忽略（第三方 harness 自带会话 ID，如 ZCode 的 UUID）', () => {
+    // 真实事故（2026-09-18）：zcode 发 x-session-id: 8a843b90-…（UUID，字符集
+    // 恰好过白名单），照透则上游百分百 403。必须回退静态，不得透传陌生会话。
+    const h1: Record<string, string> = { 'x-opencode-session': 'ses_static' }
+    applyZenFingerprint(h1, { id: '8a843b90-a9c1-4d2e-8f01-xyz123456789', affinity: '8a843b90-a9c1-4d2e-8f01-xyz123456789' })
+    expect(h1['x-opencode-session']).toBe('ses_static')
+    // affinity 同规则：UUID 不收，跟 sid（真机两者同值）
+    expect(h1['x-session-affinity']).toBe('ses_static')
+    expect(h1['x-session-id']).toBe('ses_static')
+    // 无静态可退：宁可不写会话头，也不把 UUID 发给上游
+    const h2: Record<string, string> = {}
+    applyZenFingerprint(h2, { id: '8a843b90-a9c1-4d2e-8f01-xyz123456789' })
+    expect(h2['x-opencode-session']).toBeUndefined()
+    expect(h2['x-session-id']).toBeUndefined()
+    expect(h2['x-session-affinity']).toBeUndefined()
+  })
+
+  test('ses_ 透传同样忽略（网关权威：只用静态，会话过期走刷新流程）', () => {
+    const h: Record<string, string> = { 'x-opencode-session': 'ses_static' }
+    applyZenFingerprint(h, { id: 'ses_live123', affinity: 'ses_live123' })
+    expect(h['x-opencode-session']).toBe('ses_static')
+    expect(h['x-session-affinity']).toBe('ses_static')
   })
 })
 

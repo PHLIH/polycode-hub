@@ -223,13 +223,7 @@ export class Probe {
     }
     const errText = best?.err ?? lastErr
     const errKind = best?.kind || undefined
-    // 探测带上了该模型的推理预设（见 probeOne）：终因是 bad_request 时档位不在
-    // 上游枚举里是头号嫌疑，直接点名——按“发过预设”触发，不猜报错文本的语言。
-    const preset = pv.models.find((x) => x.id === modelID)?.reasoningEffort?.trim()
-    const hint = errKind === 'bad_request' && preset
-      ? '（本次测试带了推理强度预设 ' + preset + '，疑似不在上游枚举里：核对该模型强度下拉，或清空回跟随）'
-      : ''
-    return { model: modelID, ok: false, error: errText + hint, kind: errKind }
+    return { model: modelID, ok: false, error: errText, kind: errKind }
   }
 
   // 返回该 Provider 用于探测的副本：同源有可用账号则用账号凭据（与真实转发同路径），
@@ -245,8 +239,7 @@ export class Probe {
   // 对指定模型打一次最小真实流式请求。不抛错，失败如实返回。
   // 注意与 Stream 的协议解析不完全一致：此处只看模型级/ Provider 级声明，
   // 不读 autoProtocol 进程内缓存（探测即重探，避免缓存掩盖真相）。
-  // 推理预设同样带上：测试按钮测的就是真实转发会发的东西，预设配错（上游枚举外）
-  // 在这里直接现形，而不是测试通过、业务请求再挂。
+  // 探针不带推理档位（最小请求只测连通，不测档位枚举）。
   private async probeOne(pv: Provider, bare: string): Promise<ProbeOutcome> {
     const m = pv.models.find((x) => x.id === bare)
     const proto = m?.api || pv.api
@@ -262,10 +255,8 @@ export class Probe {
     const probeUp = this.up.withOpts({ noAutoProtocol: true })
     let stream: ReadableStream<Uint8Array> | undefined
     let err: unknown
-    const preset = pv.models.find((x) => x.id === bare)?.reasoningEffort?.trim()
     const probeReq: IrRequest = {
       model: bare, stream: true, maxTokens: 16,
-      ...(preset ? { reasoningEffort: preset } : {}),
       messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
     }
     // 上游抖动重试：免费档按 IP 限速且会间歇 503，打一次就报「不通」会误判成配置错误。

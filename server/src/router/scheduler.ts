@@ -82,11 +82,14 @@ export class Scheduler {
   }
 
   // 按模型解析候选 Provider（对齐 Go PickOrder）。
-  // modelName 为空返回轮转全集；precheckContext 时超限跳过（拒绝 + 换源，绝不截断）；
-  // 非流式请求跳过 StreamOnly 源。
+  // modelName 为空返回轮转全集；precheckContext 时超限跳过（拒绝 + 换源，绝不截断）。
+  // 注意：历史上「非流式请求跳过 StreamOnly 源」，网关内部一律流式打上游之后
+  // 这条不再需要——非流式客户端由 forward 收齐拼包（见 proxy.collectStreamResponse），
+  // StreamOnly 源同样可服务。stream 参数保留（调用兼容），不再参与过滤。
   pickOrder(modelName: string, inputEstimateTokens: number, precheckContext: boolean, stream: boolean): Provider[]
   pickOrder(): Provider[]
   pickOrder(modelName?: string, inputEstimateTokens = 0, precheckContext = false, stream = true): Provider[] {
+    void stream
     if (modelName === undefined) return this.pickOrderPublic()
     if (modelName === '') return this.pickOrderPublic()
     const cands = this.pickOrderPublic()
@@ -94,7 +97,6 @@ export class Scheduler {
     const out: Provider[] = []
     for (const p of cands) {
       if (qualified && p.name !== provider) continue
-      if (!stream && p.streamOnly) continue
       const [m, ok] = matchModel(p, bare)
       if (!ok) continue
       if (precheckContext && (m.contextWindow ?? 0) > 0 && inputEstimateTokens > (m.contextWindow ?? 0)) continue

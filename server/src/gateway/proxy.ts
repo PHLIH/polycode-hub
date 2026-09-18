@@ -7,11 +7,12 @@ import type { Context } from 'hono'
 import type { Hono } from 'hono'
 import {
   ERR, accuracyWorst, getInbound, getOutbound, irError, UpstreamError, UPSTREAM,
-  type InboundCodec, type IrError, type Protocol, type StreamEvent,
+  type Block, type InboundCodec, type IrError, type IrResponse, type OutboundCodec,
+  type Protocol, type StopReason, type StreamEvent, type Usage,
 } from '../ir/index.ts'
 import { resolveProtocol, estimateRequestTokens, type Scheduler, type Upstream, type SessionHint } from '../router/index.ts'
 import type { AccountPool } from '../pool/account.ts'
-import { accountEffectiveStatus, applyReasoningPreset, type Account, type Provider, type UsageLog, type UsageStatus } from '../model/index.ts'
+import { accountEffectiveStatus, type Account, type Provider, type UsageLog, type UsageStatus } from '../model/index.ts'
 import {
   DEFAULT_FIRST_BYTE_TIMEOUT_MS, DEFAULT_STREAM_IDLE_TIMEOUT_MS, type Config,
 } from '../config/index.ts'
@@ -73,10 +74,10 @@ export function sessionHintFromHeaders(get: (name: string) => string | undefined
 }
 
 // 把最后一个上游错误映射为对 client 的规范错误。
-// sentEffort：这次转发实际发给上游的推理档位（客户端传的或模型预设强制的）。
+// sentEffort：这次转发实际发给上游的推理档位（客户端透传的）。
 // bad_request 且发过档位时，档位不在上游枚举里是头号嫌疑，直接点名——
 // 按“发过什么”触发，不按报错文本关键字猜，任何语言的上游报错都适用。
-const REASONING_PRESET_HINT = '（本次请求带了推理强度档位，疑似不在上游枚举里：到 Providers 页展开该模型核对档位，或清空预设跟随客户端）'
+const REASONING_PRESET_HINT = '（本次请求带了推理强度档位，疑似不在上游枚举里）'
 export function mapUpstreamError(ue: UpstreamError | undefined, sentEffort?: string): IrError {
   if (!ue) return irError(ERR.API, '无可用上游')
   switch (ue.kind) {
@@ -88,8 +89,8 @@ export function mapUpstreamError(ue: UpstreamError | undefined, sentEffort?: str
     // 否则用户只拿到一句英文 403，不知道该去 Provider 头里配什么。
     case UPSTREAM.FINGERPRINT: return irError(ERR.AUTHENTICATION,
       '上游只接受官方客户端指纹（免费档限制）: ' + ue.message
-      + '；先在本机跑一次 opencode（如 opencode run "hi"）产生新鲜会话，再调 POST /admin/api/providers/:pid/refresh-fingerprint 自动续上（或在 Provider 头里手填真实 x-opencode-session，会话过期后需重填；用 opencode 做客户端时自动透传）'
-      + '；另：zen 免费档还要求请求是流式 agent 体裁（含 read/bash 工具声明 + tool_choice，网关转发时已自动补齐）——若这次是非流式调用（stream=false），上游照样拒，请改用流式后重试')
+      + '；先在本机跑一次 opencode（如 opencode run "hi"）产生新鲜会话，再调 POST /admin/api/providers/:pid/refresh-fingerprint 自动续上（或在 Provider 头里手填真实 x-opencode-session，会话过期后需重填；客户端自带的会话/UA 头网关一律忽略，只用网关静态配置）'
+      + '；另：zen 免费档要求流式 agent 体裁（含 read/bash 工具声明 + tool_choice），网关转发时已自动补工具声明，非流式调用则在内部改走流式上游并拼包返回，无需客户端配合')
     // 地区限制同理：不是「模型没了」也不是「Key 错了」，而是出口 IP 不在可用地区。
     // 不给这句指引，用户会以为模型下线了。
     case UPSTREAM.REGION: return irError(ERR.AUTHENTICATION,
@@ -115,6 +116,122 @@ export function mergeStreamUsage(ul: UsageLog, ev: StreamEvent): void {
   if ((u.cacheCreationTokens ?? 0) > 0) ul.cacheCreationTokens = u.cacheCreationTokens!
   if ((u.reasoningTokens ?? 0) > 0) ul.reasoningTokens = u.reasoningTokens!
   if (u.accuracy) ul.accuracy = accuracyWorst(ul.accuracy as typeof u.accuracy, u.accuracy)
+}
+
+// 把上游 SSE 流收齐拼成单个 IR 响应（导出供测试）。
+//
+// 背景：网关内部一律用流式打上游（见 Upstream.streamWith），非流式客户端的
+// 请求也要先以流式拿回来——这里负责把事件流折叠回单包，再走既有的
+// serializeResponse 回给客户端。客户端看到的仍是非流式，拼包对它透明。
+//
+// 语义：文本/思考增量按块拼接；tool_use 块的 arguments 分片拼完后整体 parse
+// （非法 JSON 容忍为空，与 codec.parseArgs 一致）；用量按字段级最新优先合并；
+// 空流返回空内容（不断言，调用方按既有语义记账）。
+// 上游以 error 事件半路失败时抛错（调用方按上游错误记账，不伪造 200 空包）。
+// 注意是“空包才抛”：流中偶发的坏行（某 chunk 非法 JSON）只跳过，继续收后面
+// 的好内容——与流式透传“坏帧透传 + 好内容照出”对齐；全程无内容才说明整条流
+// 不可用，此时抛第一个错误（调用方记 upstream_error）。
+export async function collectStreamResponse(
+  out: OutboundCodec, rc: ReadableStream<Uint8Array>,
+): Promise<IrResponse> {
+  const sp = out.newStreamParser()
+  const blocks = new Map<number, Block>()
+  const order: number[] = []
+  const jsonAcc = new Map<number, string>() // tool_use 块的 arguments 分片
+  let usage: Usage = { outputTokens: 0, accuracy: 'unknown' }
+  let stopReason: StopReason | undefined
+  let firstStreamError: string | undefined // 全程无内容时才抛它（见上）
+  let id: string | undefined
+  let model: string | undefined
+  let created: number | undefined
+  const open = (idx: number, block: Block): Block => {
+    let b = blocks.get(idx)
+    if (!b) {
+      b = { ...block }
+      blocks.set(idx, b)
+      order.push(idx)
+      if (b.type === 'tool_use') jsonAcc.set(idx, '')
+    }
+    return b
+  }
+  const mergeUsage = (u: StreamEvent['usage']): void => {
+    if (!u) return
+    if ((u.inputTokens ?? 0) > 0) usage.inputTokens = u.inputTokens
+    if (u.outputTokens > 0) usage.outputTokens = u.outputTokens
+    if ((u.cacheReadTokens ?? 0) > 0) usage.cacheReadTokens = u.cacheReadTokens
+    if ((u.cacheCreationTokens ?? 0) > 0) usage.cacheCreationTokens = u.cacheCreationTokens
+    if ((u.reasoningTokens ?? 0) > 0) usage.reasoningTokens = u.reasoningTokens
+    if (u.accuracy) usage.accuracy = accuracyWorst(usage.accuracy, u.accuracy)
+  }
+  const feed = (evs: StreamEvent[]): void => {
+    for (const ev of evs) {
+      const idx = ev.index ?? 0
+      switch (ev.type) {
+        case 'message_start':
+          if (ev.id) id = ev.id
+          if (ev.model) model = ev.model
+          if (ev.created) created = ev.created
+          mergeUsage(ev.usage)
+          break
+        case 'content_block_start':
+          if (ev.block) open(idx, ev.block)
+          break
+        case 'content_block_delta': {
+          const d = ev.delta
+          if (!d) break
+          if (d.kind === 'text' || d.kind === 'thinking') {
+            const b = open(idx, { type: d.kind === 'text' ? 'text' : 'thinking' })
+            b.text = (b.text ?? '') + (d.text ?? '')
+          } else if (d.kind === 'tool_json') {
+            open(idx, { type: 'tool_use' })
+            jsonAcc.set(idx, (jsonAcc.get(idx) ?? '') + (d.partialJson ?? ''))
+          }
+          break
+        }
+        case 'content_block_stop': {
+          const b = blocks.get(idx)
+          if (b?.type === 'tool_use') {
+            const raw = (jsonAcc.get(idx) ?? '').trim()
+            if (raw !== '') {
+              try {
+                b.input = JSON.parse(raw) as unknown
+              } catch { /* 非法 arguments 容忍为空 */ }
+            }
+          }
+          break
+        }
+        case 'message_delta':
+          if (ev.stopReason !== undefined) stopReason ??= ev.stopReason
+          mergeUsage(ev.usage)
+          break
+        case 'message_stop':
+        case 'ping':
+          break
+        case 'error':
+          // 坏行跳过继续收（对齐流式透传）；无内容可回时才抛，见函数注释。
+          firstStreamError ??= ev.error ? ev.error.message : '上游流内错误'
+          break
+      }
+    }
+  }
+  const reader = rc.getReader()
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (value) feed(sp.feed(value))
+  }
+  feed(sp.finish())
+  if (order.length === 0 && firstStreamError !== undefined) {
+    throw new UpstreamError(0, UPSTREAM.SERVER, firstStreamError)
+  }
+  return {
+    content: order.map((i) => blocks.get(i)!),
+    ...(stopReason !== undefined ? { stopReason } : {}),
+    usage,
+    ...(id !== undefined ? { id } : {}),
+    ...(model !== undefined ? { model } : {}),
+    ...(created !== undefined ? { created } : {}),
+  }
 }
 
 function fillUsage(ul: UsageLog, u: NonNullable<StreamEvent['usage']>): void {
@@ -280,6 +397,9 @@ export class Proxy {
       return writeIrError(inb, irError(ERR.INVALID_REQUEST, '请求解析失败: ' + (err as Error).message))
     }
     if (!irReq.model) irReq.model = this.cfg.gateway.defaultModel
+    // 入站元数据日志（只记元数据、不记消息正文与工具参数）：定位客户端实际发的
+    // maxTokens/工具集/档位。body 明文绝不进日志（可能含代码与密钥）。
+    console.log(`[inbound] proto=${p} model=${irReq.model} stream=${irReq.stream} maxTokens=${irReq.maxTokens ?? '-'} tools=${(irReq.tools ?? []).map((t) => t.name).join(',') || '-'} toolChoice=${irReq.toolChoice?.mode ?? '-'} reasoning=${irReq.reasoningEffort ?? '-'}`)
 
     // 预检用粗估（绝不修改请求，绝不截断）
     const estimate = estimateRequestTokens(body)
@@ -296,17 +416,21 @@ export class Proxy {
     const pinnedId = (c.req.header('x-polycode-account') ?? '').trim()
     // opencode 客户端自带官方会话头：有就透传（zen 指纹），没有就用 Provider 静态配置。
     const session = sessionHintFromHeaders((n) => c.req.header(n))
+    // TEMP-DIAG（定案即删）：只记会话来源（透传前缀/静态），不记正文与完整 ID。
+    if (process.env.ZEN_DIAG === '1') {
+      const cli = (c.req.header('x-session-id') ?? '').trim()
+      console.log(`[zen-diag] model=${irReq.model} stream=${irReq.stream} sess=${session?.id ? `passthru:${session.id.slice(0, 12)}` : 'static'} cliSid=${cli !== '' ? cli.slice(0, 12) : '-'}`)
+    }
     const start = Date.now()
     if (pinnedId) return this.servePinned(inb, p, irReq, start, pinnedId, cands, session)
 
     let lastErr: UpstreamError | undefined
     let lastAcctId = '' // 最后尝试的账号（兜底失败账也要归因到账号，ACCOUNT-HEALTH）
     let locked: LockedUpstream | undefined
-    // 试过的推理档位（客户端传的或某候选的模型预设）：全灭且 kind 为 bad_request 时，
+    // 试过的推理档位（客户端透传的）：全灭且 kind 为 bad_request 时，
     // 档位不在枚举里是头号嫌疑，mapUpstreamError 据此追加指引（按事实触发，不猜文本）。
     let triedEffort = ''
-    // 锁定那次实际发出的请求：候选 Provider 的模型预设可能各不相同，forward 的用量
-    // 归因（modelId/stream）与它保持一致；无预设时就是 irReq 本体。
+    // 锁定那次实际发出的请求：无改写时就是 irReq 本体。
     let lockedReq = irReq
 
     // 用指定账号（null = Provider 级凭据）尝试一个候选；成功则锁定（上游 2xx 头已到，
@@ -319,8 +443,8 @@ export class Proxy {
         const pvv: Provider = acct ? { ...base, credential: acct.credential } : { ...base } // 账号 JWT 覆盖 Provider 凭据
         const [m] = this.sched.modelOf(base.providerId, irReq.model)
         if (m.egress) pvv.egress = m.egress // 模型级出口覆盖 Provider 级（未声明的模型继承 Provider）
-        // 模型级推理预设（强制覆盖）：配了就替换客户端档位，没配跟随客户端。
-        const effReq = applyReasoningPreset(irReq, m)
+        // 推理档位完全跟随客户端透传：网关不做模型级预设、不抬预算。
+        const effReq = irReq
         if ((effReq.reasoningEffort ?? '').trim() !== '') triedEffort = effReq.reasoningEffort!.trim()
         const stream = await this.up.stream(pvv, effReq, session)
         locked = { stream, provider: pvv, acctId: acct?.id ?? '' }
@@ -432,7 +556,7 @@ export class Proxy {
     const pvv: Provider = { ...pv, credential: acct.credential }
     const [m] = this.sched.modelOf(pv.providerId, irReq.model)
     if (m.egress) pvv.egress = m.egress
-    const effReq = applyReasoningPreset(irReq, m)
+    const effReq = irReq
     let stream: ReadableStream<Uint8Array>
     try {
       stream = await this.up.stream(pvv, effReq, session)
@@ -489,19 +613,15 @@ export class Proxy {
     }
 
     if (!irReq.stream) {
-      let raw: Uint8Array
+      // 客户端要非流式：上游侧实际是以流式拿回来的（见 Upstream.streamWith），
+      // 这里收齐拼成单包再回。所有上游统一走这条路，不止 zen。
+      let resp: IrResponse
       try {
-        raw = new Uint8Array(await new Response(rc).arrayBuffer())
-      } catch (err) {
-        this.logUsage(ul, 'upstream_error', 0)
-        return writeIrError(inb, irError(ERR.API, '读取上游响应失败: ' + (err as Error).message))
-      }
-      let resp
-      try {
-        resp = out.parseResponse(raw)
+        resp = await collectStreamResponse(out, rc)
       } catch (err) {
         this.logUsage(ul, 'upstream_error', Date.now() - start)
-        return writeIrError(inb, irError(ERR.API, '上游响应解析失败: ' + (err as Error).message))
+        const msg = err instanceof UpstreamError ? err.message : (err as Error).message
+        return writeIrError(inb, irError(ERR.API, '上游响应收齐失败: ' + msg))
       }
       let body: Uint8Array
       try {

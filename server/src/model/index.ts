@@ -29,30 +29,6 @@ export type Stability = 'stable' | 'beta' | 'experimental'
 
 const STABILITIES: Stability[] = ['stable', 'beta', 'experimental']
 
-// 推理强度预设：网关不做档位白名单——各家上游的档位名不是通用的，
-// 网关只负责原样透传，取值的合法性由上游判定：
-//   DeepSeek 官方：low / high / max（medium、xhigh 兼容映射为 high）
-//   OpenAI：按模型 low / medium / high，GPT-5 系另有 minimal，个别模型有 none、xhigh
-//   Anthropic 新式：low / medium / high（max 仅 Opus 系；xhigh 看模型版本）
-//   DSH 档位 ID：off / minimal / low / medium / high / xhigh / max
-// 另有网关自定义过线上拼写（如 light / extra_high / ultra），白名单会误杀它们。
-// 空 = 未设置（跟随客户端透传）；off/none 系 = 强制关闭思考（各出站 codec 自行映射）。
-export const REASONING_EFFORT_SUGGESTIONS = [
-  'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max',
-] as const
-
-// 预设值上限：wire 上就是个短枚举字符串，超长一定是填错了，在入口处拦掉。
-export const REASONING_EFFORT_MAX_LEN = 32
-
-// 收敛成可存的值：去首尾空格、非空、限长；原样保留大小写（某些上游大小写敏感）。
-// 返回 undefined = 非法（调用方报错，不静默吞）。
-export function sanitizeReasoningEffort(v: unknown): string | undefined {
-  if (typeof v !== 'string') return undefined
-  const t = v.trim()
-  if (t === '' || t.length > REASONING_EFFORT_MAX_LEN) return undefined
-  return t
-}
-
 // CredentialRef：凭据不落明文，只存环境变量名或密钥文件路径。
 // 文件引用的值每次请求现读：改文件即换凭据，进程不重启（热轮换）。
 export interface CredentialRef {
@@ -99,10 +75,6 @@ export interface Model {
   input?: string[] // ["text"] 或 ["text","image"]
   api?: Protocol // 覆盖 Provider 级 api（空 = 继承）
   egress?: string // 覆盖 Provider 级出口代理（空 = 继承；EGRESS-SPIKE §7 粒度拍板：精确到模型）
-  // 模型级推理强度预设（强制覆盖语义）：配了就听模型的，客户端传什么都被替换；
-  // 空 = 未设置，跟随客户端透传。off/none = 强制关闭思考。
-  // 取值按上游文档填（各家档位名不通用，见 sanitizeReasoningEffort 注释），网关原样透传。
-  reasoningEffort?: string
   // 备注：一句话运维知识（如「23 点后才免费，白天用会扣额度」）。
   // 与 displayName 分工不同——displayName 是"叫什么"，note 是"要注意什么"。
   note?: string
@@ -112,16 +84,6 @@ export interface Model {
 
 export function modelEffAPI(m: Model, providerAPI: Protocol): Protocol {
   return m.api ? m.api : providerAPI
-}
-
-// 模型预设应用到待发请求（强制覆盖）：有预设就替换客户端档位，同时清掉客户端带的
-// budget——否则 Anthropic 出站优先走旧式 budget，预设会被静默架空；无预设原样返回。
-export function applyReasoningPreset<T extends { reasoningEffort?: string; thinkingBudget?: number }>(
-  req: T, m: Model | undefined,
-): T {
-  const preset = m?.reasoningEffort?.trim()
-  if (!preset) return req
-  return { ...req, reasoningEffort: preset, thinkingBudget: undefined }
 }
 
 export function supportsImage(m: Model): boolean {
@@ -182,7 +144,9 @@ export interface Provider {
   headers?: Record<string, string>
   dynamicHeaders?: DynamicHeadersSpec
   priority: number
-  streamOnly?: boolean // 上游只支持流式（如 WorkBuddy 对非流式报 11101/404）
+  streamOnly?: boolean // 上游只提供流式端点（如 WorkBuddy 对非流式报 11101/404）。
+  // 网关内部一律流式打上游、非流式客户端由 forward 收齐拼包（见 proxy.collectStreamResponse），
+  // 所以该标记不再阻断非流式客户端，只保留作“该源无原生非流式端点”的声明。
   // 出口代理引用（顶层 egresses 定义的 id）；缺省 = 直连（EGRESS-SPIKE 方案 A）。
   egress?: string
   tags?: string[]
@@ -212,11 +176,6 @@ export function providerValidate(p: Provider): string | undefined {
     return `provider ${p.name}: api "${p.api}" 非法（空 = 自动探测；可选 anthropic-messages / openai-completions / openai-responses）`
   }
   if (!p.baseUrl) return `provider ${p.name}: base_url 不能为空`
-  for (const m of p.models ?? []) {
-    if (m.reasoningEffort !== undefined && m.reasoningEffort.trim() !== '' && sanitizeReasoningEffort(m.reasoningEffort) === undefined) {
-      return `provider ${p.name} 模型 ${m.id}: reasoning_effort 过长（>${REASONING_EFFORT_MAX_LEN} 字符），请按上游文档填短档位名`
-    }
-  }
   if (p.dynamicHeaders) {
     if (!p.dynamicHeaders.command) {
       return `provider ${p.name}: dynamic_headers.command 不能为空`

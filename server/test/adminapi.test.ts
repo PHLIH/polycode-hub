@@ -2108,61 +2108,6 @@ describe('PUT /admin/api/providers/:pid/models/:model/note（模型备注）', (
   })
 })
 
-describe('PUT /admin/api/providers/:pid/models/:model/reasoning-effort（模型推理强度预设）', () => {
-  const mk = (): Provider => {
-    const p = mkProviderFixed({
-      name: 'pz', api: 'openai-completions',
-      models: [{ id: 'm1', manual: false, enabled: true }],
-    })
-    p.models = p.models.map((m) => ({ ...m, providerId: p.providerId }))
-    return p
-  }
-
-  test('写入/覆盖/清空预设；空串 = 删掉该字段（跟随客户端）', async () => {
-    const pz = mk()
-    const call = caller(build({ providers: [pz] }))
-    const set = await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/reasoning-effort`, {
-      key: 'secret', body: { reasoningEffort: ' high ' },
-    })
-    expect(set.status).toBe(200)
-    // 只去首尾空格，大小写与拼写原样保留（各家档位名不通用，网关不改写）
-    expect(((await set.json()) as { reasoningEffort?: string }).reasoningEffort).toBe('high')
-
-    // 网关自定义拼写不被拦
-    const custom = await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/reasoning-effort`, {
-      key: 'secret', body: { reasoningEffort: 'ultra' },
-    })
-    expect(custom.status).toBe(200)
-    const list = await (await call('GET', '/admin/api/providers', { key: 'secret' })).json() as { providers: Provider[] }
-    expect(list.providers[0]!.models[0]!.reasoningEffort).toBe('ultra')
-
-    // 清空 → 字段消失（不是留个空串）
-    const clear = await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/reasoning-effort`, {
-      key: 'secret', body: { reasoningEffort: '' },
-    })
-    expect(clear.status).toBe(200)
-    const after = await (await call('GET', '/admin/api/providers', { key: 'secret' })).json() as { providers: Provider[] }
-    expect(after.providers[0]!.models[0]!.reasoningEffort).toBeUndefined()
-  })
-
-  test('超长 400；未知模型/provider 404；非法请求体 400', async () => {
-    const pz = mk()
-    const call = caller(build({ providers: [pz] }))
-    expect((await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/reasoning-effort`, {
-      key: 'secret', body: { reasoningEffort: 'x'.repeat(33) },
-    })).status).toBe(400)
-    expect((await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/reasoning-effort`, {
-      key: 'secret', body: {},
-    })).status).toBe(400)
-    expect((await call('PUT', `/admin/api/providers/${pz.providerId}/models/nope/reasoning-effort`, {
-      key: 'secret', body: { reasoningEffort: 'high' },
-    })).status).toBe(404)
-    expect((await call('PUT', '/admin/api/providers/99999/models/m1/reasoning-effort', {
-      key: 'secret', body: { reasoningEffort: 'high' },
-    })).status).toBe(404)
-  })
-})
-
 describe('PUT /admin/api/providers/:pid/models/:model/enabled（对外暴露开关）', () => {
   test('开关模型启用；404 与非法请求体', async () => {
     const p = mkProviderFixed({

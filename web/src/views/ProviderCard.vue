@@ -14,10 +14,6 @@ const emit = defineEmits(['test', 'reload', 'models', 'edit', 'remove'])
 const open = ref(false)
 
 const PROTOCOLS = ['openai-completions', 'openai-responses', 'anthropic-messages']
-// 推理强度预设建议值（各家档位名不通用：DeepSeek 认 low/high/max，OpenAI 看模型，
-// Anthropic 新式认 low/medium/high/max，另有网关自定义拼写）：下拉只给快捷项，
-// 可手输任意短字符串，网关原样透传给上游。空 = 跟随客户端，off = 强制关闭思考。
-const EFFORTS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
 const KIND_LABELS = {
   official: '官方 API',
   'session-reuse': '复用登录态',
@@ -143,10 +139,6 @@ function egressValue(p, id) {
   const m = modelOf(p, id)
   return (m && m.egress) || ''
 }
-function effortValue(p, id) {
-  const m = modelOf(p, id)
-  return (m && m.reasoningEffort) || ''
-}
 // 就地回填行内模型：改完立刻反映在下拉上，不用整表重拉
 function patchRowModel(p, id, key, val) {
   const m = modelOf(p, id)
@@ -168,16 +160,6 @@ async function setModelEgress(p, id, eg) {
     await api.updateProviderModelEgress(p.providerId, id, eg)
     patchRowModel(p, id, 'egress', eg)
     ElMessage.success(`${id} 出口 → ${eg || '直连'}`)
-  } catch (e) { ElMessage.error(e.message) }
-}
-
-// 模型推理强度预设：配上即强制覆盖客户端档位（含 DSH 的 reasoningEffort），
-// 清空则回到跟随客户端透传。off = 强制关闭思考。
-async function setModelEffort(p, id, effort) {
-  try {
-    await api.updateProviderModelReasoningEffort(p.providerId, id, effort)
-    patchRowModel(p, id, 'reasoningEffort', effort)
-    ElMessage.success(`${id} 推理强度 → ${effort || '跟随客户端'}`)
   } catch (e) { ElMessage.error(e.message) }
 }
 
@@ -256,18 +238,6 @@ async function saveNote(p, id) {
     noteEdit.value = ''
     ElMessage.success(note ? '备注已保存' : '备注已清除')
   } catch (e) { ElMessage.error(e.message) }
-}
-
-// 测试失败且被测模型配了强度预设：探针会带预设实测（见 probe.ts probeOne），
-// 失败就可能是档位不在上游枚举里。按“配过预设”这个事实触发，不猜报错文本的语言。
-function testedPreset(p, res) {
-  const id = String((res && res.model) || '')
-  const bare = id.includes('/') ? id.slice(id.indexOf('/') + 1) : id
-  if (!bare) return ''
-  return modelOf(p, bare)?.reasoningEffort || ''
-}
-function showReasoningHint(p, res) {
-  return !!res && !res.ok && testedPreset(p, res) !== ''
 }
 
 // 点整行开合；没有勾选任何模型时，点它直接去「模型」里勾——否则点了没反应像坏了
@@ -389,9 +359,6 @@ async function toggle() {
         <template v-else>
           <span class="dot bad" /><span>失败</span>
           <span class="msg" :title="testRes.error">{{ testRes.error }}</span>
-          <span v-if="showReasoningHint(p, testRes)" class="hint-warn">
-            该模型配了强度预设「{{ testedPreset(p, testRes) }}」（测试会带上实测）：失败可能与档位不在上游枚举里有关，核对「强度」下拉（或清空回跟随）后重测
-          </span>
         </template>
         <button class="act" :disabled="testing" @click="emit('test', p)">重测</button>
       </div>
@@ -424,12 +391,6 @@ async function toggle() {
             placeholder="直连" :title="egressValue(p, m.id) || '直连'" clearable
             @change="v => setModelEgress(p, m.id, v || '')">
             <el-option v-for="e in egresses" :key="e.id" :value="e.id" :label="e.id" />
-          </el-select>
-
-          <el-select :model-value="effortValue(p, m.id)" size="small" class="lane-sel sm"
-            placeholder="强度·跟随" :title="effortValue(p, m.id) ? `推理强度预设 ${effortValue(p, m.id)}（强制覆盖客户端，按上游文档填）` : '推理强度：跟随客户端（可手输上游支持的档位名）'"
-            clearable filterable allow-create default-first-option @change="v => setModelEffort(p, m.id, (v || '').trim())">
-            <el-option v-for="e in EFFORTS" :key="e" :value="e" :label="e" />
           </el-select>
 
           <span class="lane-detect">

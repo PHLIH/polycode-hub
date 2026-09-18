@@ -63,12 +63,23 @@ export function refreshZenProvider(
     if (validZenToken(sv)) msg = sv
   }
   if (!msg) msg = mintZenRequestId()
-  if (cur === fp.sessionID && hasValidRequest(h)) {
+  // UA 同步（网关权威后客户端 UA 不再补充，静态 UA 必须自己跟上版本，
+  // 否则 opencode 一升级、静态 UA 落后就可能被上游按版本卡）：
+  // 缺 UA，或版本号与本次识别到的不一致 → 写回识别到的真串。
+  const uaKey = findHeaderKey(h, 'user-agent')
+  const curUA = ((uaKey !== undefined ? h[uaKey] : undefined) ?? '').trim()
+  const uaStale = uaVersion(curUA) !== fp.version
+  if (cur === fp.sessionID && hasValidRequest(h) && !uaStale) {
     return { ...base, detail: `已是最新（与本机会话 ${fp.sessionID} 一致），无需刷新` }
   }
   const sessionChanged = cur !== fp.sessionID
   setHeader(h, ZEN_SESSION_HEADER, fp.sessionID)
   setHeader(h, ZEN_REQUEST_HEADER, msg)
+  let uaNote = ''
+  if (uaStale) {
+    setHeader(h, 'User-Agent', fp.userAgent)
+    uaNote = `；UA 已同步为 ${fp.userAgent}`
+  }
   // 旧版 x-session-id/affinity 若还在（历史配置），同步跟上——它们是晋升路径的输入。
   if (findHeaderKey(h, 'x-session-id') !== undefined) setHeader(h, 'x-session-id', fp.sessionID)
   if (findHeaderKey(h, 'x-session-affinity') !== undefined) setHeader(h, 'x-session-affinity', fp.sessionID)
@@ -78,8 +89,15 @@ export function refreshZenProvider(
   return {
     ...base, updated: true, sessionChanged,
     detail: `已更新为本机会话 ${fp.sessionID}（来自 ${fp.logPath}` +
-      `${fp.modelID ? `，该会话用过 ${fp.modelID}` : ''}）`,
+      `${fp.modelID ? `，该会话用过 ${fp.modelID}` : ''}）${uaNote}`,
   }
+}
+
+// 从 UA 里取 opencode 版本号（`opencode/1.18.29 …` 首段）；取不到返回 ''。
+// 缺 UA 时同样返回 ''——调用方按“与识别版本不一致”处理，顺带覆盖缺失。
+function uaVersion(ua: string): string {
+  const m = /^opencode\/([^\s]+)/.exec(ua.trim())
+  return m ? m[1]! : ''
 }
 
 // 刷新全部 Zen Provider（启动时调用）：逐个尽力而为，单个失败不影响其他，

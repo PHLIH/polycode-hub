@@ -3,14 +3,12 @@ import { readFileSync } from 'node:fs'
 import {
   accountEffectiveStatus,
   accountHealth,
-  applyReasoningPreset,
   capabilitiesFrom,
   credentialResolve,
   looksFree,
   modelEffAPI,
   providerValidate,
   riskAllowed,
-  sanitizeReasoningEffort,
   supportsImage,
   forgetProtocol,
   autoProtocol,
@@ -108,35 +106,6 @@ describe('Model 目录条目', () => {
   test('supportsImage 只认显式 image 声明', () => {
     expect(supportsImage(m({ input: [] }))).toBe(false)
     expect(supportsImage(m({ input: ['text', 'image'] }))).toBe(true)
-  })
-
-  test('推理预设不做白名单：去空格限长、原样保留（各家档位名不通用，合法性由上游判定）', () => {
-    expect(sanitizeReasoningEffort(' high ')).toBe('high')
-    // 网关自定义拼写不被误杀
-    expect(sanitizeReasoningEffort('ultra')).toBe('ultra')
-    expect(sanitizeReasoningEffort('extra_high')).toBe('extra_high')
-    expect(sanitizeReasoningEffort('')).toBeUndefined()
-    expect(sanitizeReasoningEffort('   ')).toBeUndefined()
-    expect(sanitizeReasoningEffort('x'.repeat(33))).toBeUndefined()
-    expect(sanitizeReasoningEffort(123)).toBeUndefined()
-  })
-
-  test('providerValidate 只拦超长预设，不拦未知档位名', () => {
-    expect(providerValidate(p({ models: [m({ reasoningEffort: 'high' })] }))).toBeUndefined()
-    expect(providerValidate(p({ models: [m({ reasoningEffort: 'ultra' })] }))).toBeUndefined()
-    expect(providerValidate(p({ models: [m({ id: 'm9', reasoningEffort: 'x'.repeat(33) })] }))).toMatch(/m9/)
-  })
-
-  test('applyReasoningPreset：有预设强制覆盖并清 budget，无预设跟随客户端', () => {
-    const req = { reasoningEffort: 'high', thinkingBudget: 10000 }
-    // 强制覆盖：客户端 high + budget 都被 low 替换
-    expect(applyReasoningPreset(req, m({ reasoningEffort: 'low' }))).toEqual({
-      reasoningEffort: 'low', thinkingBudget: undefined,
-    })
-    // 原请求对象不动（返回的是副本）
-    expect(req).toEqual({ reasoningEffort: 'high', thinkingBudget: 10000 })
-    // 无预设：原样返回
-    expect(applyReasoningPreset(req, m({}))).toBe(req)
   })
 
   test('capabilitiesFrom：modalities 优先、vision 收敛为 image、无声明返回 null', () => {

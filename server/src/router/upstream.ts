@@ -58,17 +58,18 @@ const defaultLookup: Lookup = (name) =>
 // 历史教训：网关曾把四件套当“毒头”删掉（臆测官方不发），与真机行为完全相反；
 // 上游 2026-09 要求 x-opencode-session 后全量 403。现在按取证原样发送。
 //
-// 网关是通用项目，不内置任何版本号、不伪造 UA，只做「诚实透传 + 配置兜底」：
-//   UA 缺省时的补位优先级（已配的不覆盖——显式配置优先于隐式透传）：
-//     1. Provider 静态头里的 User-Agent（运维自己抓包取的真串；删掉即回到透传）；
-//     2. 客户端透传：opencode 做客户端时它的真 UA 直达上游
-//        （见 proxy.sessionHintFromHeaders，来什么透什么，网关不改写）；
-//     3. ZEN_UA 环境变量（项目级默认，同样由运维提供真串）；
-//     4. 全都没有——如实不发，不编版本号。403 时按 FreeTierError 指引去配真串。
-//   会话取值优先级（透传 > 静态 > 旧 x-session-id 兼容）：
-//     1. 客户端透传的会话（session.id，须过 validZenToken 白名单）；
-//     2. Provider 静态头里的 x-opencode-session（指纹刷新流程自动续写）；
-//     3. 旧版静态 x-session-id（历史配置里存的 ses_ 值，直接晋升沿用）。
+// 网关是通用项目，不内置任何版本号、不伪造 UA，只做「网关权威 + 配置兜底」：
+//   UA 取值（客户端透传的 UA 永不采用，一律以网关自己的为准）：
+//     1. Provider 静态头里的 User-Agent（运维自己抓包取的真串；指纹刷新流程
+//        在版本变化时自动续写，见 discover.zen_refresh；删掉即回到 ZEN_UA）；
+//     2. ZEN_UA 环境变量（项目级默认，同样由运维提供真串）；
+//     3. 全都没有——如实不发，不编版本号。403 时按 FreeTierError 指引去配真串。
+//   会话取值（静态 x-opencode-session > 旧 x-session-id 晋升，客户端透传忽略）：
+//     1. Provider 静态头里的 x-opencode-session（指纹刷新流程自动续写）；
+//     2. 旧版静态 x-session-id（历史配置里存的 ses_ 值，直接晋升沿用）。
+//   为什么忽略客户端透传：第三方 harness 也会发自家的 x-session-id（如 ZCode
+//   的 UUID），上游根本不认识，照透则百分百 403（2026-09-18 实测）。网关算定
+//   的指纹不容上游（客户端）覆盖，来什么请求都用网关自己这一套头发出去。
 //   x-opencode-request：静态值优先（真机一次会话内稳定）；缺时现铸一个
 //     （mintZenRequestId，格式与观测一致；唯一性有收益，时间绑定则听天由命）。
 //   x-opencode-client/project：静态优先，缺省 cli/global。
@@ -94,8 +95,8 @@ const defaultLookup: Lookup = (name) =>
 //
 // 落点：Upstream 发往 zen 前统一补（转发与探针同一入口，见 ensureZenAgentShape）。
 // 开销：缺时才补，最多两个空 schema 工具（~30 input tokens）+ choice auto；
-// 已带的不动、不覆盖、不改名。另见：非流式请求网关无法代改 stream，
-// 仍会 403（见 proxy.mapUpstreamError 指引），这是客户端语义，网关不动。
+// 已带的不动、不覆盖、不改名。另：非流式在 streamWith 内一并提升为流式发出
+// （见上），客户端语义不变——体裁与流式两道闸门由网关全兜，缺一即 403。
 //
 // 残留风险（已评估，P≈0）：tool_choice:auto 下模型几乎不会点名调这两个
 // 垫片工具（实测 0 次）；万一调了，透传给客户端按普通 tool_call 处理，
@@ -151,32 +152,38 @@ const isZenUpstream = isZenBaseUrl
 
 // 大小写不敏感的头查找与会话白名单见 model（唯一定义，避免两处漂移）。
 
-// zen 指纹校准（导出供测试）：落实 x-opencode-* 四件套（透传 > 静态 x-opencode-session
-// > 旧 x-session-id 晋升）与 x-session-id/affinity（透传 > 静态，既有行为保留）；
-// UA 缺省时补位（静态头已配的不动——显式配置优先；缺时按 透传 > ZEN_UA 补，
-// 全无则不发），拒绝伪造版本。
+// zen 指纹校准（导出供测试）：落实 x-opencode-* 四件套（静态 x-opencode-session
+// > 旧 x-session-id 晋升）与 x-session-id/affinity（恒跟 sid）；
+// UA 缺省时补位（静态头已配的不动——显式配置优先；缺时用 ZEN_UA，
+// 全无则不发），拒绝伪造版本。客户端透传一律忽略（网关权威）。
 // zen=true（即 opencode.ai 上游）才动——非 zen 上游原样不动。
 // 注意：x-opencode-* 一律保留（真客户端本来就发这些；删掉才会 403）。
 // envUA 是 ZEN_UA 的可注入替身（测试用，生产走 process.env.ZEN_UA）：
 // 传了（哪怕空串）就用它，不再读环境——测试不碰运行环境。
+//
+// 网关权威原则（2026-09-18 定案）：指纹与身份类头一律以网关自己的配置为准，
+// 客户端透传的会话/AFFINITY/UA 一概不采用——第三方 harness 自带的会话 ID
+// （如 ZCode 的 UUID）上游根本不认识，之前按“透传优先”照单转发导致百分百 403。
+// 上游（客户端）来的请求也必须用网关自己的头与指纹，不得覆盖网关算定值。
+// session 参数保留（签名兼容），内容不再读取。
 export function applyZenFingerprint(
   h: Record<string, string>, session?: SessionHint, zen = true, envUA?: string,
 ): void {
-  // UA 补位：Provider 静态头已配的不动（buildHeaders 里静态头先落头，
-  // 显式配置优先）；缺时按 透传 > ZEN_UA 补；全都没有就不发（不编版本号）。
+  void session
+  // UA 补位：Provider 静态头已配的不动（显式配置优先）；缺时用 ZEN_UA；
+  // 全都没有就不发（不编版本号）。客户端 UA 永不采用。
   if (zen && findHeaderKey(h, 'user-agent') === undefined) {
-    const ua = sanitizeUA(session?.userAgent) ?? sanitizeUA(envUA ?? process.env.ZEN_UA)
+    const ua = sanitizeUA(envUA ?? process.env.ZEN_UA)
     if (ua !== undefined) h['User-Agent'] = ua
   }
   if (!zen) return
-  // 会话取值：透传 > 静态 x-opencode-session > 旧 x-session-id（晋升沿用）。
-  const live = (session?.id ?? '').trim()
+  // 会话取值：静态 x-opencode-session > 旧 x-session-id（晋升沿用）。
+  // 客户端透传一律忽略（见上）。
   const staticZen = findHeaderKey(h, ZEN_SESSION_HEADER) !== undefined
     ? (h[findHeaderKey(h, ZEN_SESSION_HEADER)!] ?? '').trim() : ''
   const legacySid = findHeaderKey(h, 'x-session-id') !== undefined
     ? (h[findHeaderKey(h, 'x-session-id')!] ?? '').trim() : ''
-  const sid = validZenToken(live) ? live
-    : validZenToken(staticZen) ? staticZen
+  const sid = validZenToken(staticZen) ? staticZen
     : validZenToken(legacySid) ? legacySid : ''
   // request 取值：静态优先；缺了现铸（真机一次会话内稳定，网关侧持久化由刷新流程做，
   // 这里只保证每次发出的请求都带一个合法值）。
@@ -187,19 +194,25 @@ export function applyZenFingerprint(
   // 旧 x-session-id/affinity 行为保留（既有配置与未知工具链可能依赖；真客户端虽不发，
   // 实测多带不影响 403 判定——403 只与四件套缺失有关）。
   if (!validZenToken(sid)) return // 无可用会话：不硬凑，失败信息更干净
-  const aff = (session?.affinity ?? '').trim()
+  // affinity 恒跟 sid（真机两者同值；客户端 affinity 同会话一样不采用）。
   const affKey = findHeaderKey(h, 'x-session-affinity')
   const sidKey = findHeaderKey(h, 'x-session-id')
   if (sidKey !== undefined) h[sidKey] = sid
   else h['x-session-id'] = sid
-  const affVal = validZenToken(aff) ? aff : sid
-  if (affKey !== undefined) h[affKey] = affVal
-  else h['x-session-affinity'] = affVal
+  if (affKey !== undefined) h[affKey] = sid
+  else h['x-session-affinity'] = sid
 }
+
+// 瞬时重试的时间预算：只有在 fetch 起点 5s 内就失败才值得同条件再打一次。
+// 快 500/快拒连多是抖动；慢失败说明上游真在挣扎（或连接挂起），重试只会翻倍等待。
+export const TRANSIENT_RETRY_BUDGET_MS = 5000
 
 export class Upstream {
   // 上游调用器：协议解析/自动探测、动态头铸币、出口代理分流、模型目录拉取。
   // 无状态（除 dispatcher 缓存与 autoProtocol 进程内记忆）；失败一律抛 UpstreamError。
+  // 注意：对外仍是“按 irReq.stream 语义调用”，但落线一律流式——非流式请求在
+  // streamWith/streamWithTimeout 内被提升为流式发出，由 proxy.forward 收齐拼包。
+  // 这样残缺的非流式端点（workbuddy 404、zen 免费档 403）对客户端全部透明。
   private credLookup: Lookup
   private noAutoProtocol: boolean
   private egresses: Record<string, string>
@@ -287,14 +300,24 @@ export class Upstream {
   }
 
   // 用指定协议打一次上游。有动态头时最多打两次：首调失败且为换 token 信号 → 重铸再打一次。
+  //
+  // 网关内部一律用流式打上游（所有 Provider 生效，不止 zen）：部分上游的非流式
+  // 端点残缺或直接拒单（如 workbuddy 报 11101/404、zen 免费档非流式恒 403），
+  // 而流式端点人人都有；非流式客户端由 proxy.forward 把 SSE 收齐拼成单包返回，
+  // 客户端看到的仍是非流式（见 forward 非流式分支与 collectStreamResponse）。
+  //
+  // 另：网络异常与 5xx 同条件重试一次（抖动与过载常见）。4xx 是确定性拒绝
+  // （鉴权/指纹/地区/坏请求），重试只浪费 token，直接抛。
   private async streamWith(p: Provider, irReq: IrRequest, proto: Protocol, session?: SessionHint): Promise<ReadableStream<Uint8Array>> {
+    // upReq 是真正上游的请求：流式固定 true（客户端要非流式也先流式拿回来再拼）。
+    const upReq: IrRequest = irReq.stream ? irReq : { ...irReq, stream: true }
     let body: Uint8Array
     let path: string
     try {
       const codec = getOutbound(proto)
       // zen 免费档要 agent 体裁才放行（缺 read/bash 工具声明或 tool_choice 即 403，
       // 与指纹头无关的独立判定）：这里统一补，转发侧无需逐个操心。
-      body = codec.serializeRequest(ensureZenAgentShape(irReq, p.baseUrl))
+      body = codec.serializeRequest(ensureZenAgentShape(upReq, p.baseUrl))
       path = codec.requestPath()
     } catch (err) {
       if (err instanceof UpstreamError) throw err
@@ -303,6 +326,17 @@ export class Upstream {
 
     const url = buildRequestURL(p.baseUrl, path)
     const attempts = p.dynamicHeaders ? 2 : 1
+    // 瞬时故障同条件重试一次（各 attempt 共享一次额度，不占用动态头重铸次数）：
+    // 连接被重置/超时与 Console 过载 500 常见，重打一次常能过去。
+    // 但只给“快失败”重试：慢 500（≥5s才回）说明上游真在挣扎，重试只是把
+    // 用户的等待翻倍，直接抛让客户端早失败早重试。判定点见每次 fetch 起点。
+    let transientRetried = false
+    const retryTransient = async (): Promise<boolean> => {
+      if (transientRetried) return false
+      transientRetried = true
+      await new Promise<void>((r) => setTimeout(r, 500))
+      return true
+    }
     for (let a = 0; a < attempts; a++) {
       let dyn: Record<string, string> | null = null
       if (p.dynamicHeaders) {
@@ -312,16 +346,21 @@ export class Upstream {
           throw new UpstreamError(0, UPSTREAM.NETWORK, (err as Error).message)
         }
       }
+      const t0 = Date.now()
+      // 快失败（5s 内）才值得重试一次；慢失败直接抛（见上）。
+      const retryable = async (): Promise<boolean> =>
+        Date.now() - t0 < TRANSIENT_RETRY_BUDGET_MS && retryTransient()
       let resp: Response
       try {
         resp = await this.fetch(url, {
           method: 'POST',
-          headers: this.buildHeaders(p, irReq.stream, dyn, proto, session),
+          headers: this.buildHeaders(p, upReq.stream, dyn, proto, session),
           body: body as never, // Node fetch 接受 Uint8Array；类型侧缺 DOM BodyInit
           dispatcher: this.dispatcherFor(p) as never,
         })
       } catch (err) {
         if (err instanceof UpstreamError) throw err // 凭据缺失等本地错误：原样上报，别降级成 network
+        if (await retryable()) { a--; continue } // 连接级抖动：同条件再打一次
         throw new UpstreamError(0, UPSTREAM.NETWORK, (err as Error).message)
       }
       if (resp.status >= 200 && resp.status <= 299) {
@@ -330,6 +369,10 @@ export class Upstream {
       const text = await resp.text() // text() 已消费 body，无需再 cancel
       console.warn(`[upstream] POST ${url} -> ${resp.status} (${ue2s(resp.status, text)})`)
       const ue = new UpstreamError(resp.status, classifyUpstreamError(resp.status, text), summarizeUpstreamBody(text))
+      if ((ue.kind === UPSTREAM.SERVER || ue.kind === UPSTREAM.NETWORK) && await retryable()) {
+        a-- // 快失败的过载 500 系：同条件再打一次（动态头重铸次数不受影响）
+        continue
+      }
       // 换 token 信号看原文全文：提炼只留人话 + 业务码，散落在其它字段的标记会丢。
       if (a === 0 && p.dynamicHeaders && needsRemint(text, p.dynamicHeaders.retryOn)) {
         continue // 换 token 信号：重铸一次
@@ -426,18 +469,21 @@ export class Upstream {
   }
 
   // 带超时信号的单次流式请求（探测用）。语义同 stream()，但由外部 signal 控制超时。
+  // 同样内部一律流式（见 streamWith）：探针本就只发 stream:true，此处只是把形态钉死。
   async streamWithTimeout(
     p: Provider, irReq: import('../ir/index.ts').IrRequest, signal: AbortSignal,
   ): Promise<ReadableStream<Uint8Array>> {
     const [proto, known] = resolveProtocol(p, irReq.model)
     if (!known) throw new UpstreamError(0, UPSTREAM.BAD_REQUEST, '协议未定，无法发请求')
+    // upReq 是真正上游的请求：流式固定 true。
+    const upReq: import('../ir/index.ts').IrRequest = irReq.stream ? irReq : { ...irReq, stream: true }
     let body: Uint8Array
     let path: string
     try {
       const codec = getOutbound(proto)
       // 探测路径同样走体裁保底：探针本就是极简 `hi`，不补则 zen 恒 403，
       // 会把「体裁不对」误报成「源不可用」（与 streamWith 同语义，见 ensureZenAgentShape）。
-      body = codec.serializeRequest(ensureZenAgentShape(irReq, p.baseUrl))
+      body = codec.serializeRequest(ensureZenAgentShape(upReq, p.baseUrl))
       path = codec.requestPath()
     } catch (err) {
       throw new UpstreamError(0, UPSTREAM.BAD_REQUEST, `序列化上游请求失败: ${(err as Error).message}`)
@@ -446,7 +492,7 @@ export class Upstream {
     try {
       resp = await this.fetch(buildRequestURL(p.baseUrl, path), {
         method: 'POST',
-        headers: this.buildHeaders(p, irReq.stream, null, proto),
+        headers: this.buildHeaders(p, upReq.stream, null, proto),
         body: body as never,
         signal,
         dispatcher: this.dispatcherFor(p) as never,

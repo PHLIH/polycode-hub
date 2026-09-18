@@ -2,8 +2,8 @@ import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createServer, type Server } from 'node:http'
 import { AddressInfo } from 'node:net'
 import { Hono } from 'hono'
-import { Proxy, noCandidateMessage, sessionHintFromHeaders, mapUpstreamError } from '../src/gateway/proxy.ts'
-import { UpstreamError, UPSTREAM } from '../src/ir/index.ts'
+import { Proxy, noCandidateMessage, sessionHintFromHeaders, mapUpstreamError, collectStreamResponse } from '../src/gateway/proxy.ts'
+import { UpstreamError, UPSTREAM, getOutbound } from '../src/ir/index.ts'
 import { DEFAULT_FIRST_BYTE_TIMEOUT_MS, DEFAULT_STREAM_IDLE_TIMEOUT_MS } from '../src/config/index.ts'
 import { Scheduler } from '../src/router/scheduler.ts'
 import { Upstream } from '../src/router/upstream.ts'
@@ -200,7 +200,7 @@ describe('POST /v1/messages 流式转发（anthropic 入站 × openai-completion
   })
 })
 
-describe('模型推理强度预设（强制覆盖，端到端）', () => {
+describe('客户端推理档位透传（端到端）', () => {
   const chatBody = (over: Record<string, unknown> = {}) => ({
     model: 'p1/m1', stream: false,
     messages: [{ role: 'user', content: 'hi' }], ...over,
@@ -210,27 +210,7 @@ describe('模型推理强度预设（强制覆盖，端到端）', () => {
     models: [{ id: 'm1', manual: false, enabled: true, ...modelOver }],
   })
 
-  test('有预设：客户端传 high 也被替换成 low', async () => {
-    const { app } = buildApp({ providers: [pv({ reasoningEffort: 'low' })] })
-    const res = await app.request('/v1/chat/completions', {
-      method: 'POST', body: JSON.stringify(chatBody({ reasoning_effort: 'high' })),
-    })
-    expect(res.status).toBe(200)
-    await res.json()
-    expect(JSON.parse(lastUpstreamBody).reasoning_effort).toBe('low')
-  })
-
-  test('有预设：客户端没传也按预设发', async () => {
-    const { app } = buildApp({ providers: [pv({ reasoningEffort: 'max' })] })
-    const res = await app.request('/v1/chat/completions', {
-      method: 'POST', body: JSON.stringify(chatBody()),
-    })
-    expect(res.status).toBe(200)
-    await res.json()
-    expect(JSON.parse(lastUpstreamBody).reasoning_effort).toBe('max')
-  })
-
-  test('无预设：跟随客户端透传（没传就不发）', async () => {
+  test('跟随客户端透传（没传就不发）', async () => {
     const { app } = buildApp({ providers: [pv({})] })
     const res = await app.request('/v1/chat/completions', {
       method: 'POST', body: JSON.stringify(chatBody({ reasoning_effort: 'high' })),
@@ -244,16 +224,6 @@ describe('模型推理强度预设（强制覆盖，端到端）', () => {
     })
     expect(res2.status).toBe(200)
     await res2.json()
-    expect(JSON.parse(lastUpstreamBody)).not.toHaveProperty('reasoning_effort')
-  })
-
-  test('预设 off：客户端传 high 也被关掉（上游收不到 reasoning_effort）', async () => {
-    const { app } = buildApp({ providers: [pv({ reasoningEffort: 'off' })] })
-    const res = await app.request('/v1/chat/completions', {
-      method: 'POST', body: JSON.stringify(chatBody({ reasoning_effort: 'high' })),
-    })
-    expect(res.status).toBe(200)
-    await res.json()
     expect(JSON.parse(lastUpstreamBody)).not.toHaveProperty('reasoning_effort')
   })
 })
@@ -647,10 +617,10 @@ describe('sessionHintFromHeaders（客户端指纹透传，zen 指纹）', () =>
   })
 })
 
-describe('mapUpstreamError：推理参数 400 带指引（按“发过档位”触发，不猜文本语言）', () => {
+describe('mapUpstreamError：推理参数 400（按“发过档位”触发，不猜文本语言）', () => {
   const bad = (msg: string) => new UpstreamError(400, UPSTREAM.BAD_REQUEST, msg)
 
-  test('发过档位 + bad_request → 附核对预设的指引（中英文报错都一样）', () => {
+  test('发过档位 + bad_request → 附档位指引（中英文报错都一样）', () => {
     const en = mapUpstreamError(bad("reasoning_effort 'minimal' is not supported"), 'minimal')
     expect(en.type).toBe('api_error')
     expect(en.httpStatus).toBe(500)
@@ -675,16 +645,96 @@ describe('mapUpstreamError：推理参数 400 带指引（按“发过档位”�
   })
 })
 
-describe('mapUpstreamError：指纹拒绝指引含体裁与流式要求（2026-09-18 取证）', () => {
+describe('mapUpstreamError：指纹拒绝指引含体裁说明（2026-09-18 取证）', () => {
   // zen 免费档的拒绝有两半开关：指纹头 + agent 体裁（read/bash 工具声明 +
-  // tool_choice，且须流式）。网关转发时已自动补工具声明，但 stream 是客户端
-  // 语义、网关不代改——指引必须把这两句都点名，否则用户照着刷会话也过不了。
-  test('FINGERPRINT 指引保留刷新入口，并点名体裁/流式', () => {
+  // tool_choice，且须流式）。网关转发时已自动补工具声明，非流式则在内部改走
+  // 流式上游并拼包返回——指引如实说明这两点，不再要求客户端改流式。
+  test('FINGERPRINT 指引保留刷新入口，并点名体裁与拼包', () => {
     const e = mapUpstreamError(new UpstreamError(403, UPSTREAM.FINGERPRINT, 'free tier'))
     expect(e.type).toBe('authentication_error')
     expect(e.httpStatus).toBe(401)
     expect(e.message).toContain('refresh-fingerprint')
     expect(e.message).toContain('read/bash')
-    expect(e.message).toContain('stream=false')
+    expect(e.message).toContain('拼包')
+  })
+})
+
+describe('collectStreamResponse：SSE 收齐拼单包（非流式兜底）', () => {
+  const enc = new TextEncoder()
+  const B = (s: string) => enc.encode(s)
+  const streamOf = (chunks: string[]) => new ReadableStream<Uint8Array>({
+    start(c) {
+      for (const s of chunks) c.enqueue(B(s))
+      c.close()
+    },
+  })
+  const out = () => getOutbound('openai-completions')
+
+  test('文本分片拼接 + 用量合并 + stopReason', async () => {
+    const rc = streamOf([
+      'data: {"id":"c1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"he"}}]}\n\n',
+      'data: {"id":"c1","choices":[{"index":0,"delta":{"content":"llo"}}]}\n\n',
+      'data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}\n\n',
+      'data: [DONE]\n\n',
+    ])
+    const resp = await collectStreamResponse(out(), rc)
+    expect(resp.content).toEqual([{ type: 'text', text: 'hello' }])
+    expect(resp.stopReason).toBe('end_turn')
+    expect(resp.usage.inputTokens).toBe(3)
+    expect(resp.usage.outputTokens).toBe(2)
+    expect(resp.id).toBe('c1')
+  })
+
+  test('tool_use 跨块 JSON 拼装', async () => {
+    const rc = streamOf([
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"t1","type":"function","function":{"name":"read","arguments":""}}]}}]}\n\n',
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"p\\":"}}]}}]}\n\n',
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}\n\n',
+      'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+      'data: [DONE]\n\n',
+    ])
+    const resp = await collectStreamResponse(out(), rc)
+    expect(resp.stopReason).toBe('tool_use')
+    expect(resp.content).toEqual([{ type: 'tool_use', id: 't1', name: 'read', input: { p: 1 } }])
+  })
+
+  test('流内 error 事件：有好内容则跳过坏行照回，无内容才抛错', async () => {
+    // openai 解析器把“非法 JSON 行”转成 error 事件（合法 JSON 的错误包络无 choices，直接忽略）。
+    const badThenGood = streamOf([
+      'data: {not json}\n\n',
+      'data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n',
+      'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+      'data: [DONE]\n\n',
+    ])
+    const resp = await collectStreamResponse(out(), badThenGood)
+    expect(resp.content).toEqual([{ type: 'text', text: 'hi' }])
+    const onlyBad = streamOf(['data: {not json}\n\n', 'data: [DONE]\n\n'])
+    await expect(collectStreamResponse(out(), onlyBad)).rejects.toThrow('合法 JSON')
+  })
+
+  test('空流返回空内容（不断言）', async () => {
+    const resp = await collectStreamResponse(out(), streamOf(['data: [DONE]\n\n']))
+    expect(resp.content).toEqual([])
+    expect(resp.usage.accuracy).toBe('unknown')
+  })
+})
+
+describe('非流式客户端经内部流式上游拼包返回（全源生效）', () => {
+  test('上游收到 stream:true，客户端拿到单包 JSON + stream=false 记账', async () => {
+    const { app, usage } = buildApp({
+      providers: [provider({ headers: { 'x-mode': 'capture' } })],
+    })
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST',
+      body: JSON.stringify({ model: 'p1/m1', stream: false, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+    expect(res.status).toBe(200)
+    // 网关内部改走流式：桩服务看到的必须是 stream:true（否则回的是 JSON 整包，拼包无意义）
+    expect(JSON.parse(lastUpstreamBody).stream).toBe(true)
+    const body = (await res.json()) as { choices: { message: { content: string } }[] }
+    expect(body.choices[0]!.message.content).toBe('hello')
+    // 记账仍按客户端形态：stream=false
+    expect(usage.rows[0]!.stream).toBe(false)
+    expect(usage.rows[0]!.status).toBe('ok')
   })
 })

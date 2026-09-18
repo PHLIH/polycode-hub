@@ -281,4 +281,16 @@ providers:
 `)
     expect(() => loadConfig(bad)).toThrow(/egress/)
   })
+
+  test('模型上写 reasoning_effort/reasoning_min_tokens → 启动即报未知字段（该功能已删除）', () => {
+    const bad = write('reasoning-gone.yaml', `
+providers:
+  - name: zen
+    base_url: https://x.example
+    models:
+      - id: muse-spark-1.3
+        reasoning_effort: xhigh
+`)
+    expect(() => loadConfig(bad)).toThrow(/reasoning_effort/)
+  })
 })

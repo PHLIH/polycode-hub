@@ -138,7 +138,8 @@ describe('refreshZenProvider', () => {
     const dir = writeLogDir(mkdtempSync(join(tmpdir(), 'zenfp-')), FP_LOG)
     try {
       const store = new MemoryProviderStore([zenProvider({
-        headers: { 'x-opencode-session': SESSION, 'x-opencode-request': 'msg_0b209c3fc001LViMJFLn53xddn' },
+        // UA 也要对上版本才算“最新”（网关权威后客户端 UA 不再补充，见下组测试）
+        headers: { 'User-Agent': 'opencode/1.18.29', 'x-opencode-session': SESSION, 'x-opencode-request': 'msg_0b209c3fc001LViMJFLn53xddn' },
       })])
       const id = store.list()[0]!.providerId
       let notified = 0
@@ -314,5 +315,60 @@ describe('Proxy 指纹自愈重试', () => {
     expect(calls).toBe(1)
     const body = (await res.json()) as { error: { message: string } }
     expect(body.error.message).toContain('refresh-fingerprint')
+  })
+})
+
+describe('refreshZenProvider 同步 UA（网关权威后客户端 UA 不再补充）', () => {
+  // 静态缺 UA 或版本落后 → 写回识别到的真串；版本一致则不动（上游随时可能按版本卡）。
+  const NEWER_LOG = [
+    'timestamp=2026-09-18T00:00:01Z level=INFO message=created id=ses_aaaabbbbccccddddeeeeffff00 slug=x version=1.19.0 projectID=global directory=/private/tmp path=private/tmp',
+    'timestamp=2026-09-18T00:00:02Z level=INFO message=process session.id=ses_aaaabbbbccccddddeeeeffff00 messageID=msg_0b209c3fc001LViMJFLn53xddn',
+    'timestamp=2026-09-18T00:00:03Z level=INFO message=stream providerID=opencode modelID=mimo-v2.5-free session.id=ses_aaaabbbbccccddddeeeeffff00 small=false',
+  ].join('\n')
+
+  test('缺 UA 则补上；版本一致不碰', () => {
+    const dir = writeLogDir(mkdtempSync(join(tmpdir(), 'zenua-')), FP_LOG)
+    try {
+      const store = new MemoryProviderStore([zenProvider({
+        headers: { 'x-opencode-session': 'ses_stale' },
+      })])
+      const id = store.list()[0]!.providerId
+      const rep = refreshZenProvider(store, () => {}, id, [dir])
+      expect(rep.updated).toBe(true)
+      expect(store.get(id)!.headers?.['User-Agent']).toBe('opencode/1.18.29')
+
+      // 版本一致（1.18.29）→ 第二次只换会话不动 UA
+      const store2 = new MemoryProviderStore([zenProvider({
+        headers: { 'User-Agent': 'opencode/1.18.29 keep', 'x-opencode-session': 'ses_stale' },
+      })])
+      const id2 = store2.list()[0]!.providerId
+      refreshZenProvider(store2, () => {}, id2, [dir])
+      expect(store2.get(id2)!.headers?.['User-Agent']).toBe('opencode/1.18.29 keep')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('版本落后则同步新版并点名（会话已是最新也一样写）', () => {
+    const dir = writeLogDir(mkdtempSync(join(tmpdir(), 'zenua-newer-')), NEWER_LOG)
+    try {
+      const store = new MemoryProviderStore([zenProvider({
+        headers: {
+          'User-Agent': 'opencode/1.18.29 old',
+          'x-opencode-session': 'ses_aaaabbbbccccddddeeeeffff00',
+          'x-opencode-request': 'msg_0b209c3fc001LViMJFLn53xddn',
+        },
+      })])
+      const id = store.list()[0]!.providerId
+      let notified = 0
+      const rep = refreshZenProvider(store, () => { notified++ }, id, [dir])
+      expect(rep.updated).toBe(true)
+      expect(rep.sessionChanged).toBe(false)
+      expect(rep.detail).toContain('opencode/1.19.0')
+      expect(notified).toBe(1)
+      expect(store.get(id)!.headers?.['User-Agent']).toBe('opencode/1.19.0')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

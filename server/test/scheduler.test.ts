@@ -76,10 +76,11 @@ describe('模型路由（对齐 PickOrder）', () => {
     expect(s.pickOrder('unknownsrc/glm-4.6', 0, false, true).map((x) => x.name)).toEqual(['z1', 'o1'])
   })
 
-  test('StreamOnly 源在非流式请求时跳过', () => {
+  test('StreamOnly 源不再因非流式被跳过（网关内部一律流式打上游并拼包）', () => {
     const s = sched([p({ name: 'so', providerId: 1, streamOnly: true, priority: 0 }), p({ name: 'both', providerId: 2, priority: 2 })])
     expect(s.pickOrder('m', 0, false, true).map((x) => x.name)).toEqual(['so', 'both'])
-    expect(s.pickOrder('m', 0, false, false).map((x) => x.name)).toEqual(['both'])
+    // 非流式客户端同样可路由到 StreamOnly 源：拼包对客户端透明
+    expect(s.pickOrder('m', 0, false, false).map((x) => x.name)).toEqual(['so', 'both'])
   })
 
   test('上下文预检：超限跳过该 Provider（绝不截断），unknown 放行', () => {
