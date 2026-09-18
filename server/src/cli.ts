@@ -24,6 +24,7 @@ import type { Finding } from './adminapi/types.ts'
 import { createSidecarApp } from './adminapi/sidecar_app.ts'
 import { createProjectsApp } from './adminapi/projects_app.ts'
 import { Sidecar } from './sidecar/sidecar.ts'
+import { maskProxyURI, resolveSidecarDownloadFetch } from './sidecar/httpproxy.ts'
 import { Manager } from './projects/manager.ts'
 import { Store as ProjectsStore } from './projects/store.ts'
 import { openLog, startDetached } from './projects/process.ts'
@@ -379,7 +380,7 @@ export async function runServe(args: string[]): Promise<void> {
     lister: { listProviderModels: (pid) => probe.listProviderModels(pid) },
     modelProber: { probeModels: (pid, models) => probe.probeModels(pid, models) },
     notify: syncStores,
-    sidecar: createSidecarApp(sidecarSvc, providers, syncStores),
+    sidecar: createSidecarApp(sidecarSvc, providers, syncStores, fetch, egresses),
     projects: createProjectsApp(projectsMgr, { defaultModel: cfg.gateway.defaultModel }),
   })
 
@@ -499,23 +500,53 @@ async function runZCode(args: string[]): Promise<void> {
     const sc = new Sidecar(join(cwd, 'config', 'credentials', 'zcode-proxy-key'))
     sc.workDir = join(cwd, 'config', 'zcode-proxy')
     sc.loadPort(sc.workDir)
-    switch (action) {
-      case 'install': {
-        // 下载走代理：--proxy http://127.0.0.1:7897 或环境变量 HTTPS_PROXY（国内网络必备）
-        let proxy = ''
-        for (let i = 2; i < args.length - 1; i++) {
-          if (args[i] === '--proxy') proxy = args[i + 1] ?? ''
-        }
-        if (!proxy) proxy = process.env.HTTPS_PROXY ?? process.env.https_proxy ?? ''
-        if (proxy) {
-          const { setGlobalDispatcher, ProxyAgent } = await import('undici')
-          setGlobalDispatcher(new ProxyAgent(proxy))
-          console.log(`下载走代理: ${proxy}`)
-        }
-        const p = await sc.install(args.includes('--force'))
+    if (action === 'install' || action === 'ensure') {
+      // 下载走代理（不写死地址）：决议顺序见 resolveSidecarDownloadFetch——
+      // 显式 --proxy → 显式 --egress <id> → 项目 egress 表（zcode-plan-local
+      // 的 egress 引用，或表里仅一项时自动采用）→ HTTPS_PROXY → 系统代理 → 直连。
+      // 项目 egress 表是「复用项目配置」的主路径：用户在管理台配的出口就是这里用的出口。
+      const cfg = loadOrDefault(process.env.POLYCODE_CONFIG ?? join(cwd, 'config', 'apps.yaml'))
+      let explicitProxy = ''
+      let egressId = ''
+      for (let i = 2; i < args.length - 1; i++) {
+        if (args[i] === '--proxy') explicitProxy = args[i + 1] ?? ''
+        if (args[i] === '--egress') egressId = args[i + 1] ?? ''
+      }
+      // egress 表以 DB 为准（与 serve 同源），DB 不可用时回落配置文件里的定义。
+      let egressList: { id: string; kind: string; addr: string }[] = cfg.egresses
+      try {
+        const store = await SQLiteEgressStore.open(join(cwd, cfg.dataDir, 'admin.db'))
+        const fromDB = store.list()
+        if (fromDB.length > 0) egressList = fromDB
+      } catch { /* 库不可用 → 用配置文件里的定义 */ }
+      const provider = await (async () => {
+        try {
+          const providers = await SQLiteProviderStore.open(join(cwd, cfg.dataDir, 'admin.db'))
+          return providers.getByName('zcode-plan-local')
+        } catch { return undefined }
+      })()
+      let dl: ReturnType<typeof resolveSidecarDownloadFetch>
+      try {
+        dl = resolveSidecarDownloadFetch({
+          explicitProxy, egressId,
+          providerEgressId: provider?.egress ?? '',
+          egressList,
+        })
+      } catch (e) {
+        fatal(e as Error) // 显式指定的 egress 不存在/不支持：点名报错，不静默换出口
+      }
+      console.log(`下载走代理: ${maskProxyURI(dl.proxyURI)}（来源 ${dl.source}）`)
+      if (action === 'install') {
+        const p = await sc.install(args.includes('--force'), { fetch: dl.fetch })
         console.log('已安装:', p)
         return
       }
+      await sc.ensureReady(sc.workDir, { fetch: dl.fetch })
+      console.log('sidecar 就绪:', await sc.status())
+      console.log('网关凭据:', sc.credKey)
+      return
+    }
+    switch (action) {
       case 'setup': {
         const key = sc.setupConfig(sc.workDir)
         console.log('已生成安全配置:', join(sc.workDir, 'config.yaml'))
@@ -535,11 +566,6 @@ async function runZCode(args: string[]): Promise<void> {
         return
       case 'login':
         await sc.login(sc.workDir)
-        return
-      case 'ensure':
-        await sc.ensureReady(sc.workDir)
-        console.log('sidecar 就绪:', await sc.status())
-        console.log('网关凭据:', sc.credKey)
         return
       default:
         fatal(new Error(`未知 sidecar 动作 "${action}"（支持: install|setup|start|stop|status|login|ensure）`))

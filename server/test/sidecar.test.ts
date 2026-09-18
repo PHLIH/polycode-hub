@@ -16,7 +16,7 @@ import {
   sha256Hex,
   validatePort,
 } from '../src/sidecar/sidecar.ts'
-import { parseScutilProxy } from '../src/sidecar/httpproxy.ts'
+import { parseScutilProxy, normalizeProxyURI, maskProxyURI, egressDefToProxyURI, resolveSidecarDownloadFetch } from '../src/sidecar/httpproxy.ts'
 
 const makeTemp = (prefix: string): string => mkdtempSync(join(tmpdir(), prefix))
 
@@ -141,6 +141,140 @@ describe('parseScutilProxy scutil 输出解析', () => {
   })
   test('未启用返回 null', () => {
     expect(parseScutilProxy('  HTTPSEnable : 0\n  HTTPEnable : 0\n')).toBeNull()
+  })
+})
+
+// —— 下载代理决议（复用项目 egress 配置，不写死地址）——
+// 回归锚点：管理台「一键安装」以前用全局 fetch 直连 github release（~66MB），
+// 国内网络必然超时，页面永远转「安装中…」。这里锚死「项目 egress 表优先」。
+
+describe('下载代理决议 resolveSidecarDownloadFetch', () => {
+  const clash = { id: 'clash', kind: 'http', addr: '127.0.0.1:7897' }
+  // 测试一律 wantSystem:false + 空 env：不依赖跑测试这台机器的系统代理/环境变量，
+  // 否则同一个用例在「开着 Clash 的机器」和 CI 上结论不同（不可复现）。
+  const base = { wantSystem: false, env: {} as Record<string, string | undefined> }
+
+  test('优先级 1：显式 --proxy 压过一切', () => {
+    const r = resolveSidecarDownloadFetch({
+      ...base, explicitProxy: 'http://127.0.0.1:1080',
+      egressId: 'clash', egressList: [clash],
+    })
+    expect(r.proxyURI).toBe('http://127.0.0.1:1080')
+    expect(r.source).toBe('--proxy')
+  })
+
+  test('优先级 2：显式 egress id 命中即采用（来源可回显）', () => {
+    const r = resolveSidecarDownloadFetch({ ...base, egressId: 'clash', egressList: [clash] })
+    expect(r.proxyURI).toBe('http://127.0.0.1:7897')
+    expect(r.source).toBe('egress:clash')
+  })
+
+  test('优先级 2：显式 egress id 不存在 → 点名抛错（不静默换出口）', () => {
+    expect(() => resolveSidecarDownloadFetch({ ...base, egressId: 'nope', egressList: [clash] }))
+      .toThrow(/egress "nope" 不存在/)
+  })
+
+  test('优先级 2：显式 egress id 是 socks5 → 点名抛错（v1 仅 http/https）', () => {
+    expect(() => resolveSidecarDownloadFetch({
+      ...base, egressId: 's', egressList: [{ id: 's', kind: 'socks5', addr: '127.0.0.1:7897' }],
+    })).toThrow(/暂不支持/)
+  })
+
+  test('优先级 3：Provider 的 egress 引用（zcode-plan-local 配了 clash）', () => {
+    const r = resolveSidecarDownloadFetch({ ...base, providerEgressId: 'clash', egressList: [clash] })
+    expect(r.proxyURI).toBe('http://127.0.0.1:7897')
+    expect(r.source).toBe('provider-egress:clash')
+  })
+
+  test('优先级 3（lenient）：Provider 引用了不存在的 egress → 继续往下，不抛错', () => {
+    // 与「显式 id」相反：这是 Provider 静态配置的一行脏引用，不该让下载整个炸掉。
+    const r = resolveSidecarDownloadFetch({ ...base, providerEgressId: 'ghost', egressList: [clash] })
+    // 落到规则 4：表里仅一项 → 自动采用
+    expect(r.proxyURI).toBe('http://127.0.0.1:7897')
+    expect(r.source).toBe('egress-auto:clash')
+  })
+
+  test('优先级 4：表里仅一项时自动采用（单 clash 最常见的形态）', () => {
+    const r = resolveSidecarDownloadFetch({ ...base, egressList: [clash] })
+    expect(r.proxyURI).toBe('http://127.0.0.1:7897')
+    expect(r.source).toBe('egress-auto:clash')
+  })
+
+  test('优先级 4：表里多项时不猜（避免把下载送错出口）', () => {
+    const r = resolveSidecarDownloadFetch({
+      ...base, egressList: [clash, { id: 'other', kind: 'http', addr: '10.0.0.9:8888' }],
+    })
+    expect(r.proxyURI).toBeNull()
+    expect(r.source).toBe('direct')
+  })
+
+  test('优先级 5：环境变量（HTTPS 优先于 ALL，来源点名用了哪个）', () => {
+    const r = resolveSidecarDownloadFetch({
+      wantSystem: false,
+      env: { HTTPS_PROXY: 'http://127.0.0.1:8888', ALL_PROXY: 'http://127.0.0.1:9999' },
+    })
+    expect(r.proxyURI).toBe('http://127.0.0.1:8888')
+    expect(r.source).toBe('env:HTTPS_PROXY')
+  })
+
+  test('优先级 6：系统代理（darwin scutil 解析结果）', () => {
+    const r = resolveSidecarDownloadFetch({
+      wantSystem: true, env: {},
+      systemProxy: () => ({ scheme: 'http', host: '127.0.0.1:7897' }),
+    })
+    expect(r.proxyURI).toBe('http://127.0.0.1:7897')
+    expect(r.source).toBe('system')
+  })
+
+  test('系统代理是 socks5 → 放弃（ProxyAgent 不支持），回落直连', () => {
+    const r = resolveSidecarDownloadFetch({
+      wantSystem: true, env: {},
+      systemProxy: () => ({ scheme: 'socks5', host: '127.0.0.1:7897' }),
+    })
+    expect(r.proxyURI).toBeNull()
+    expect(r.source).toBe('direct')
+  })
+
+  test('读系统代理抛错 → 不冒泡，回落直连', () => {
+    const r = resolveSidecarDownloadFetch({
+      wantSystem: true, env: {},
+      systemProxy: () => { throw new Error('scutil 挂了') },
+    })
+    expect(r.proxyURI).toBeNull()
+    expect(r.source).toBe('direct')
+  })
+
+  test('优先级 7：全无 → 直连（保持旧行为）', () => {
+    const r = resolveSidecarDownloadFetch({ ...base })
+    expect(r.proxyURI).toBeNull()
+    expect(r.source).toBe('direct')
+  })
+
+  test('normalizeProxyURI：只收 http/https，保留认证、丢掉 path', () => {
+    expect(normalizeProxyURI('http://127.0.0.1:7897')).toBe('http://127.0.0.1:7897')
+    expect(normalizeProxyURI('https://proxy.corp:8443')).toBe('https://proxy.corp:8443')
+    // 认证信息必须保留（有密码的代理否则根本连不上）
+    expect(normalizeProxyURI('http://u:p@127.0.0.1:7897')).toBe('http://u:p@127.0.0.1:7897')
+    // 代理地址不该带路径
+    expect(normalizeProxyURI('http://127.0.0.1:7897/some/path')).toBe('http://127.0.0.1:7897')
+    for (const bad of ['socks5://127.0.0.1:7897', '', '   ', 'not-a-url', 'ftp://x']) {
+      expect(normalizeProxyURI(bad)).toBeNull()
+    }
+  })
+
+  test('maskProxyURI：密码打码，host 保留；null/invalid 可读', () => {
+    expect(maskProxyURI('http://u:secret@127.0.0.1:7897')).toBe('http://u:***@127.0.0.1:7897')
+    expect(maskProxyURI('http://127.0.0.1:7897')).toBe('http://127.0.0.1:7897')
+    expect(maskProxyURI(null)).toBe('direct')
+    expect(maskProxyURI('garbage')).toBe('invalid')
+  })
+
+  test('egressDefToProxyURI：kind/addr 收敛，非法一律 null', () => {
+    expect(egressDefToProxyURI(clash)).toBe('http://127.0.0.1:7897')
+    expect(egressDefToProxyURI({ id: 'h', kind: 'https', addr: 'p.corp:8443' })).toBe('https://p.corp:8443')
+    expect(egressDefToProxyURI(undefined)).toBeNull()
+    expect(egressDefToProxyURI({ id: 's', kind: 'socks5', addr: '127.0.0.1:7897' })).toBeNull()
+    expect(egressDefToProxyURI({ id: 'e', kind: 'http', addr: '' })).toBeNull()
   })
 })
 

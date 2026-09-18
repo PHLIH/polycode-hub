@@ -107,7 +107,7 @@
 | `scan` | 只扫描本机可导入的 harness，不启动服务；`--json` 输出 JSON（`cli.ts:199-210`） |
 | `adopt [--id ID] <finding-key>` | 命令行采用某个 harness（如 `workbuddy / opencode-zen`），写入 `admin.db`（`cli.ts:214-240`） |
 | `zcode login` | ZCode OAuth 登录：浏览器授权，JWT **只打印一次，不保存**，需自行 export（`cli.ts:246-270`） |
-| `zcode sidecar <动作>` | 本地引擎管理：`install / setup / start / stop / status / login / ensure`（缺省 `ensure`，`cli.ts:271-320`）；`install` 支持 `--proxy <url>` / `--force`，无值读 `HTTPS_PROXY`（`:277-291`） |
+| `zcode sidecar <动作>` | 本地引擎管理：`install / setup / start / stop / status / login / ensure`（缺省 `ensure`，`cli.ts:271-320`）；`install`/`ensure` 支持 `--proxy <url>` 与 `--egress <id>` 指定下载出口，缺省自动复用项目 egress 配置（见 §10 下载代理） |
 
 启动方式：`npm start`（日常）；`npm run dev`（后端 `tsx watch` 热重启）；`./update.sh`（停旧服务 → 前端构建 → 起新服务 → 健康检查，日志 `data/gateway.log`）。
 
@@ -184,6 +184,10 @@ SQLite 持久化（`usage/store.ts`，schema v2，`user_version` 前向迁移，
 - `Sidecar` 句柄（`sidecar.ts:111-127`）：二进制缺省 `~/.polycode-hub/bin`，数据 `~/.zcode-proxy`，网关侧凭据引用 `config/credentials/zcode-proxy-key`（`cli.ts:137`），端口缺省 8080，工作目录 `config/zcode-proxy`（`cli.ts:138`）。
 - 真实功能：`install [--force]`（下载 GitHub release `TriDefender/zcode-api`，按平台选资产名，已存在跳过，`:132-160`）；`setupConfig`（写 127.0.0.1 + 24 字节 hex 随机 `sk-local-` key + start-plan，凭据 0600 落盘，`:167-188`）；`setPort/loadPort`（改/恢复 config.yaml port 行，端口 1024-65535，`:196-218`）；`start`（分离进程，日志 `logs/sidecar.log`，45s 探活，`:222-238`）；`stop`（按进程名 kill，`:256-270`）；`running`（打 `127.0.0.1:port/health` 带 key，`:274-288`）；`status`（running/installed/stopped/not installed）；`login`（仅交互提示并 spawn 二进制 `auth login zai`，不代持，`:315-331`）；`ensureReady`（装→配→起，下载重试 3 次）；`uninstall`（删二进制+key+config，运行时拒绝）。
 - HTTP 仅 `POST /:action=start|stop|setup|uninstall|ensure|port|endpoint` + `GET /` 状态（`sidecar_app.ts:44-64`）；`install / login` 走 CLI 不进 HTTP（`:60-61,169-171` 明示）；`endpoint` 只改 Provider baseUrl 且仅回环 host（`:133-168`）。
+- **下载代理（复用项目 egress 配置，不写死地址）**：release 查询与二进制下载都走 `resolveSidecarDownloadFetch`（`sidecar/httpproxy.ts`）决议出的 fetch，优先级：`--proxy` 显式值 → 显式 `--egress <id>` / `?egress=<id>`（不存在或不支持**点名抛错**，不静默换出口）→ Provider `zcode-plan-local` 的 `egress` 引用（脏引用 lenient 跳过）→ egress 表**仅一项时自动采用**（多个不猜，避免送错出口）→ `HTTPS_PROXY`/`ALL_PROXY` 环境变量 → darwin 系统代理（`scutil --proxy`）→ 直连。只认 http/https（ProxyAgent 不支持 socks5，Clash 混合端口用其 http 端口）。
+  - 管理面 `GET /` 与 `ensure` 回执都带 `downloadProxy`（**脱敏**，密码位打码）/`downloadProxySource`；`ensure` 失败时把「走了哪个代理 + 来源」写进错误信息——首次要下 ~66MB，直连卡住时不能再只给一个转圈的「安装中…」。
+  - 代理实现复用已有依赖 `undici` 的 `ProxyAgent`（与转发面同源，不新增依赖）；CLI 侧不再用 `setGlobalDispatcher` 全局污染（那是进程级副作用，改为按次注入 fetch）。
+  - 实测（2026-09-18，本机 egress `clash`=127.0.0.1:7897）：release `v4.6.7` / `zcode-proxy-darwin-arm64` 63.4MB 经代理下载成功，约 1.0 MB/s。修复前管理台 `ensure` 走全局 fetch 直连，同一网络下必然长时间卡住。
 - OAuth（`zcodeauth/index.ts`）：`TOKEN_BASE https://zcode.z.ai` / `LOGIN_BASE https://api.z.ai`；`startFlow`（`POST …/oauth/cli/init` 拿 flowID/authorizeURL）→ `pollFlow`（`GET …/poll/{flowID}` 等 ready，5 分钟有效）→ `resolveBusinessToken`（`POST …/api/auth/z/login` 换 business JWT）；JWT 只打印不落盘。
 
 ## 11. 本地项目管理器（与代理链路解耦）

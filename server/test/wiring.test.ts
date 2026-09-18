@@ -46,6 +46,108 @@ describe('sidecar 适配器（对齐 Go adminapi/sidecar_api.go）', () => {
     expect(b.custom).toBe(false) // endpoint == builtin
   })
 
+  test('GET / → 回显下载代理（复用 egress 配置，脱敏）', async () => {
+    // 项目 egress 表里只有 clash 一项 → 自动采用（不写死地址，来自项目配置）
+    const app = new Hono()
+    app.route('/admin/api/sidecar', createSidecarApp(
+      stubSidecar() as never,
+      { getByName: () => undefined, put: () => {} } as never,
+      () => {}, fetch, { list: () => [{ id: 'clash', kind: 'http', addr: '127.0.0.1:7897' }] }))
+    const b = await (await app.request('/admin/api/sidecar')).json() as Record<string, unknown>
+    expect(b.downloadProxy).toBe('http://127.0.0.1:7897')
+    expect(b.downloadProxySource).toBe('egress-auto:clash')
+  })
+
+  test('POST ensure → 下载 fetch 走项目 egress 代理（回归锚点）', async () => {
+    // 这是本次真实缺陷的锚点：管理台「一键安装」以前用全局 fetch 直连，
+    // 国内网络下 66MB 的 github release 必然超时，页面永远转「安装中…」。
+    // 断言：传给 ensureReady 的 fetch 必须是「经 egress 代理」的那个，
+    // 且代理解析不出来时绝不静默直连（这里代理来自项目 egress 表）。
+    let seenFetch: unknown
+    const svc = stubSidecar({
+      ensureReady: async (_dir: string, opts: { fetch?: unknown } = {}) => { seenFetch = opts.fetch },
+    })
+    const app = new Hono()
+    app.route('/admin/api/sidecar', createSidecarApp(
+      svc as never,
+      { getByName: () => undefined, put: () => {} } as never,
+      () => {}, fetch, { list: () => [{ id: 'clash', kind: 'http', addr: '127.0.0.1:7897' }] }))
+    const res = await app.request('/admin/api/sidecar/ensure', { method: 'POST' })
+    expect(res.status).toBe(200)
+    const b = await res.json() as Record<string, unknown>
+    expect(b.downloadProxy).toBe('http://127.0.0.1:7897')
+    expect(b.downloadProxySource).toBe('egress-auto:clash')
+    // 关键：注入的是代理 fetch（不是全局 fetch 本身）
+    expect(seenFetch).toBeTypeOf('function')
+    expect(seenFetch).not.toBe(fetch)
+  })
+
+  test('POST ensure?egress=<id>：显式指定出口；不存在 → 400 点名', async () => {
+    let seenFetch: unknown
+    const svc = stubSidecar({
+      ensureReady: async (_dir: string, opts: { fetch?: unknown } = {}) => { seenFetch = opts.fetch },
+    })
+    const app = new Hono()
+    app.route('/admin/api/sidecar', createSidecarApp(
+      svc as never,
+      { getByName: () => undefined, put: () => {} } as never,
+      () => {}, fetch, {
+        list: () => [
+          { id: 'clash', kind: 'http', addr: '127.0.0.1:7897' },
+          { id: 'corp', kind: 'http', addr: '10.0.0.9:8888' },
+        ],
+      }))
+    // 多项时默认不猜 → 直连；显式指定才走对应出口
+    const ok = await app.request('/admin/api/sidecar/ensure?egress=corp', { method: 'POST' })
+    expect(ok.status).toBe(200)
+    const b = await ok.json() as Record<string, unknown>
+    expect(b.downloadProxy).toBe('http://10.0.0.9:8888')
+    expect(b.downloadProxySource).toBe('egress:corp')
+    expect(seenFetch).not.toBe(fetch)
+    // 不存在的 id → 400（不静默换出口）
+    const bad = await app.request('/admin/api/sidecar/ensure?egress=ghost', { method: 'POST' })
+    expect(bad.status).toBe(400)
+    expect((await bad.json() as { error: { message: string } }).error.message).toContain('egress "ghost" 不存在')
+  })
+
+  test('POST ensure 失败 → 500 带上下载代理与来源（可解释的报错）', async () => {
+    const svc = stubSidecar({
+      ensureReady: async () => { throw new Error('下载失败: http 502') },
+    })
+    const app = new Hono()
+    app.route('/admin/api/sidecar', createSidecarApp(
+      svc as never,
+      { getByName: () => undefined, put: () => {} } as never,
+      () => {}, fetch, { list: () => [{ id: 'clash', kind: 'http', addr: '127.0.0.1:7897' }] }))
+    const res = await app.request('/admin/api/sidecar/ensure', { method: 'POST' })
+    expect(res.status).toBe(500)
+    const msg = (await res.json() as { error: { message: string } }).error.message
+    expect(msg).toContain('下载失败')
+    expect(msg).toContain('http://127.0.0.1:7897') // 排障要知道走了哪个代理
+  })
+
+  test('Provider 配了 egress 时，下载复用该出口（项目配置优先于自动采用）', async () => {
+    let seenFetch: unknown
+    const svc = stubSidecar({
+      ensureReady: async (_dir: string, opts: { fetch?: unknown } = {}) => { seenFetch = opts.fetch },
+    })
+    const app = new Hono()
+    app.route('/admin/api/sidecar', createSidecarApp(
+      svc as never,
+      { getByName: () => ({ baseUrl: 'http://127.0.0.1:8080', egress: 'corp' }), put: () => {} } as never,
+      () => {}, fetch, {
+        list: () => [
+          { id: 'clash', kind: 'http', addr: '127.0.0.1:7897' },
+          { id: 'corp', kind: 'http', addr: '10.0.0.9:8888' },
+        ],
+      }))
+    const b = await (await app.request('/admin/api/sidecar/ensure', { method: 'POST' }))
+      .json() as Record<string, unknown>
+    expect(b.downloadProxySource).toBe('provider-egress:corp')
+    expect(b.downloadProxy).toBe('http://10.0.0.9:8888')
+    expect(seenFetch).not.toBe(fetch)
+  })
+
   test('POST start/stop/setup：setup 不回显 key 全文', async () => {
     const app = sidecarHarness()
     expect((await app.request('/admin/api/sidecar/start', { method: 'POST' })).status).toBe(200)

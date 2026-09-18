@@ -322,10 +322,18 @@ function gotoProviders() {
     <p v-if="sc && sc.endpoint" class="field-hint">
       引擎地址：<code>{{ sc.endpoint }}</code>（{{ sc.custom ? '自定义 —— 网关直接指向该地址，内置引擎不受影响' : '内置引擎' }}）
     </p>
+    <!-- 下载走哪个代理要看得见：首次要下 ~66MB 的 release，直连会卡很久，
+         只给一个转圈的「安装中…」用户没法判断是慢还是死了。 -->
+    <p v-if="sc && sc.downloadProxy" class="field-hint">
+      下载代理：<code>{{ sc.downloadProxy }}</code>
+      <span class="dim">（{{ sc.downloadProxySource === 'direct'
+        ? '直连 —— 国内网络可能很慢，可在 Providers 页配置出口代理'
+        : '来源 ' + sc.downloadProxySource }}）</span>
+    </p>
     <p class="field-hint">
       引擎是本机运行的官方社区工具（TriDefender/zcode-proxy），负责 ZCode 免费额度的验证与转发。
       首次使用：安装 → 配置 → 启动 → 在终端跑一次 <code>polycode-hub zcode sidecar login</code> 完成授权。
-      二进制从其 GitHub Releases 下载，不由本仓分发。
+      二进制从其 GitHub Releases 下载（约 66MB），不由本仓分发；下载自动复用项目配置的出口代理。
     </p>
     <details class="api-spec">
       <summary>自定义引擎的接口格式（Anthropic 兼容）</summary>
