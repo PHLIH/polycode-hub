@@ -129,7 +129,7 @@
 - egresses：`GET /admin/api/egresses`，`PUT /admin/api/egresses/:id`（body `{kind:http|https, addr}`），`DELETE`（`api.ts:146-170`）。
 - providers：`GET` 列表，`POST` 新建（`parse.ts` 收敛解析 + `providerValidate`，冲突 409），`PATCH /:id`（白名单 `enabled/priority/streamOnly/displayName/riskNote/credential/models/probeModel/egress/headers`，models 只增不减，headers 整包替换/空对象清空），`DELETE /:id`（builtin 禁删 403，成功 204）。
 - accounts：`GET /admin/api/accounts`（DB + 池内冷却/连败合并，过期冷却复位），`POST` 新建（id/providerId 必填，归属 Provider 必须存在；重名 409；新建只许 available/disabled），`PATCH /:id`（白名单 status/displayName/credential/weight），`DELETE /:id`，`POST /:id/recheck`（零上游成本，只清惩罚），`POST /:id/test`（真实请求，可传 `{model}`，成功清冷却归零），`POST /:id/checkin`（WorkBuddy 自动登录：账号页「签到」按钮，只认一键导入/import-account 打标的 importSource=workbuddy 账号；用导入登录态调上游每日签到，一天一次，不自动重试）。
-- 模型：`POST /providers/:id/test`（最小真实请求），`POST /providers/:id/scan`（探到协议写回），`POST /providers/:id/refresh-fingerprint`（Zen 指纹刷新：读本机新鲜会话写回静态头；本地无新鲜会话时返回 next 重登指引，见 `discover/zen_refresh.ts`），`PUT /providers/:id/models/:model/{protocol,egress,note,enabled}`（note 限 200 字，空串删字段），`DELETE /providers/:id/models/:model`（PATCH 删不掉故独立端点），`GET /providers/:id/models`（lister 报错转 502）。
+- 模型：`POST /providers/:id/test`（最小真实请求），`POST /providers/:id/scan`（探到协议写回），`POST /providers/:id/refresh-fingerprint`（Zen 指纹刷新：读本机新鲜会话写回静态头；本地无新鲜会话时返回 next 重登指引，见 `discover/zen_refresh.ts`），`PUT /providers/:id/models/:model/{protocol,egress,note,enabled,reasoning-min-tokens}`（note 限 200 字，空串删字段；reasoning-min-tokens 为高档位最低预算，只管 xhigh/max 两档，值域 1-200000，`{}` 清掉整张映射），`DELETE /providers/:id/models/:model`（PATCH 删不掉故独立端点），`GET /providers/:id/models`（lister 报错转 502）。
 - stats：`GET /admin/api/stats`（全量），`GET /admin/api/breakdown?days|since|until&account_id`（默认 365 天），`GET /admin/api/usage/accounts`（账号维度）。
 - discover（`discover_api.ts`）：`GET /admin/api/discover`（未接线返回空列表），`POST /discover/adopt {key,id?}`（须 ready 否则 400，幂等），`POST /discover/import-account`（必填 key/tokenPath/accountId/credentialFile，服务端 0600 落盘，token 不经前端；workbuddy 导入打 `importSource` + uid + token 指纹标记，账号页才显示「签到」），`POST /discover/quick-import {key}`（全量导入存活登录态，同样打标记）。
 - sidecar / projects 以 Hono 子应用注入（`api.ts:646-653`），未注入对应端点 501。
@@ -145,6 +145,25 @@
 | `opencode-zen` | 连通探针 `GET {base}/v1/models` 带 `Bearer public`（`checkZen:264-297`），200 即 ready；默认 `https://opencode.ai/zen`。 |
 
 一键导入的 Provider 草稿：WorkBuddy（`wb-auto`，openai-completions，`copilot.tencent.com/v2`，`headers X-Product/X-Domain`，模型 `hy3-preview`）与 Zen（`zen-auto`，openai-completions，`zen/v1`，会话头 `x-opencode-session`/`x-opencode-request`（+ 兼容旧 `x-session-id`/`x-session-affinity`），模型 `mimo-v2.5-free` / `nemotron-3-ultra-free`）——见 `discover/index.ts:136-148,243-261`。注意：① `x-opencode-*` 四件套是官方客户端本来就发的（2026-09-18 真机取证；旧“毒头”结论已推翻，见 `router/upstream.ts applyZenFingerprint`），上游 2026-09 起要求 `x-opencode-session`，网关按取证原样发送，会话过期由指纹刷新自动续（`discover/zen_refresh.ts`：转发失败自愈重试 + 启动刷新 + 管理台手动刷新；本地无新鲜会话如实返回重登指引）；② UA 网关不内置版本号（通用项目不写死个人环境版本）：opencode 做客户端时透传它的真 UA，其他客户端配 Provider 静态头或 `ZEN_UA` 环境变量，优先级 静态 > 透传 > `ZEN_UA`，全无则如实不发。
+
+### 免费档限流口径：按**会话**而非 IP（2026-09-18 实测修正）
+
+历史文档写「免费档按 IP 限速」，**结论有误，已推翻**。取证：
+
+- 同一会话连打十轮 xhigh 必 429（`rate_limit_exceeded`）；
+- 本机 opencode 开多个窗口（每窗口一个新会话）同 IP 打出同一模型，一点事没有；
+- 网关连发 429 时，换个 `x-opencode-session` 立即恢复。
+
+两侧出口同为 `clash` 代理（同一 IP），故限流维度是 `x-opencode-session`。
+
+**网关对策（会话池轮换）**：
+
+- `x-polycode-session-pool`（网关自定义头，上游不认识）：`discover` 从本机 opencode 日志收**全部**真实会话（实测 227 个），取最近 16 个、**新→旧**排列写入——越新的会话配额窗口越干净（`parseAllFingerprintsFromLog` / `discoverAllOpenCodeFingerprints`，`model.parseZenSessionPool` / `writeZenSessionPool`）。
+- 转发侧**首打池首主会话**（最新那个），撞 429 才在**本请求副本内**顺序换下一个重打（最多 min(池长, 4) 个不同会话，不占用瞬时重试额度，并发隔离、池头永不上 wire），日志前缀 `[zen-pool]`（`upstream.ts zenSessionPoolOf/shiftZenSessionHeaders`）。刻意不用逐请求预防性轮换：每请求换一个只会把所有会话的配额窗口同时打满，还破坏上游按会话的亲和性。
+- 实测：换会话立即恢复（429 转成功）；`[zen-pool]` 只在真撞 429 时触发。
+- 池只有 1 个会话时行为等同旧版（不轮换，429 原样上报）。
+
+**运维含义**：会话是稀缺资源（一次 `opencode run` 产一个）。本机跑过的客户端越多，池越厚、越抗限流；长期不开客户端则池停止更新，旧会话配额窗口会越用越紧——届时跑一次 `opencode run "hi"` 再刷新指纹即可续上。
 
 ## 9. 用量统计口径
 
@@ -205,6 +224,7 @@ npm run typecheck  # tsc --noEmit
 - **未声明 models 的 Provider 视为透明代理**，接受任意模型（`scheduler.ts:36-40`）。
 - **手填模型默认纯文本**：`input` 缺省 `['text']`（`config/index.ts:271`）；支持图片须显式声明，未声明时发出请求前拒绝并点名。
 - **失败账**：全部候选失败记一笔 tokens 为 0 的失败账，这是流式失败唯一的落账点（`proxy.ts:246-258`）。
+- **高档位最低预算**：模型 `reasoning_min_tokens: {"xhigh": 128000, "max": 200000}`（`PUT /admin/api/providers/:id/models/:model/reasoning-min-tokens`，值域 1-200000）。只管 xhigh/max 两档、只托底不封顶——客户端值低于该档下限时抬到下限（防推理吃光预算导致截断/无工具），高于下限或没给值时不动，其他档位一律不动；探针同样走下限，避免把“预算不足”误报成“源不可用”。托底时记 `[floor]` 日志，入站原文记 `[inbound]` 日志（含 `maxTokens/tools/toolChoice/reasoning`，不记正文）。
 
 ## 15. 许可证
 

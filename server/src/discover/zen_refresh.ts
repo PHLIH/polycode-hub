@@ -10,14 +10,20 @@
 
 import { readFileSync } from 'node:fs'
 import {
-  discoverOpenCodeFingerprint, latestSessionMessageId,
+  discoverAllOpenCodeFingerprints, discoverOpenCodeFingerprint, latestSessionMessageId,
+  type OpenCodeFingerprint,
 } from './index.ts'
 import {
-  findHeaderKey, isZenBaseUrl, mintZenRequestId, validZenToken,
+  findHeaderKey, isZenBaseUrl, mintZenRequestId, validZenToken, parseZenSessionPool,
+  writeZenSessionPool,
   ZEN_REQUEST_HEADER, ZEN_SESSION_HEADER,
   type Provider,
 } from '../model/index.ts'
 import type { FingerprintRefreshReport } from '../adminapi/types.ts'
+
+// 会话池头与读写工具由 model 层定义（discover 写入、router 轮换取用），
+// 这里重导出以保持既有 import 路径可用。
+export { ZEN_SESSION_POOL_HEADER, parseZenSessionPool, writeZenSessionPool } from '../model/index.ts'
 
 // 需要的最小 store 形状（SQLite/Memory 两实现都满足；测试可传桩）。
 export interface ZenProviderStore {
@@ -46,9 +52,15 @@ export function refreshZenProvider(
   if (!isZenBaseUrl(p.baseUrl)) {
     return { ...base, detail: `非 Zen 上游（${p.baseUrl}），无需刷新指纹` }
   }
-  const fp = discoverOpenCodeFingerprint(openCodeDirs)
+  // 会话池：本机近期真实用过的全部会话（旧→新），最新那个当主会话。
+  // 兼容旧行为：没有任何会话时按老路径返回指引。
+  const pool = discoverAllOpenCodeFingerprints(openCodeDirs)
+  const fp: OpenCodeFingerprint | undefined = pool[pool.length - 1]
   if (!fp) {
-    return { ...base, detail: '本机没有可用的 opencode 会话', next: NO_LOCAL_FINGERPRINT_NEXT }
+    const none = discoverOpenCodeFingerprint(openCodeDirs)
+    return none
+      ? { ...base, detail: '本机没有可用的 opencode 会话' }
+      : { ...base, detail: '本机没有可用的 opencode 会话', next: NO_LOCAL_FINGERPRINT_NEXT }
   }
   const h: Record<string, string> = { ...(p.headers ?? {}) }
   const curKey = findHeaderKey(h, ZEN_SESSION_HEADER)
@@ -69,27 +81,37 @@ export function refreshZenProvider(
   const uaKey = findHeaderKey(h, 'user-agent')
   const curUA = ((uaKey !== undefined ? h[uaKey] : undefined) ?? '').trim()
   const uaStale = uaVersion(curUA) !== fp.version
-  if (cur === fp.sessionID && hasValidRequest(h) && !uaStale) {
-    return { ...base, detail: `已是最新（与本机会话 ${fp.sessionID} 一致），无需刷新` }
+  // 池内容（新→旧）：最近用的会话排首位，首打就用它（配额窗口最干净）；
+  // 撞 429 才在请求副本内顺序换下一个重打（见 router/upstream.ts streamWith）。
+  // 刻意不用“逐请求预防性轮换”：每请求换一个只会把所有会话的窗口同时打满，
+  // 还破坏上游按会话的亲和性。
+  const poolIDs = pool.map((x) => x.sessionID).reverse()
+  const oldPool = parseZenSessionPool(h)
+  const poolChanged = oldPool.join(',') !== poolIDs.join(',')
+  const primary = poolIDs[0] ?? fp.sessionID
+  if (cur === primary && hasValidRequest(h) && !uaStale && !poolChanged) {
+    return { ...base, detail: `已是最新（与本机会话 ${primary} 一致，池 ${poolIDs.length} 个），无需刷新` }
   }
-  const sessionChanged = cur !== fp.sessionID
-  setHeader(h, ZEN_SESSION_HEADER, fp.sessionID)
+  const sessionChanged = cur !== primary
+  setHeader(h, ZEN_SESSION_HEADER, primary)
   setHeader(h, ZEN_REQUEST_HEADER, msg)
+  writeZenSessionPool(h, poolIDs)
   let uaNote = ''
   if (uaStale) {
     setHeader(h, 'User-Agent', fp.userAgent)
     uaNote = `；UA 已同步为 ${fp.userAgent}`
   }
   // 旧版 x-session-id/affinity 若还在（历史配置），同步跟上——它们是晋升路径的输入。
-  if (findHeaderKey(h, 'x-session-id') !== undefined) setHeader(h, 'x-session-id', fp.sessionID)
-  if (findHeaderKey(h, 'x-session-affinity') !== undefined) setHeader(h, 'x-session-affinity', fp.sessionID)
+  if (findHeaderKey(h, 'x-session-id') !== undefined) setHeader(h, 'x-session-id', primary)
+  if (findHeaderKey(h, 'x-session-affinity') !== undefined) setHeader(h, 'x-session-affinity', primary)
   p.headers = h
   store.put(p)
   notify()
   return {
     ...base, updated: true, sessionChanged,
-    detail: `已更新为本机会话 ${fp.sessionID}（来自 ${fp.logPath}` +
-      `${fp.modelID ? `，该会话用过 ${fp.modelID}` : ''}）${uaNote}`,
+    detail: `已更新为本机会话 ${primary}（来自 ${fp.logPath}` +
+      `${fp.modelID ? `，该会话用过 ${fp.modelID}` : ''}）` +
+      `${poolIDs.length > 1 ? `；会话池 ${poolIDs.length} 个可轮换` : ''}${uaNote}`,
   }
 }
 

@@ -41,6 +41,10 @@ function parseModel(v: unknown): Model | undefined {
   if (typeof v.displayName === 'string') m.displayName = v.displayName
   if (typeof v.note === 'string' && v.note !== '') m.note = v.note
   if (typeof v.egress === 'string' && v.egress !== '') m.egress = v.egress
+  // 高档位下限非法值原样保留，由 providerValidate 点名报错。
+  if (v.reasoningMinTokens !== undefined && v.reasoningMinTokens !== null && typeof v.reasoningMinTokens === 'object' && !Array.isArray(v.reasoningMinTokens)) {
+    m.reasoningMinTokens = { ...(v.reasoningMinTokens as Record<string, number>) }
+  }
   if (typeof v.contextWindow === 'number') m.contextWindow = v.contextWindow
   if (typeof v.maxOutputTokens === 'number') m.maxOutputTokens = v.maxOutputTokens
   const input = strArr(v.input)

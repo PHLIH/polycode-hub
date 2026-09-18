@@ -75,6 +75,11 @@ export interface Model {
   input?: string[] // ["text"] 或 ["text","image"]
   api?: Protocol // 覆盖 Provider 级 api（空 = 继承）
   egress?: string // 覆盖 Provider 级出口代理（空 = 继承；EGRESS-SPIKE §7 粒度拍板：精确到模型）
+  // 高档位最低预算：只认 xhigh / max 两键（档位名小写），其他键忽略。
+  // 只托底不封顶——客户端 maxTokens 低于该档下限时抬到下限（防推理吃光预算导致
+  // 截断、无工具）；高于下限或没给值时不动（保持省略语义，不替上游默认档做主）。
+  // 例：{xhigh: 128000, max: 200000}。空/缺省 = 不干预。
+  reasoningMinTokens?: Record<string, number>
   // 备注：一句话运维知识（如「23 点后才免费，白天用会扣额度」）。
   // 与 displayName 分工不同——displayName 是"叫什么"，note 是"要注意什么"。
   note?: string
@@ -84,6 +89,45 @@ export interface Model {
 
 export function modelEffAPI(m: Model, providerAPI: Protocol): Protocol {
   return m.api ? m.api : providerAPI
+}
+
+// 高档位预算上限：映射值超过即拒绝写入（防手滑多写个 0）。
+export const REASONING_MIN_TOKENS_MAX = 200000
+
+// 只认 xhigh / max 两档（大小写不敏感），其他档位一律不触发。
+export function reasoningFloorFor(effort: string | undefined, m: Model | undefined): number | undefined {
+  const eff = (effort ?? '').trim().toLowerCase()
+  if (eff !== 'xhigh' && eff !== 'max') return undefined
+  const floor = m?.reasoningMinTokens?.[eff]
+  if (floor === undefined || floor <= 0) return undefined
+  return floor
+}
+
+// 高档位最低预算收敛：对象形态，键收小写、值须为 (0, 200000] 的正整数。
+// 非 xhigh/max 的键保留（写入时不拦，应用时忽略）；空/非法返回 undefined。
+export function sanitizeReasoningMinTokens(v: unknown): Record<string, number> | undefined {
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return undefined
+  const out: Record<string, number> = {}
+  for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+    const key = k.trim().toLowerCase()
+    if (key === '' || key.length > 32) return undefined
+    if (typeof val !== 'number' || !Number.isSafeInteger(val) || val <= 0 || val > REASONING_MIN_TOKENS_MAX) return undefined
+    out[key] = val
+  }
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
+// 高档位最低预算应用到待发请求（只托底）：生效档位是 xhigh/max 之一、
+// 映射里有下限、且客户端给了正值 maxTokens 但低于下限时，抬到下限。
+// 高于下限、没给值、无映射，一律原样返回（同一引用，便于调用方判定“没动过”）。
+export function applyReasoningFloor<T extends { reasoningEffort?: string; maxTokens?: number }>(
+  req: T, m: Model | undefined,
+): T {
+  const floor = reasoningFloorFor(req.reasoningEffort, m)
+  if (floor === undefined) return req
+  if (req.maxTokens === undefined || req.maxTokens === 0) return req
+  if (req.maxTokens >= floor) return req
+  return { ...req, maxTokens: floor }
 }
 
 export function supportsImage(m: Model): boolean {
@@ -176,6 +220,11 @@ export function providerValidate(p: Provider): string | undefined {
     return `provider ${p.name}: api "${p.api}" 非法（空 = 自动探测；可选 anthropic-messages / openai-completions / openai-responses）`
   }
   if (!p.baseUrl) return `provider ${p.name}: base_url 不能为空`
+  for (const m of p.models ?? []) {
+    if (m.reasoningMinTokens !== undefined && sanitizeReasoningMinTokens(m.reasoningMinTokens) === undefined) {
+      return `provider ${p.name} 模型 ${m.id}: reasoning_min_tokens 非法（须为{"xhigh"|"max": 1-${REASONING_MIN_TOKENS_MAX} 的正整数}，如 {"xhigh": 128000}）`
+    }
+  }
   if (p.dynamicHeaders) {
     if (!p.dynamicHeaders.command) {
       return `provider ${p.name}: dynamic_headers.command 不能为空`
@@ -305,6 +354,14 @@ export const ZEN_CLIENT_HEADER = 'x-opencode-client'
 export const ZEN_PROJECT_HEADER = 'x-opencode-project'
 export const ZEN_REQUEST_HEADER = 'x-opencode-request'
 export const ZEN_SESSION_HEADER = 'x-opencode-session'
+// 会话池头（网关自定义，上游不认识）：本机近期真实用过的全部会话，逗号分隔、新→旧。
+// 免费档限流按会话算（2026-09-18 实测），撞 429 时在池内换会话重打；定义放这里供
+// discover（写入池）与 router（轮换取用）共用，避免两侧反向依赖。
+export const ZEN_SESSION_POOL_HEADER = 'x-polycode-session-pool'
+export const ZEN_POOL_MAX = 16
+
+// 内网头：发往上游前必须剥掉（buildHeaders 统一处理）。池是网关内部
+// 轮换用的，一次把全部会话明文发给上游既无用又扩散登录态。
 
 export const ZEN_DEFAULT_CLIENT = 'cli'
 export const ZEN_DEFAULT_PROJECT = 'global'
@@ -329,6 +386,33 @@ export function findHeaderKey(h: Record<string, string>, name: string): string |
 // 会话 token 白名单（与 upstream 一致：字母数字/_/-，≤128）。
 export function validZenToken(s: string): boolean {
   return /^[A-Za-z0-9_-]{1,128}$/.test(s)
+}
+
+// 解析会话池头 → 会话列表（去重、白名单过滤、保序、限长）。
+// 保序：池内顺序 = 使用优先级（队首最优先）。写入方按新鲜度排列。
+export function parseZenSessionPool(h: Record<string, string>): string[] {
+  const k = findHeaderKey(h, ZEN_SESSION_POOL_HEADER)
+  const raw = (k !== undefined ? h[k] : undefined) ?? ''
+  const out: string[] = []
+  for (const part of raw.split(',')) {
+    const s = part.trim()
+    if (!validZenToken(s) || out.includes(s)) continue
+    out.push(s)
+    if (out.length >= ZEN_POOL_MAX) break
+  }
+  return out
+}
+
+// 写会话池头（空列表 = 删掉池头）。
+export function writeZenSessionPool(h: Record<string, string>, sessions: string[]): void {
+  const k = findHeaderKey(h, ZEN_SESSION_POOL_HEADER)
+  const clean = sessions.filter((s) => validZenToken(s)).slice(0, ZEN_POOL_MAX)
+  if (clean.length === 0) {
+    if (k !== undefined) delete h[k]
+    return
+  }
+  if (k !== undefined) h[k] = clean.join(',')
+  else h[ZEN_SESSION_POOL_HEADER] = clean.join(',')
 }
 
 // 把指纹会话落实为 x-opencode-* 四件套（纯函数，就地改 h 并返回是否写过）：

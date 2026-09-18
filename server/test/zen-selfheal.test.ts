@@ -11,9 +11,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Hono } from 'hono'
 import {
-  isZenBaseUrl, mintZenRequestId, zenHeadersWithFingerprint,
+  isZenBaseUrl, mintZenRequestId, parseZenSessionPool, zenHeadersWithFingerprint,
 } from '../src/model/index.ts'
-import { latestSessionMessageId } from '../src/discover/index.ts'
+import { latestSessionMessageId, parseAllFingerprintsFromLog } from '../src/discover/index.ts'
 import {
   NO_LOCAL_FINGERPRINT_NEXT, refreshAllZenProviders, refreshZenProvider,
 } from '../src/discover/zen_refresh.ts'
@@ -21,6 +21,7 @@ import { createAdminApi } from '../src/adminapi/index.ts'
 import { MemoryAccountStore, MemoryProviderStore } from '../src/adminapi/store.ts'
 import { Proxy } from '../src/gateway/proxy.ts'
 import { Scheduler } from '../src/router/scheduler.ts'
+import { Upstream, nextZenSession, resetZenPoolCursor, shiftZenSession, shiftZenSessionHeaders } from '../src/router/upstream.ts'
 import { UpstreamError, UPSTREAM } from '../src/ir/index.ts'
 import type { Config } from '../src/config/index.ts'
 import type { Provider } from '../src/model/index.ts'
@@ -137,9 +138,15 @@ describe('refreshZenProvider', () => {
   test('已是最新则不写不断言；本地无会话则给重登指引', () => {
     const dir = writeLogDir(mkdtempSync(join(tmpdir(), 'zenfp-')), FP_LOG)
     try {
+      // 会话池头也要在才算“全齐”——池是新增维度（限流按会话算，多会话轮换），
+      // 缺了它会补写一次，见下方“池补齐”用例。
       const store = new MemoryProviderStore([zenProvider({
         // UA 也要对上版本才算“最新”（网关权威后客户端 UA 不再补充，见下组测试）
-        headers: { 'User-Agent': 'opencode/1.18.29', 'x-opencode-session': SESSION, 'x-opencode-request': 'msg_0b209c3fc001LViMJFLn53xddn' },
+        headers: {
+          'User-Agent': 'opencode/1.18.29', 'x-opencode-session': SESSION,
+          'x-opencode-request': 'msg_0b209c3fc001LViMJFLn53xddn',
+          'x-polycode-session-pool': SESSION,
+        },
       })])
       const id = store.list()[0]!.providerId
       let notified = 0
@@ -369,6 +376,183 @@ describe('refreshZenProvider 同步 UA（网关权威后客户端 UA 不再补�
       expect(store.get(id)!.headers?.['User-Agent']).toBe('opencode/1.19.0')
     } finally {
       rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+// 会话池（2026-09-18 实测缺陷）：zen 免费档限流按 x-opencode-session 算，
+// 不是按 IP——同一会话连打十轮 xhigh 必 429，而本机 opencode 多窗口没事。
+// 网关把本机全部真实会话收进池轮换，等效多窗口。
+describe('会话池：收集本机全部会话并轮换', () => {
+  const S1 = 'ses_aaaa1111bbbb2222cccc3333'
+  const S2 = 'ses_dddd4444eeee5555ffff6666'
+  const POOL_LOG = [
+    `timestamp=2026-09-18T00:00:01Z level=INFO message=created id=${S1} slug=x version=1.18.29 projectID=global directory=/private/tmp path=private/tmp`,
+    `timestamp=2026-09-18T00:00:03Z level=INFO message=stream providerID=opencode modelID=mimo-v2.5-free session.id=${S1} small=false`,
+    `timestamp=2026-09-18T00:10:01Z level=INFO message=created id=${S2} slug=y version=1.18.29 projectID=global directory=/private/tmp path=private/tmp`,
+    `timestamp=2026-09-18T00:10:03Z level=INFO message=stream providerID=opencode modelID=mimo-v2.5-free session.id=${S2} small=false`,
+  ].join('\n')
+
+  test('parseAllFingerprintsFromLog：收全部会话、去重、保序（旧→新）', () => {
+    const all = parseAllFingerprintsFromLog(POOL_LOG)
+    expect(all.map((x) => x.sessionID)).toEqual([S1, S2])
+    // 重复出现不重复收
+    expect(parseAllFingerprintsFromLog(POOL_LOG + '\n' + POOL_LOG.split('\n')[0]).length).toBe(2)
+  })
+
+  test('刷新写入池头（新→旧），x-opencode-session = 最新那个', () => {
+    const dir = writeLogDir(mkdtempSync(join(tmpdir(), 'zenpool-')), POOL_LOG)
+    try {
+      const store = new MemoryProviderStore([zenProvider({ headers: {} })])
+      const id = store.list()[0]!.providerId
+      const rep = refreshZenProvider(store, () => {}, id, [dir])
+      expect(rep.updated).toBe(true)
+      const h = store.get(id)!.headers ?? {}
+      expect(h['x-opencode-session']).toBe(S2) // 最新那个当主会话
+      // 池按新→旧：最新的排首位（配额窗口最干净，轮换从它开始）
+      expect(parseZenSessionPool(h)).toEqual([S2, S1])
+      expect(rep.detail).toContain('会话池 2 个')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('parseZenSessionPool：白名单过滤脏值、去重、保序', () => {
+    expect(parseZenSessionPool({ 'x-polycode-session-pool': `${S1}, ${S1}, bad value!, ${S2}` }))
+      .toEqual([S1, S2])
+    expect(parseZenSessionPool({})).toEqual([])
+    expect(parseZenSessionPool({ 'X-Polycode-Session-Pool': S1 })).toEqual([S1]) // 头名大小写不敏感
+  })
+
+  test('shiftZenSession：把指定会话提到池首并同步 x-opencode-session', () => {
+    const p = zenProvider({ headers: { 'x-polycode-session-pool': `${S1},${S2}`, 'x-opencode-session': S1 } })
+    shiftZenSession(p, S2)
+    expect(parseZenSessionPool(p.headers!)).toEqual([S2, S1])
+    expect(p.headers!['x-opencode-session']).toBe(S2)
+    // 不在池里的会话不动（防凭空的会话被塞进去）
+    const q = zenProvider({ headers: { 'x-polycode-session-pool': `${S1},${S2}` } })
+    shiftZenSession(q, 'ses_zzzz')
+    expect(parseZenSessionPool(q.headers!)).toEqual([S1, S2])
+  })
+
+  test('nextZenSession：池内轮转；无池返回 undefined', () => {
+    resetZenPoolCursor()
+    const p = zenProvider({ headers: { 'x-polycode-session-pool': `${S1},${S2}` } })
+    expect(nextZenSession(p)).toBe(S1)
+    expect(nextZenSession(p)).toBe(S2)
+    expect(nextZenSession(p)).toBe(S1) // 回到队首
+    resetZenPoolCursor()
+    expect(nextZenSession(zenProvider({ headers: {} }))).toBeUndefined()
+  })
+
+  test('shiftZenSessionHeaders：只动传入副本，不碰原引用（并发隔离）', () => {
+    const headers = { 'x-polycode-session-pool': `${S1},${S2}`, 'x-opencode-session': S1 }
+    const snap = { ...headers }
+    shiftZenSessionHeaders(headers, [S1, S2], S2)
+    expect(parseZenSessionPool(headers)).toEqual([S2, S1])
+    expect(headers['x-opencode-session']).toBe(S2)
+    expect(snap).toEqual({ 'x-polycode-session-pool': `${S1},${S2}`, 'x-opencode-session': S1 })
+  })
+
+  test('buildHeaders：池头永不上 wire（内网轮换用）', () => {
+    const up = new Upstream({ credLookup: () => ['', false] })
+    const p = zenProvider({
+      api: 'openai-completions',
+      headers: {
+        'x-polycode-session-pool': `${S1},${S2}`,
+        'x-opencode-session': S1,
+        'x-opencode-request': 'msg_aaaaaaaaaaaaaaaaaaaaaaaa',
+      },
+    })
+    const h = (up as unknown as {
+      buildHeaders(p: Provider, s: boolean, d: null, proto: 'openai-completions'): Record<string, string>
+    }).buildHeaders(p, true, null, 'openai-completions')
+    expect(Object.keys(h).some((k) => k.toLowerCase() === 'x-polycode-session-pool')).toBe(false)
+    expect(h['x-opencode-session']).toBe(S1) // 主会话照常发出
+    // 库内那份原样保留（发一次不丢池）
+    expect(parseZenSessionPool(p.headers!)).toEqual([S1, S2])
+  })
+
+  test('429 换会话重试：首打主会话，撞 429 换下一个成功，且不污染库内 Provider', async () => {
+    const seen: string[] = []
+    const { startOneShot } = await import('./helpers/one-shot-server.ts')
+    const okSSE = 'event: message_start\ndata: {"type":"message_start"}\n\n'
+    let n = 0
+    const { server: sx, base } = await startOneShot((_req, res) => {
+      n++
+      if (n === 1) {
+        res.writeHead(429, { 'content-type': 'application/json' })
+        res.end('{"error":{"message":"rate_limit_exceeded"}}')
+        return
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(okSSE)
+    })
+    try {
+      const up = new Upstream({ credLookup: () => ['', false] })
+      const orig = zenProvider({
+        // isZenUpstream 只认 opencode.ai 域名：用 127.0.0.1 + 池会走“非 zen”分支；
+        // 这里用 http://s1.opencode.ai 域名并劫持 fetch，把 host 指回本地桩。
+        baseUrl: 'https://s1.opencode.ai/zen/v1', api: 'openai-completions',
+        headers: {
+          'x-polycode-session-pool': `${S1},${S2}`,
+          'x-opencode-session': S1,
+          'x-opencode-request': 'msg_aaaaaaaaaaaaaaaaaaaaaaaa',
+        },
+      })
+      const snapPool = `${S1},${S2}`
+      const fetchSpy = up as unknown as {
+        fetch: (url: string, init: { headers: Record<string, string> }) => Promise<Response>
+      }
+      const realFetch = fetchSpy.fetch.bind(up)
+      fetchSpy.fetch = (async (url: string, init: { headers: Record<string, string> }) => {
+        seen.push(init.headers['x-opencode-session'] ?? '')
+        // 池头永不上 wire（断言在 fetch 边界做，比 buildHeaders 更贴近真实外发）
+        expect(Object.keys(init.headers).some((k) => k.toLowerCase() === 'x-polycode-session-pool')).toBe(false)
+        return realFetch(url.replace('https://s1.opencode.ai', base), init)
+      }) as typeof fetchSpy.fetch
+      const stream = await up.stream(orig, {
+        model: 'm', stream: true, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      } as never)
+      await stream.cancel().catch(() => {})
+      expect(n).toBe(2) // 首打 429 + 换会话一次成功
+      expect(seen).toEqual([S1, S2]) // 首打主会话，重打下一个（不重复打同一会话）
+      // 库内 Provider 未被污染：会话与池顺序原样
+      expect(orig.headers!['x-opencode-session']).toBe(S1)
+      expect(orig.headers!['x-polycode-session-pool']).toBe(snapPool)
+    } finally {
+      await new Promise<void>((r) => sx.close(() => r()))
+    }
+  })
+
+  test('429 重试有界：池耗尽后原样抛 429，不无限打', async () => {
+    const { startOneShot } = await import('./helpers/one-shot-server.ts')
+    let n = 0
+    const { server: sx, base } = await startOneShot((_req, res) => {
+      n++
+      res.writeHead(429, { 'content-type': 'application/json' })
+      res.end('{"error":{"message":"rate_limit_exceeded"}}')
+    })
+    try {
+      const up = new Upstream({ credLookup: () => ['', false] })
+      const orig = zenProvider({
+        baseUrl: 'https://s1.opencode.ai/zen/v1', api: 'openai-completions',
+        headers: {
+          'x-polycode-session-pool': `${S1},${S2}`,
+          'x-opencode-session': S1,
+          'x-opencode-request': 'msg_aaaaaaaaaaaaaaaaaaaaaaaa',
+        },
+      })
+      const fetchSpy = up as unknown as { fetch: (url: string, init: unknown) => Promise<Response> }
+      const realFetch = fetchSpy.fetch.bind(up)
+      fetchSpy.fetch = ((url: string, init: unknown) =>
+        realFetch(url.replace('https://s1.opencode.ai', base), init)) as typeof fetchSpy.fetch
+      await expect(up.stream(orig, {
+        model: 'm', stream: true, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      } as never)).rejects.toMatchObject({ status: 429 })
+      expect(n).toBe(2) // 首打 + min(池长 2, 上限 4) - 1 次换会话 = 共 2 次
+    } finally {
+      await new Promise<void>((r) => sx.close(() => r()))
     }
   })
 })

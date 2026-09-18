@@ -401,7 +401,7 @@ function zenSuggestedProvider(baseURL: string, fp?: OpenCodeFingerprint | null):
   return {
     providerId: 0, name: 'opencode', state: 'active' as const, displayName: 'Zen免费档（自动发现）',
     accessKind: 'reverse', risk: 'high',
-    riskNote: '逆向客户端指纹；免费档按 IP 限速；指纹优先用本机 opencode 客户端的真实运行记录自动识别，识别不到时才需要手动配置',
+    riskNote: '逆向客户端指纹；免费档限流按会话（x-opencode-session）而非 IP，网关用会话池自动轮换；指纹优先用本机 opencode 客户端的真实运行记录自动识别，识别不到时才需要手动配置',
     stability: 'beta', api: 'openai-completions',
     baseUrl: baseURL.replace(/\/+$/, '') + '/v1',
     credential: { apiKeyEnv: 'ZEN_KEY' },
@@ -659,33 +659,42 @@ export function openCodeLogFiles(dirs: string[]): string[] {
   return out
 }
 
-// 从日志内容提取指纹。纯函数（便于测试），不碰文件系统。
-// 策略：取**最后一个**可用会话（最近一次真实运行的最可能还新鲜）；
-// 需要「自建会话」与「确实对 opencode(zen) 发起过 stream」两个证据同时成立。
-export function parseFingerprintFromLog(text: string): { sessionID: string; version: string; modelID?: string } | null {  // 会话自建：在 message=created 的那一行里同时拿到 id 与 version。
-  //
-  // 刻意**不依赖字段顺序**：早先的写法假设 `id=` 在 `version=` 之前，字段序一变
-  // （换版本、不同构建）就整条识别不出来 → 用户明明装了 opencode、却被告知
-  // 「缺少客户端指纹」。日志字段顺序是 opencode 内部实现细节，不该成为我们的假设。
-  // 逐行处理，行内独立提取两个字段。
-  let sessionID = ''
-  let version = ''
+// 提取日志里**全部**可用会话（按出现顺序，旧→新），供配额轮换取多个候选。
+//
+// 背景（2026-09-18 实测）：zen 免费档的限流是按 x-opencode-session 会话算的，
+// 不是按 IP——同一会话连续打十轮 xhigh 必 429，而本机 opencode 开多个窗口
+// （每窗口一个新会话）一点事没有。网关只认一个静态会话，请求量一上去就撞墙。
+// 所以刷新器不能只挑一个会话，要把本机近期真实用过的会话全收进来轮换。
+export function parseAllFingerprintsFromLog(text: string): { sessionID: string; version: string; modelID?: string }[] {
+  const out: { sessionID: string; version: string; modelID?: string }[] = []
+  const seen = new Set<string>()
   for (const line of text.split('\n')) {
     if (!line.includes('message=created')) continue
     const id = /(?:^|\s)id=(ses_[A-Za-z0-9_-]{8,})(?:\s|$)/.exec(line)
     if (!id) continue
     const ver = /(?:^|\s)version=v?(\d+\.\d+\.\d+[\w.-]*)(?:\s|$)/.exec(line)
     if (!ver) continue
-    sessionID = id[1]!
-    version = ver[1]!
-    // 继续循环：取最后一次出现的（最近一次会话）
+    const sessionID = id[1]!
+    if (seen.has(sessionID)) continue // 同一会话只收一次（保留最早那次的位置）
+    seen.add(sessionID)
+    out.push({ sessionID, version: ver[1]! })
   }
-  if (!sessionID || !version) return null
-  // 旁证：该会话对 zen(opencode provider) 发过流式请求；顺带取它用过的模型。
-  const used = [...text.matchAll(
-    new RegExp(`message=stream providerID=opencode modelID=([^\\s]+) session\\.id=${sessionID}`, 'g'),
-  )]
-  return { sessionID, version, modelID: used.length > 0 ? used[used.length - 1]![1] : undefined }
+  // 旁证：各会话对 zen(opencode provider) 发过流式请求；顺带取它用过的模型。
+  for (const item of out) {
+    const used = [...text.matchAll(
+      new RegExp(`message=stream providerID=opencode modelID=([^\\s]+) session\\.id=${item.sessionID}`, 'g'),
+    )]
+    if (used.length > 0) item.modelID = used[used.length - 1]![1]
+  }
+  return out
+}
+
+// 从日志内容提取指纹。纯函数（便于测试），不碰文件系统。
+// 策略：取**最后一个**可用会话（最近一次真实运行的最可能还新鲜）；
+// 需要「自建会话」与「确实对 opencode(zen) 发起过 stream」两个证据同时成立。
+export function parseFingerprintFromLog(text: string): { sessionID: string; version: string; modelID?: string } | null {
+  const all = parseAllFingerprintsFromLog(text)
+  return all.length > 0 ? all[all.length - 1]! : null
 }
 
 // ---- Zen 指纹刷新（x-opencode-session / x-opencode-request） ----
@@ -730,13 +739,22 @@ export function latestSessionMessageId(text: string, sessionID: string): string 
 // 扫描本机 opencode 日志，返回指纹（找不到返回 null）。
 // 从最新的日志文件开始找（轮转文件里越新的越可能含未过期会话）。
 export function discoverOpenCodeFingerprint(dirs: string[]): OpenCodeFingerprint | null {
+  const all = discoverAllOpenCodeFingerprints(dirs)
+  return all.length > 0 ? all[all.length - 1]! : null
+}
+
+// 本机全部可用会话（跨日志文件去重，按发现顺序），供会话池轮换。
+// 每个日志文件内按出现顺序；文件之间按修改时间旧→新，使“越靠后越新鲜”成立。
+export function discoverAllOpenCodeFingerprints(dirs: string[]): OpenCodeFingerprint[] {
   const files = openCodeLogFiles(dirs)
-  // 按修改时间倒序：先看最新日志。
+  // 按修改时间正序：旧文件先处理，最后累积到的就是最新文件里的会话。
   const sorted = files.map((p) => {
     let m = 0
     try { m = statSync(p).mtimeMs } catch { /* 取不到按 0 */ }
     return { p, m }
-  }).sort((a, b) => b.m - a.m)
+  }).sort((a, b) => a.m - b.m)
+  const out: OpenCodeFingerprint[] = []
+  const seen = new Set<string>()
   for (const { p } of sorted) {
     let raw: string
     try {
@@ -744,10 +762,13 @@ export function discoverOpenCodeFingerprint(dirs: string[]): OpenCodeFingerprint
     } catch {
       continue
     }
-    const got = parseFingerprintFromLog(raw)
-    if (got) return { ...got, userAgent: `opencode/${got.version}`, logPath: p }
+    for (const got of parseAllFingerprintsFromLog(raw)) {
+      if (seen.has(got.sessionID)) continue
+      seen.add(got.sessionID)
+      out.push({ ...got, userAgent: `opencode/${got.version}`, logPath: p })
+    }
   }
-  return null
+  return out
 }
 
 // ---- WorkBuddy 多账号发现 ----

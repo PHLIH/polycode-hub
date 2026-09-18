@@ -203,6 +203,7 @@ type FieldSpec =
   | { kind: 'string' | 'number' | 'boolean' }
   | { kind: 'array'; item: FieldSpec }
   | { kind: 'map' } // 自由键值（provider.headers，值收敛成字符串）
+  | { kind: 'nummap' } // 高档位→预算映射（model.reasoning_min_tokens，值收敛成数字）
   | { kind: 'object'; spec: Record<string, [string, FieldSpec]> }
 
 // [tsKey, spec]
@@ -226,6 +227,7 @@ const MODEL: Record<string, [string, FieldSpec]> = {
   input: ['input', { kind: 'array', item: { kind: 'string' } }],
   api: ['api', { kind: 'string' }],
   egress: ['egress', { kind: 'string' }],
+  reasoning_min_tokens: ['reasoningMinTokens', { kind: 'nummap' }],
   note: ['note', { kind: 'string' }],
   manual: ['manual', { kind: 'boolean' }],
   enabled: ['enabled', { kind: 'boolean' }],
@@ -319,6 +321,14 @@ function convert(v: unknown, fs: FieldSpec, path: string): unknown {
     for (const [k, val] of Object.entries(v as Record<string, unknown>)) out[k] = String(val)
     return out
   }
+  if (fs.kind === 'nummap') {
+    if (v === null || typeof v !== 'object' || Array.isArray(v)) {
+      throw new Error(`配置解析失败: "${path}" 应为键值映射`)
+    }
+    const out: Record<string, number> = {}
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) out[k] = Number(val)
+    return out
+  }
   if (fs.kind === 'array') {
     if (!Array.isArray(v)) throw new Error(`配置解析失败: "${path}" 应为数组`)
     return v.map((item, i) => convert(item, fs.item, `${path}${i}.`))
@@ -396,6 +406,15 @@ function applyDefaults(c: Config): void {
     p.models ??= [] // Go 侧 nil 切片语义等价空目录
     for (const m of p.models) {
       if (!m.input || m.input.length === 0) m.input = ['text'] // 手动添加的模型默认纯文本
+      // 高档位下限的键收敛成小写（应用侧按小写查）；值非法留给
+      // validate() 点名报错，不在这里静默吞掉。
+      if (m.reasoningMinTokens !== undefined && m.reasoningMinTokens !== null && typeof m.reasoningMinTokens === 'object') {
+        const norm: Record<string, number> = {}
+        for (const [k, val] of Object.entries(m.reasoningMinTokens)) {
+          norm[k.trim().toLowerCase()] = val
+        }
+        m.reasoningMinTokens = norm
+      }
     }
   }
   for (const a of c.accounts) {

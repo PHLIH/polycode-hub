@@ -163,6 +163,47 @@ async function setModelEgress(p, id, eg) {
   } catch (e) { ElMessage.error(e.message) }
 }
 
+// 高档位最低预算（只管 xhigh/max）：xhigh/max 档的 maxTokens 低于下限时抬到下限，
+// 其他档位不动。输入 "xhigh:128000,max:200000" 这种逗号分隔的 档位:预算 对，清空则删掉整张映射。
+function floorText(p, id) {
+  const m = modelOf(p, id)
+  const t = m && m.reasoningMinTokens
+  if (!t || typeof t !== 'object') return ''
+  return Object.entries(t).map(([k, v]) => `${k}:${v}`).join(',')
+}
+const floorEdit = ref('')
+const floorDraft = ref('')
+function startFloor(p, id) {
+  floorEdit.value = keyOf(p, id)
+  floorDraft.value = floorText(p, id)
+}
+async function saveFloor(p, id) {
+  const m = modelOf(p, id)
+  if (!m) return
+  const raw = floorDraft.value.trim()
+  if (raw === floorText(p, id)) { floorEdit.value = ''; return } // 没改就不打接口
+  try {
+    if (raw === '') {
+      await api.updateProviderModelReasoningMinTokens(p.providerId, id, {})
+      patchRowModel(p, id, 'reasoningMinTokens', '')
+    } else {
+      const map = {}
+      for (const part of raw.split(',')) {
+        const i = part.indexOf(':')
+        if (i < 0) throw new Error(`「${part.trim()}」须为 档位:预算 形态（如 xhigh:128000）`)
+        const k = part.slice(0, i).trim().toLowerCase()
+        const v = Number(part.slice(i + 1).trim())
+        if (!k || !Number.isSafeInteger(v) || v <= 0) throw new Error(`「${part.trim()}」预算须为正整数`)
+        map[k] = v
+      }
+      await api.updateProviderModelReasoningMinTokens(p.providerId, id, map)
+      patchRowModel(p, id, 'reasoningMinTokens', map)
+    }
+    floorEdit.value = ''
+    ElMessage.success(raw ? '预算下限已保存' : '预算下限已清除')
+  } catch (e) { ElMessage.error(e.message) }
+}
+
 // 就地识别单个模型的协议：复用扫描接口（只传该模型），探到即写回并更新行内显示。
 // 识别是真打上游，慢则几十秒——按钮在探测中变成「取消」，点了立即中断。
 async function detect(p, id) {
@@ -392,6 +433,18 @@ async function toggle() {
             @change="v => setModelEgress(p, m.id, v || '')">
             <el-option v-for="e in egresses" :key="e.id" :value="e.id" :label="e.id" />
           </el-select>
+
+          <span class="lane-note">
+            <input v-if="floorEdit === keyOf(p, m.id)" v-model="floorDraft"
+              class="note-input" placeholder="如 xhigh:128000,max:200000"
+              @keyup.enter="saveFloor(p, m.id)" @keyup.esc="floorEdit = ''" @blur="saveFloor(p, m.id)">
+            <template v-else>
+              <button class="note-btn" :class="{ has: floorText(p, m.id) }"
+                :title="floorText(p, m.id) || '只管 xhigh/max 两档：低于下限抬预算，其他档不动'"
+                @click="startFloor(p, m.id)">{{ floorText(p, m.id) ? '预算' : '＋预算' }}</button>
+              <span v-if="floorText(p, m.id)" class="note-text mono" :title="floorText(p, m.id)">{{ floorText(p, m.id) }}</span>
+            </template>
+          </span>
 
           <span class="lane-detect">
             <button class="act tiny" :class="{ busy: detecting[keyOf(p, m.id)] }"

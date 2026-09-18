@@ -10,7 +10,7 @@ import { join } from 'node:path'
 import { writeFile0600 } from './credential_file.ts'
 import { ERR, validProtocol } from '../ir/index.ts'
 import {
-  providerValidate, accountHealth, validAccessKind, validRisk,
+  providerValidate, accountHealth, validAccessKind, validRisk, sanitizeReasoningMinTokens,
   credentialResolve, forgetProtocol,
   type Account, type CredentialRef, type Model, type Provider,
 } from '../model/index.ts'
@@ -979,6 +979,37 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     if (!m) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 下没有模型 ${modelID}`)
     if (egress === '') delete m.egress
     else m.egress = egress
+    providers.put(p)
+    changed()
+    return ok(c, 200, m)
+  })
+
+  // 高档位最低预算（只管 xhigh/max）：{"reasoningMinTokens": {"xhigh": 128000}}。
+  // 只托底不封顶（见 model.applyReasoningFloor）；空对象/缺字段 = 清掉整张映射。
+  // 值域 (0, 200000]，超限 400。
+  app.put('/admin/api/providers/:pid/models/:model/reasoning-min-tokens', async (c) => {
+    const raw = c.req.param('pid')
+    const pid = parsePid(raw)
+    const modelID = c.req.param('model')
+    const p = pid === undefined ? undefined : providers.get(pid)
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
+    const body = await jsonBody(c)
+    if (!isObj(body)) return errRes(c, 400, ERR.INVALID_REQUEST, '请求体不是合法 JSON')
+    const v = body.reasoningMinTokens
+    if (v !== undefined && (v === null || typeof v !== 'object' || Array.isArray(v))) {
+      return errRes(c, 400, ERR.INVALID_REQUEST, '请求体须为 {"reasoningMinTokens": {"xhigh"|"max": 正整数预算}}（{} = 清掉映射）')
+    }
+    const m = p.models.find((x) => x.id === modelID)
+    if (!m) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 下没有模型 ${modelID}`)
+    if (v === undefined || Object.keys(v as Record<string, unknown>).length === 0) {
+      delete m.reasoningMinTokens
+    } else {
+      const clean = sanitizeReasoningMinTokens(v)
+      if (clean === undefined) {
+        return errRes(c, 400, ERR.INVALID_REQUEST, 'reasoningMinTokens 非法：键须为非空短档位名，值须为 1-200000 的正整数（如 {"xhigh": 128000}）')
+      }
+      m.reasoningMinTokens = clean
+    }
     providers.put(p)
     changed()
     return ok(c, 200, m)

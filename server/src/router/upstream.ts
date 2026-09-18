@@ -13,7 +13,8 @@ import { getOutbound, kindForStatus, UpstreamError, UPSTREAM,
 import { autoProtocol, forgetProtocol, rememberProtocol,
   capabilitiesFrom, credentialResolve, dynamicHeadersTimeout,
   findHeaderKey, isZenBaseUrl, mintZenRequestId, validZenToken, zenHeadersWithFingerprint,
-  ZEN_REQUEST_HEADER, ZEN_SESSION_HEADER,
+  parseZenSessionPool, writeZenSessionPool,
+  ZEN_REQUEST_HEADER, ZEN_SESSION_HEADER, ZEN_SESSION_POOL_HEADER,
   type Capabilities, type DynamicHeadersSpec, type Provider } from '../model/index.ts'
 
 // egress 定义 → 代理 URI（EGRESS-SPIKE §4 方案 A）。
@@ -207,6 +208,68 @@ export function applyZenFingerprint(
 // 快 500/快拒连多是抖动；慢失败说明上游真在挣扎（或连接挂起），重试只会翻倍等待。
 export const TRANSIENT_RETRY_BUDGET_MS = 5000
 
+// ---- Zen 会话池轮换（2026-09-18 实测：免费档限流按 x-opencode-session 算） ----
+//
+// 取证：同一会话连打十轮 xhigh 必 429（rate_limit_exceeded），而本机 opencode
+// 开多个窗口（每窗口新会话）一点事没有；换会话立刻恢复。结论：限流维度是会话
+// 而不是 IP（出口同为 clash 代理）。
+//
+// 策略：会话池（discover 写进 x-polycode-session-pool）做 429 触发式轮换。
+// 注意不是逐请求预防性轮换：每请求都换会话只会把所有会话的配额窗口同时打满，
+// 还破坏上游按会话的亲和性；正确做法是首打用主会话（池首 = 最新），
+// 撞 429 才在本请求副本内换下一个重打（最多 min(池长,4) 个不同会话）。
+// 池只有 1 个会话时行为等同旧版（不轮换，429 原样上报）。
+const zenPoolCursor = new Map<number, number>()
+
+// 取 Provider 的会话池（无池返回空数组）。池头由 discover/zen_refresh 写。
+export function zenSessionPoolOf(p: Provider): string[] {
+  return parseZenSessionPool(p.headers ?? {})
+}
+
+// 池轮换游标（保留供潜在的预防性轮换用；当前转发路径不用它——
+// 429 重试在请求副本内顺序推进，见 streamWith 的 shiftLocal）。
+// 无池返回 undefined。
+export function nextZenSession(p: Provider): string | undefined {
+  const pool = zenSessionPoolOf(p)
+  if (pool.length === 0) return undefined
+  const i = zenPoolCursor.get(p.providerId) ?? 0
+  zenPoolCursor.set(p.providerId, (i + 1) % pool.length)
+  return pool[i % pool.length]
+}
+
+// 测试用：清空轮换游标（避免用例间串状态）。
+export function resetZenPoolCursor(): void {
+  zenPoolCursor.clear()
+}
+
+// 把指定会话提到池首：同请求的 headers 副本内部轮换用，不写回库里那份。
+// 调用方须保证 h 是本请求自有副本（deep copy），禁止传库内 Provider.headers 原引用，
+// 否则一次 429 重试会污染调度器里的 Provider 与所有在途请求。
+export function shiftZenSessionHeaders(
+  h: Record<string, string>, pool: string[], sid: string,
+): void {
+  if (!validZenToken(sid)) return
+  // 只认池内会话：轮换器给的值必定来自池；池外的值说明是脏输入，不塞进去
+  // （凭空的会话 ID 上游不认识，塞了只会 403）。
+  if (pool.length === 0 || !pool.includes(sid)) return
+  const merged = [sid, ...pool.filter((s) => s !== sid)]
+  writeZenSessionPool(h, merged)
+  const sk = findHeaderKey(h, ZEN_SESSION_HEADER)
+  if (sk !== undefined) h[sk] = sid
+  else h[ZEN_SESSION_HEADER] = sid
+}
+
+// 旧签名兼容（测试用）：只动传进来的 Provider.headers，不写库。
+// 注意：并发转发路径禁止用它（见 shiftZenSessionHeaders），只留给单线程测试。
+export function shiftZenSession(p: Provider, sid: string): void {
+  const h = p.headers
+  if (!h) return
+  shiftZenSessionHeaders(h, parseZenSessionPool(h), sid)
+}
+
+// 429 换会话重试的次数上限（池里有几个会话就最多试几个，但设硬上限防打爆）。
+const ZEN_POOL_RETRY_MAX = 4
+
 export class Upstream {
   // 上游调用器：协议解析/自动探测、动态头铸币、出口代理分流、模型目录拉取。
   // 无状态（除 dispatcher 缓存与 autoProtocol 进程内记忆）；失败一律抛 UpstreamError。
@@ -337,7 +400,38 @@ export class Upstream {
       await new Promise<void>((r) => setTimeout(r, 500))
       return true
     }
+    // 会话池 429 轮换（仅 zen）：限流按会话算，换一个就恢复。
+    // 池快照（请求级深拷贝）：游标 + 池内顺序全在本地副本上推进，
+    // 库内 Provider.headers 与其他在途请求一律不动（并发隔离）。
+    // 池在头里（x-polycode-session-pool），游标进程内自增，等效 opencode 多窗口。
+    const zenPool = isZenUpstream(p.baseUrl) ? zenSessionPoolOf(p) : []
+    const zenHeaders: Record<string, string> | null = zenPool.length > 1 ? { ...(p.headers ?? {}) } : null
+    // 已试过的会话（按首打快照顺序）：首打用池首主会话，重试只取没试过的，
+    // 同一会话绝不打第二遍（它刚回 429，立刻重打是浪费额度）。
+    const zenTriedSet = new Set<string>()
+    let zenTried = 0
+    // 内存轮换（本请求副本内）：按首打快照顺序取下一个没试过的会话，
+    // 提池首并同步 x-opencode-session。用副本内自己的顺序推进，
+    // 不碰进程游标、不碰库内 Provider（并发隔离）。
+    const shiftLocal = (): string | undefined => {
+      if (!zenHeaders) return undefined
+      const pool = parseZenSessionPool(zenHeaders)
+      const next = zenPool.find((s) => pool.includes(s) && !zenTriedSet.has(s))
+      if (!next) return undefined
+      zenTriedSet.add(next)
+      zenTried++
+      shiftZenSessionHeaders(zenHeaders, pool, next)
+      return next
+    }
     for (let a = 0; a < attempts; a++) {
+      // 本次 fetch 用的 Provider 视图：429 轮换中（已换过会话）用副本，否则用原件。
+      // 副本 headers 已深拷贝，buildHeaders 再怎么合并也不会污染库内那份。
+      const view: Provider = zenHeaders && zenTried > 0 ? { ...p, headers: zenHeaders } : p
+      // 首打会话记入已试集：重试时跳过它（刚 429 的会话不打第二遍）。
+      if (zenHeaders && zenTried === 0) {
+        const first = parseZenSessionPool(zenHeaders)[0]
+        if (first) zenTriedSet.add(first)
+      }
       let dyn: Record<string, string> | null = null
       if (p.dynamicHeaders) {
         try {
@@ -354,7 +448,7 @@ export class Upstream {
       try {
         resp = await this.fetch(url, {
           method: 'POST',
-          headers: this.buildHeaders(p, upReq.stream, dyn, proto, session),
+          headers: this.buildHeaders(view, upReq.stream, dyn, proto, session),
           body: body as never, // Node fetch 接受 Uint8Array；类型侧缺 DOM BodyInit
           dispatcher: this.dispatcherFor(p) as never,
         })
@@ -369,6 +463,18 @@ export class Upstream {
       const text = await resp.text() // text() 已消费 body，无需再 cancel
       console.warn(`[upstream] POST ${url} -> ${resp.status} (${ue2s(resp.status, text)})`)
       const ue = new UpstreamError(resp.status, classifyUpstreamError(resp.status, text), summarizeUpstreamBody(text))
+      // 429 且池里还有没试过的会话：换会话重打（限流按会话算，换一个就恢复）。
+      // 不占用 transient 额度——这是与 500 抖动不同维度的重试。
+      // 边界：首打 1 个 + 最多 min(池长, ZEN_POOL_RETRY_MAX) - 1 次换会话，
+      // 同一会话不打第二遍（shiftLocal 按已试集过滤）。
+      if (ue.kind === UPSTREAM.RATE_LIMIT && zenHeaders && zenTriedSet.size < Math.min(zenPool.length, ZEN_POOL_RETRY_MAX)) {
+        const next = shiftLocal()
+        if (next) {
+          console.warn(`[zen-pool] 429 换会话重试（第 ${zenTried} 次）：${next.slice(0, 16)}…`)
+          a-- // 不消耗 attempts
+          continue
+        }
+      }
       if ((ue.kind === UPSTREAM.SERVER || ue.kind === UPSTREAM.NETWORK) && await retryable()) {
         a-- // 快失败的过载 500 系：同条件再打一次（动态头重铸次数不受影响）
         continue
@@ -396,6 +502,9 @@ export class Upstream {
     if (stream) h['Accept'] = 'text/event-stream'
     for (const [k, v] of Object.entries(p.headers ?? {})) h[k] = v
     for (const [k, v] of Object.entries(dyn ?? {})) h[k] = v
+    // 内网池头永不上 wire：轮换只在网关内存里做，上游只需要单个 x-opencode-session。
+    // （位置：静态/动态头合并之后、指纹校准之前——动态铸币也不得把池头带回来。）
+    { const pk = findHeaderKey(h, ZEN_SESSION_POOL_HEADER); if (pk !== undefined) delete h[pk] }
     // zen 指纹校准必须在鉴权头落定前做：它只动 UA/会话类头，不碰 Authorization。
     applyZenFingerprint(h, session, isZenUpstream(p.baseUrl))
     let key = ''

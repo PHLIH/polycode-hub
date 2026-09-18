@@ -12,7 +12,7 @@ import {
 } from '../ir/index.ts'
 import { resolveProtocol, estimateRequestTokens, type Scheduler, type Upstream, type SessionHint } from '../router/index.ts'
 import type { AccountPool } from '../pool/account.ts'
-import { accountEffectiveStatus, type Account, type Provider, type UsageLog, type UsageStatus } from '../model/index.ts'
+import { accountEffectiveStatus, applyReasoningFloor, type Account, type Provider, type UsageLog, type UsageStatus } from '../model/index.ts'
 import {
   DEFAULT_FIRST_BYTE_TIMEOUT_MS, DEFAULT_STREAM_IDLE_TIMEOUT_MS, type Config,
 } from '../config/index.ts'
@@ -443,8 +443,12 @@ export class Proxy {
         const pvv: Provider = acct ? { ...base, credential: acct.credential } : { ...base } // 账号 JWT 覆盖 Provider 凭据
         const [m] = this.sched.modelOf(base.providerId, irReq.model)
         if (m.egress) pvv.egress = m.egress // 模型级出口覆盖 Provider 级（未声明的模型继承 Provider）
-        // 推理档位完全跟随客户端透传：网关不做模型级预设、不抬预算。
-        const effReq = irReq
+        // 高档位预算托底（只管 xhigh/max）：客户端值低于下限时抬到下限并记一行，
+        // 其他档位跟随客户端透传。
+        const effReq = applyReasoningFloor(irReq, m)
+        if (effReq.maxTokens !== irReq.maxTokens) {
+          console.log(`[floor] model=${irReq.model} effort=${effReq.reasoningEffort ?? '-'} maxTokens=${irReq.maxTokens ?? '-'}→${effReq.maxTokens}`)
+        }
         if ((effReq.reasoningEffort ?? '').trim() !== '') triedEffort = effReq.reasoningEffort!.trim()
         const stream = await this.up.stream(pvv, effReq, session)
         locked = { stream, provider: pvv, acctId: acct?.id ?? '' }
@@ -556,7 +560,10 @@ export class Proxy {
     const pvv: Provider = { ...pv, credential: acct.credential }
     const [m] = this.sched.modelOf(pv.providerId, irReq.model)
     if (m.egress) pvv.egress = m.egress
-    const effReq = irReq
+    const effReq = applyReasoningFloor(irReq, m)
+    if (effReq.maxTokens !== irReq.maxTokens) {
+      console.log(`[floor] model=${irReq.model} effort=${effReq.reasoningEffort ?? '-'} maxTokens=${irReq.maxTokens ?? '-'}→${effReq.maxTokens} account=${acct.id}`)
+    }
     let stream: ReadableStream<Uint8Array>
     try {
       stream = await this.up.stream(pvv, effReq, session)

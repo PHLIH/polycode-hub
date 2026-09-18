@@ -282,15 +282,26 @@ providers:
     expect(() => loadConfig(bad)).toThrow(/egress/)
   })
 
-  test('模型上写 reasoning_effort/reasoning_min_tokens → 启动即报未知字段（该功能已删除）', () => {
-    const bad = write('reasoning-gone.yaml', `
+  test('reasoning_min_tokens 从 YAML 解析：键收小写、超 20w 启动即报错', () => {
+    const ok = write('floor.yaml', `
 providers:
   - name: zen
     base_url: https://x.example
     models:
       - id: muse-spark-1.3
-        reasoning_effort: xhigh
+        reasoning_min_tokens: {XHIGH: 128000, max: 200000}
 `)
-    expect(() => loadConfig(bad)).toThrow(/reasoning_effort/)
+    const cfg = loadConfig(ok)
+    expect(cfg.providers[0]!.models[0]!.reasoningMinTokens).toEqual({ xhigh: 128000, max: 200000 })
+
+    const bad = write('floor-bad.yaml', `
+providers:
+  - name: zen
+    base_url: https://x.example
+    models:
+      - id: muse-spark-1.3
+        reasoning_min_tokens: {xhigh: 200001}
+`)
+    expect(() => loadConfig(bad)).toThrow(/reasoning_min_tokens/)
   })
 })

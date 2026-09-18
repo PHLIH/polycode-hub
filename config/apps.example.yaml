@@ -115,7 +115,7 @@ accounts: []
 #     display_name: "Zen免费档"
 #     access_kind: "reverse"          # 逆向客户端指纹（风险高，见 NOTICE.md 登记）
 #     risk: "high"
-#     risk_note: "逆向客户端指纹；上游可随时变更；免费档按 IP 限速；ses_ 须真实有效（opencode run --print-logs 取 created id=），过期/403 就重收"
+#     risk_note: "逆向客户端指纹；上游可随时变更；免费档限流按会话（x-opencode-session）而非 IP——网关用会话池自动轮换，见 docs/FEATURES.md；ses_ 须真实有效（opencode run --print-logs 取 created id=），过期/403 就重收"
 #     stability: "beta"
 #     state: "paused"                # active | paused（旧 enabled: false 等价于 paused）
 #     api: "openai-completions"      # 仅作默认；协议是模型级的，见下方 models[].api

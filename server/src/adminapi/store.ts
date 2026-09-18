@@ -40,6 +40,17 @@ function cleanModel(m: Model): Model {
   if (typeof m.displayName === 'string') out.displayName = m.displayName
   if (typeof m.note === 'string' && m.note !== '') out.note = m.note
   if (typeof m.egress === 'string' && m.egress !== '') out.egress = m.egress
+  // 高档位下限：只收 (0, 200000] 正整数值（防脏数据；键大小写由写入入口收敛，
+  // 非法整体由 providerValidate 点名）。白名单与 parse.ts 的 parseModel 保持一致。
+  if (m.reasoningMinTokens !== undefined && m.reasoningMinTokens !== null && typeof m.reasoningMinTokens === 'object' && !Array.isArray(m.reasoningMinTokens)) {
+    const norm: Record<string, number> = {}
+    for (const [k, val] of Object.entries(m.reasoningMinTokens)) {
+      if (typeof val === 'number' && Number.isSafeInteger(val) && val > 0 && val <= 200000) {
+        norm[k.trim().toLowerCase()] = val
+      }
+    }
+    if (Object.keys(norm).length > 0) out.reasoningMinTokens = norm
+  }
   if (typeof m.contextWindow === 'number') out.contextWindow = m.contextWindow
   if (typeof m.maxOutputTokens === 'number') out.maxOutputTokens = m.maxOutputTokens
   if (Array.isArray(m.input) && m.input.length > 0) out.input = [...m.input]

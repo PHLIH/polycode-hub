@@ -3,12 +3,15 @@ import { readFileSync } from 'node:fs'
 import {
   accountEffectiveStatus,
   accountHealth,
+  applyReasoningFloor,
   capabilitiesFrom,
   credentialResolve,
   looksFree,
   modelEffAPI,
   providerValidate,
+  reasoningFloorFor,
   riskAllowed,
+  sanitizeReasoningMinTokens,
   supportsImage,
   forgetProtocol,
   autoProtocol,
@@ -106,6 +109,60 @@ describe('Model 目录条目', () => {
   test('supportsImage 只认显式 image 声明', () => {
     expect(supportsImage(m({ input: [] }))).toBe(false)
     expect(supportsImage(m({ input: ['text', 'image'] }))).toBe(true)
+  })
+
+  test('sanitizeReasoningMinTokens：键收小写、值须为 1-200000 正整数，空/非法全拒', () => {
+    expect(sanitizeReasoningMinTokens({ XHIGH: 128000, Max: 200000 })).toEqual({ xhigh: 128000, max: 200000 })
+    expect(sanitizeReasoningMinTokens({})).toBeUndefined()
+    expect(sanitizeReasoningMinTokens(undefined)).toBeUndefined()
+    expect(sanitizeReasoningMinTokens([])).toBeUndefined()
+    expect(sanitizeReasoningMinTokens({ xhigh: 0 })).toBeUndefined()
+    expect(sanitizeReasoningMinTokens({ xhigh: 200001 })).toBeUndefined()
+    expect(sanitizeReasoningMinTokens({ xhigh: -5 })).toBeUndefined()
+    expect(sanitizeReasoningMinTokens({ xhigh: 1.5 })).toBeUndefined()
+    expect(sanitizeReasoningMinTokens({ xhigh: '8000' })).toBeUndefined()
+    expect(sanitizeReasoningMinTokens({ '': 100 })).toBeUndefined()
+  })
+
+  test('applyReasoningFloor：只管 xhigh/max，只托底不封顶，没给值的不动', () => {
+    const mm = m({ reasoningMinTokens: { xhigh: 128000, max: 200000 } })
+    // 低于下限 → 抬到下限（返回副本，原对象不动）
+    const req = { reasoningEffort: 'xhigh', maxTokens: 32768 }
+    expect(applyReasoningFloor(req, mm)).toEqual({ reasoningEffort: 'xhigh', maxTokens: 128000 })
+    expect(req).toEqual({ reasoningEffort: 'xhigh', maxTokens: 32768 })
+    // 大小写不敏感；max 档同样托底
+    expect(applyReasoningFloor({ reasoningEffort: 'XHigh', maxTokens: 1 }, mm)).toEqual({ reasoningEffort: 'XHigh', maxTokens: 128000 })
+    expect(applyReasoningFloor({ reasoningEffort: 'max', maxTokens: 100 }, mm)).toEqual({ reasoningEffort: 'max', maxTokens: 200000 })
+    // 高于下限 → 同一引用（没动过）
+    const ok = { reasoningEffort: 'xhigh', maxTokens: 200000 }
+    expect(applyReasoningFloor(ok, mm)).toBe(ok)
+    // 没给值 → 不动（保持省略语义）
+    const bare = { reasoningEffort: 'xhigh' }
+    expect(applyReasoningFloor(bare, mm)).toBe(bare)
+    // 其他档位一律不动（low/high/off/没传）
+    expect(applyReasoningFloor({ reasoningEffort: 'high', maxTokens: 100 }, mm)).toEqual({ reasoningEffort: 'high', maxTokens: 100 })
+    expect(applyReasoningFloor({ reasoningEffort: 'low', maxTokens: 100 }, mm)).toEqual({ reasoningEffort: 'low', maxTokens: 100 })
+    expect(applyReasoningFloor({ reasoningEffort: 'off', maxTokens: 100 }, mm)).toEqual({ reasoningEffort: 'off', maxTokens: 100 })
+    expect(applyReasoningFloor({ maxTokens: 100 }, mm)).toEqual({ maxTokens: 100 })
+    // 无映射表 → 不动
+    expect(applyReasoningFloor({ reasoningEffort: 'xhigh', maxTokens: 100 }, m({}))).toEqual({ reasoningEffort: 'xhigh', maxTokens: 100 })
+  })
+
+  test('reasoningFloorFor：只认 xhigh/max（大小写不敏感），其他档返回 undefined', () => {
+    const mm = m({ reasoningMinTokens: { xhigh: 128000, max: 200000 } })
+    expect(reasoningFloorFor('xhigh', mm)).toBe(128000)
+    expect(reasoningFloorFor('MAX', mm)).toBe(200000)
+    expect(reasoningFloorFor('high', mm)).toBeUndefined()
+    expect(reasoningFloorFor('low', mm)).toBeUndefined()
+    expect(reasoningFloorFor('off', mm)).toBeUndefined()
+    expect(reasoningFloorFor(undefined, mm)).toBeUndefined()
+    expect(reasoningFloorFor('xhigh', m({}))).toBeUndefined()
+  })
+
+  test('providerValidate 点名非法档位下限（含超 20w 上限）', () => {
+    expect(providerValidate(p({ models: [m({ reasoningMinTokens: { xhigh: 128000 } })] }))).toBeUndefined()
+    expect(providerValidate(p({ models: [m({ id: 'm9', reasoningMinTokens: { xhigh: 0 } })] }))).toMatch(/m9/)
+    expect(providerValidate(p({ models: [m({ id: 'm9', reasoningMinTokens: { xhigh: 200001 } })] }))).toMatch(/m9/)
   })
 
   test('capabilitiesFrom：modalities 优先、vision 收敛为 image、无声明返回 null', () => {

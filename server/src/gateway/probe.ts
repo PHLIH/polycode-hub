@@ -3,7 +3,7 @@
 
 import { getOutbound, UpstreamError, type IrRequest, type StreamEvent } from '../ir/index.ts'
 import {
-  autoProtocol, rememberProtocol, looksFree, accountEffectiveStatus,
+  autoProtocol, rememberProtocol, looksFree, accountEffectiveStatus, applyReasoningFloor,
   type Provider, type UsageLog,
 } from '../model/index.ts'
 import type { AccountPool } from '../pool/account.ts'
@@ -239,7 +239,8 @@ export class Probe {
   // 对指定模型打一次最小真实流式请求。不抛错，失败如实返回。
   // 注意与 Stream 的协议解析不完全一致：此处只看模型级/ Provider 级声明，
   // 不读 autoProtocol 进程内缓存（探测即重探，避免缓存掩盖真相）。
-  // 探针不带推理档位（最小请求只测连通，不测档位枚举）。
+  // 探针不带推理档位（最小请求只测连通，不测档位枚举），但同样走档位下限：
+  // 万一模型配了 xhigh/max 下限，16 预算会被抬起，避免把“预算不足”误报成“源不可用”。
   private async probeOne(pv: Provider, bare: string): Promise<ProbeOutcome> {
     const m = pv.models.find((x) => x.id === bare)
     const proto = m?.api || pv.api
@@ -255,11 +256,12 @@ export class Probe {
     const probeUp = this.up.withOpts({ noAutoProtocol: true })
     let stream: ReadableStream<Uint8Array> | undefined
     let err: unknown
-    const probeReq: IrRequest = {
+    const probeReq: IrRequest = applyReasoningFloor({
       model: bare, stream: true, maxTokens: 16,
       messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
-    }
-    // 上游抖动重试：免费档按 IP 限速且会间歇 503，打一次就报「不通」会误判成配置错误。
+    }, pv.models.find((x) => x.id === bare))
+    // 上游抖动重试：免费档会间歇 503（限流按会话算，见 docs/FEATURES.md），
+    // 打一次就报「不通」会误判成配置错误。
     for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
       try {
         stream = await probeUp.streamWithTimeout(pv, probeReq, AbortSignal.timeout(PROBE_TIMEOUT_MS))

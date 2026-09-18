@@ -226,6 +226,31 @@ describe('客户端推理档位透传（端到端）', () => {
     await res2.json()
     expect(JSON.parse(lastUpstreamBody)).not.toHaveProperty('reasoning_effort')
   })
+
+  test('xhigh/max 托底：低于下限抬起，高于不动，其他档不动', async () => {
+    const { app } = buildApp({ providers: [pv({ reasoningMinTokens: { xhigh: 128000, max: 200000 } })] })
+    // xhigh + 小预算 → 抬到 128000
+    const r1 = await app.request('/v1/chat/completions', {
+      method: 'POST', body: JSON.stringify(chatBody({ reasoning_effort: 'xhigh', max_tokens: 32768 })),
+    })
+    expect(r1.status).toBe(200)
+    await r1.json()
+    expect(JSON.parse(lastUpstreamBody).max_tokens).toBe(128000)
+    // max + 小预算 → 抬到 200000
+    const r2 = await app.request('/v1/chat/completions', {
+      method: 'POST', body: JSON.stringify(chatBody({ reasoning_effort: 'max', max_tokens: 100 })),
+    })
+    expect(r2.status).toBe(200)
+    await r2.json()
+    expect(JSON.parse(lastUpstreamBody).max_tokens).toBe(200000)
+    // high 不受影响
+    const r3 = await app.request('/v1/chat/completions', {
+      method: 'POST', body: JSON.stringify(chatBody({ reasoning_effort: 'high', max_tokens: 100 })),
+    })
+    expect(r3.status).toBe(200)
+    await r3.json()
+    expect(JSON.parse(lastUpstreamBody).max_tokens).toBe(100)
+  })
 })
 
 describe('换源闸门（端到端）', () => {
