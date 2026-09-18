@@ -12,6 +12,8 @@ import { getOutbound, kindForStatus, UpstreamError, UPSTREAM,
   type IrRequest, type Protocol } from '../ir/index.ts'
 import { autoProtocol, forgetProtocol, rememberProtocol,
   capabilitiesFrom, credentialResolve, dynamicHeadersTimeout,
+  findHeaderKey, isZenBaseUrl, mintZenRequestId, validZenToken, zenHeadersWithFingerprint,
+  ZEN_REQUEST_HEADER, ZEN_SESSION_HEADER,
   type Capabilities, type DynamicHeadersSpec, type Provider } from '../model/index.ts'
 
 // egress 定义 → 代理 URI（EGRESS-SPIKE §4 方案 A）。
@@ -43,13 +45,18 @@ const defaultLookup: Lookup = (name) =>
 
 // ---- OpenCode Zen 反代指纹 ----
 //
-// 上游免费档只认「官方客户端样子」的请求（否则 403 FreeTierError）：
-//   User-Agent：官方客户端的真串（三段式 opencode/<ver> ai-sdk/… runtime/…，
-//     版本号随官方发版变）
-//   x-session-id / x-session-affinity：官方客户端会话 ID（ses_…）
-// 2026-09 前用的 x-opencode-client/project/request/session 四件套现在是毒头——
-// 带了必回 403（"can only be used from within OpenCode"），真机抓包确认官方
-// 客户端根本不发这四个头。
+// 上游免费档只认「官方客户端样子」的请求（否则 403 FreeTierError）。
+// 2026-09-18 真机取证（覆盖官方 baseURL 的本地日志端点，抓官方客户端发出的原文）：
+//   User-Agent: opencode/<ver> ai-sdk/provider-utils/<ver> runtime/bun/<ver>
+//   Authorization: Bearer public
+//   x-opencode-client: cli
+//   x-opencode-project: global（或该目录的 hex projectID）
+//   x-opencode-request: msg_<24位>（一次会话内稳定）
+//   x-opencode-session: ses_<…>（本次运行的真实会话）
+// 真客户端不发 x-session-id / x-session-affinity（ai-sdk 给别的上游用的）。
+//
+// 历史教训：网关曾把四件套当“毒头”删掉（臆测官方不发），与真机行为完全相反；
+// 上游 2026-09 要求 x-opencode-session 后全量 403。现在按取证原样发送。
 //
 // 网关是通用项目，不内置任何版本号、不伪造 UA，只做「诚实透传 + 配置兜底」：
 //   UA 缺省时的补位优先级（已配的不覆盖——显式配置优先于隐式透传）：
@@ -58,16 +65,66 @@ const defaultLookup: Lookup = (name) =>
 //        （见 proxy.sessionHintFromHeaders，来什么透什么，网关不改写）；
 //     3. ZEN_UA 环境变量（项目级默认，同样由运维提供真串）；
 //     4. 全都没有——如实不发，不编版本号。403 时按 FreeTierError 指引去配真串。
-//   注意 UA 与会话头的优先级是反的（会话是 透传 > 静态）：会话的静态值会过期，
-//   活的永远比配的真；UA 的静态值是运维抓包 curated 的，客户端带来的反而可能是
-//   curl/Cherry Studio 之类非官方串——静态优先能保住配好的指纹不被冲掉。
+//   会话取值优先级（透传 > 静态 > 旧 x-session-id 兼容）：
+//     1. 客户端透传的会话（session.id，须过 validZenToken 白名单）；
+//     2. Provider 静态头里的 x-opencode-session（指纹刷新流程自动续写）；
+//     3. 旧版静态 x-session-id（历史配置里存的 ses_ 值，直接晋升沿用）。
+//   x-opencode-request：静态值优先（真机一次会话内稳定）；缺时现铸一个
+//     （mintZenRequestId，格式与观测一致；唯一性有收益，时间绑定则听天由命）。
+//   x-opencode-client/project：静态优先，缺省 cli/global。
 //   注入安全：透传/配置的 UA 只收单行可打印 ASCII（防 CR/LF 头注入），
-//   超长（>512）截断；会话 token 仍走 validSessionToken 白名单（非法不写头）。
+//   超长（>512）截断；会话 token 仍走 validZenToken 白名单（非法不写头）。
 //
-// 会话 ID 必须来自一次真实的官方客户端运行（`opencode run --print-logs` 输出的
-// created id=ses_…），跨模型、跨端点可复用；本地随机编一个通不过。
-// opencode 自己做客户端时网关直接透传它的会话头（见 proxy.sessionHintFromHeaders），
-// 其他客户端则用 Provider 静态头里的那一份；都没有就不硬凑。
+// 会话 ID 必须来自一次真实的官方客户端运行（本地日志自动识别，
+// 见 discover.discoverOpenCodeFingerprint；过期由指纹刷新流程续写）；
+// 本地随机编一个通不过。
+
+// ---- Zen 免费档 agent 体裁保底 ----
+//
+// 2026-09-18 真机取证 + 在线二分（`opencode-echo` 本地陷阱抓真机原文，
+// 进程内复打逐变量排除）：FreeTierError 的另一半开关在请求体——上游要求
+// 请求长得像真正的 agent 回合，缺一不可：
+//   1. tools 声明里必须同时含 `read` 与 `bash`（按 function 名判定；schema
+//      内容不校验，空 parameters 照过；10 个假名工具 / 单个真名 / read+write
+//      等组合全部 403，只有含 read+bash 的集合返回 2xx）；
+//   2. tool_choice 必须显式出现（有工具无 choice 照样 403）；
+//   3. 必须流式（stream:false 即使体裁全对也 403，chat 与 responses 同此）。
+// 头/UA/会话/TLS（Bun 1.3.14 内嵌栈）/请求体形状逐项对齐后仍 403，
+// 唯独补上 read+bash+choice 当次转 200——体裁是独立判定维度。
+//
+// 落点：Upstream 发往 zen 前统一补（转发与探针同一入口，见 ensureZenAgentShape）。
+// 开销：缺时才补，最多两个空 schema 工具（~30 input tokens）+ choice auto；
+// 已带的不动、不覆盖、不改名。另见：非流式请求网关无法代改 stream，
+// 仍会 403（见 proxy.mapUpstreamError 指引），这是客户端语义，网关不动。
+//
+// 残留风险（已评估，P≈0）：tool_choice:auto 下模型几乎不会点名调这两个
+// 垫片工具（实测 0 次）；万一调了，透传给客户端按普通 tool_call 处理，
+// 与上游调了客户端未声明工具的既有语义一致，不在网关内自作主张多轮续跑
+// （那会烧 token，违背最小消耗原则）。
+
+// 体裁保底要求的工具名（子集语义：缺哪个补哪个，不碰已有的）。
+export const ZEN_FLOOR_TOOL_NAMES = ['read', 'bash'] as const
+
+// 垫片工具的最小形态（与取证时通过的那次一致：名 + 一句话描述 + 空对象 schema）。
+function zenFloorTool(name: string): { name: string; description: string; inputSchema: unknown } {
+  return { name, description: `${name} file operation.`, inputSchema: { type: 'object', properties: {} } }
+}
+
+// zen 上游发包前落实 agent 体裁（纯函数：不改入参，缺时返回补齐后的浅拷贝）。
+// 非 zen 原样返回（同一引用，便于调用方与测试判定“没动过”）。
+// 取舍（显式决策）：即使调用方 toolChoice 为 none 也照补 read/bash——zen 免费档
+// 本来就要 agent 体裁，不补必 403；这里优先保可用，none 语义在 zen 路径下让位。
+export function ensureZenAgentShape(req: IrRequest, baseUrl: string): IrRequest {
+  if (!isZenUpstream(baseUrl)) return req
+  const names = new Set((req.tools ?? []).map((t) => t.name))
+  const missing = ZEN_FLOOR_TOOL_NAMES.filter((n) => !names.has(n))
+  if (missing.length === 0 && req.toolChoice !== undefined) return req
+  return {
+    ...req,
+    tools: [...(req.tools ?? []), ...missing.map(zenFloorTool)],
+    ...(req.toolChoice !== undefined ? {} : { toolChoice: { mode: 'auto' as const } }),
+  }
+}
 
 // 单行可打印 ASCII 才配做 UA（防 CR/LF 头注入）；超长截断到 512。
 // 空/含控制字符/含非 ASCII → undefined（调用方视为无可用 UA，不硬凑）。
@@ -89,57 +146,53 @@ export interface SessionHint {
   userAgent?: string
 }
 
-function isZenUpstream(baseUrl: string): boolean {
-  try {
-    const h = new URL(baseUrl).hostname.toLowerCase()
-    return h === 'opencode.ai' || h.endsWith('.opencode.ai')
-  } catch {
-    return false
-  }
-}
+// zen 判定见 model.isZenBaseUrl（唯一定义，避免两处漂移）。
+const isZenUpstream = isZenBaseUrl
 
-// 大小写不敏感的头查找（fetch 头名不敏感，但这里操作的是普通对象）。
-function findHeaderKey(h: Record<string, string>, name: string): string | undefined {
-  const want = name.toLowerCase()
-  for (const k of Object.keys(h)) if (k.toLowerCase() === want) return k
-  return undefined
-}
+// 大小写不敏感的头查找与会话白名单见 model（唯一定义，避免两处漂移）。
 
-function validSessionToken(s: string): boolean {
-  return /^[A-Za-z0-9_-]{1,128}$/.test(s)
-}
-
-// zen 指纹校准（导出供测试）：去毒头、落实会话头（透传 > 静态）；
+// zen 指纹校准（导出供测试）：落实 x-opencode-* 四件套（透传 > 静态 x-opencode-session
+// > 旧 x-session-id 晋升）与 x-session-id/affinity（透传 > 静态，既有行为保留）；
 // UA 缺省时补位（静态头已配的不动——显式配置优先；缺时按 透传 > ZEN_UA 补，
 // 全无则不发），拒绝伪造版本。
-// zen=true（即 opencode.ai 上游）才补位——非 zen 上游缺 UA 就是缺，不碰。
-// 去毒头不限 host：x-opencode-* 是本网关早期逆向的臆测头，官方客户端从不发送，
-// 发给任何上游都没有意义，只会触发 zen 系网关的免费档拒绝。
+// zen=true（即 opencode.ai 上游）才动——非 zen 上游原样不动。
+// 注意：x-opencode-* 一律保留（真客户端本来就发这些；删掉才会 403）。
 // envUA 是 ZEN_UA 的可注入替身（测试用，生产走 process.env.ZEN_UA）：
 // 传了（哪怕空串）就用它，不再读环境——测试不碰运行环境。
 export function applyZenFingerprint(
   h: Record<string, string>, session?: SessionHint, zen = true, envUA?: string,
 ): void {
-  for (const n of ['x-opencode-client', 'x-opencode-project', 'x-opencode-request', 'x-opencode-session']) {
-    const k = findHeaderKey(h, n)
-    if (k !== undefined) delete h[k]
-  }
   // UA 补位：Provider 静态头已配的不动（buildHeaders 里静态头先落头，
   // 显式配置优先）；缺时按 透传 > ZEN_UA 补；全都没有就不发（不编版本号）。
   if (zen && findHeaderKey(h, 'user-agent') === undefined) {
     const ua = sanitizeUA(session?.userAgent) ?? sanitizeUA(envUA ?? process.env.ZEN_UA)
     if (ua !== undefined) h['User-Agent'] = ua
   }
-  const staticId = findHeaderKey(h, 'x-session-id') !== undefined
+  if (!zen) return
+  // 会话取值：透传 > 静态 x-opencode-session > 旧 x-session-id（晋升沿用）。
+  const live = (session?.id ?? '').trim()
+  const staticZen = findHeaderKey(h, ZEN_SESSION_HEADER) !== undefined
+    ? (h[findHeaderKey(h, ZEN_SESSION_HEADER)!] ?? '').trim() : ''
+  const legacySid = findHeaderKey(h, 'x-session-id') !== undefined
     ? (h[findHeaderKey(h, 'x-session-id')!] ?? '').trim() : ''
-  const sid = (session?.id ?? '').trim() || staticId
-  if (!validSessionToken(sid)) return // 无可用会话：不硬凑，失败信息更干净
+  const sid = validZenToken(live) ? live
+    : validZenToken(staticZen) ? staticZen
+    : validZenToken(legacySid) ? legacySid : ''
+  // request 取值：静态优先；缺了现铸（真机一次会话内稳定，网关侧持久化由刷新流程做，
+  // 这里只保证每次发出的请求都带一个合法值）。
+  let rid = findHeaderKey(h, ZEN_REQUEST_HEADER) !== undefined
+    ? (h[findHeaderKey(h, ZEN_REQUEST_HEADER)!] ?? '').trim() : ''
+  if (!validZenToken(rid)) rid = mintZenRequestId()
+  if (sid !== '') zenHeadersWithFingerprint(h, sid, rid)
+  // 旧 x-session-id/affinity 行为保留（既有配置与未知工具链可能依赖；真客户端虽不发，
+  // 实测多带不影响 403 判定——403 只与四件套缺失有关）。
+  if (!validZenToken(sid)) return // 无可用会话：不硬凑，失败信息更干净
   const aff = (session?.affinity ?? '').trim()
   const affKey = findHeaderKey(h, 'x-session-affinity')
   const sidKey = findHeaderKey(h, 'x-session-id')
   if (sidKey !== undefined) h[sidKey] = sid
   else h['x-session-id'] = sid
-  const affVal = validSessionToken(aff) ? aff : sid
+  const affVal = validZenToken(aff) ? aff : sid
   if (affKey !== undefined) h[affKey] = affVal
   else h['x-session-affinity'] = affVal
 }
@@ -239,7 +292,9 @@ export class Upstream {
     let path: string
     try {
       const codec = getOutbound(proto)
-      body = codec.serializeRequest(irReq)
+      // zen 免费档要 agent 体裁才放行（缺 read/bash 工具声明或 tool_choice 即 403，
+      // 与指纹头无关的独立判定）：这里统一补，转发侧无需逐个操心。
+      body = codec.serializeRequest(ensureZenAgentShape(irReq, p.baseUrl))
       path = codec.requestPath()
     } catch (err) {
       if (err instanceof UpstreamError) throw err
@@ -380,7 +435,9 @@ export class Upstream {
     let path: string
     try {
       const codec = getOutbound(proto)
-      body = codec.serializeRequest(irReq)
+      // 探测路径同样走体裁保底：探针本就是极简 `hi`，不补则 zen 恒 403，
+      // 会把「体裁不对」误报成「源不可用」（与 streamWith 同语义，见 ensureZenAgentShape）。
+      body = codec.serializeRequest(ensureZenAgentShape(irReq, p.baseUrl))
       path = codec.requestPath()
     } catch (err) {
       throw new UpstreamError(0, UPSTREAM.BAD_REQUEST, `序列化上游请求失败: ${(err as Error).message}`)
@@ -435,7 +492,7 @@ export function classifyUpstreamError(status: number, body: string): string {
     //   RegionError   —— 地区不可用（换出口代理能解）
     //   FreeTierError —— 免费档只认官方客户端指纹，单独归 FINGERPRINT。
     //     2026-09-17 实测："OpenCode's free tier can only be used from within OpenCode"，
-    //     触发条件是缺 x-session-id/affinity 或带了旧的 x-opencode-* 四件套；
+    //     触发条件是缺 x-opencode-session 四件套（或会话过期）；旧 x-session-id 仅作晋升兼容输入。
     //     指纹对上后匿名 Bearer public 照常用。
     //     归 auth 会误导用户去翻 API Key（Key 是好的）；归 bad_request 又会被探测
     //     当作「协议路径噪音」压到最低优先级（见 probe.errorRank），真实病因浮不上来。

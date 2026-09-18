@@ -6,6 +6,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { Provider } from '../model/index.ts'
+import { mintZenRequestId } from '../model/index.ts'
 import type { Finding } from '../adminapi/types.ts'
 
 // 状态枚举的唯一定义是 adminapi/types.ts 的 DiscoverStatus（Finding.status 用的就是它）。
@@ -394,6 +395,8 @@ export function checkZCode(dirs: string[]): Finding {
 // fp：从本机 opencode 日志自动识别出的指纹（没有则 undefined）。
 // 有就把真实 UA + 会话直接写进草稿——新用户「一键导入」即可用，不需要手抄任何东西。
 // 没有也不伪造：留空头，由「opencode 做客户端时的透传 / ZEN_UA / 静态配置」兜底。
+// 头集合与真客户端对齐（2026-09-18 取证）：x-opencode-* 四件套必带
+// （上游要求 x-opencode-session），旧 x-session-id/affinity 附带兼容。
 function zenSuggestedProvider(baseURL: string, fp?: OpenCodeFingerprint | null): Provider {
   return {
     providerId: 0, name: 'opencode', state: 'active' as const, displayName: 'Zen免费档（自动发现）',
@@ -404,16 +407,21 @@ function zenSuggestedProvider(baseURL: string, fp?: OpenCodeFingerprint | null):
     credential: { apiKeyEnv: 'ZEN_KEY' },
     headers: {
       // 指纹优先级（见 upstream.applyZenFingerprint）：
-      //   静态头（这里有值就用）> 客户端透传 > ZEN_UA > 不发。
+      //   会话：客户端透传 > 静态 x-opencode-session > 旧 x-session-id；
+      //   UA：静态头已配的不动（显式配置优先），缺时按 透传 > ZEN_UA 补。
       // 自动识别到的就是「本机 opencode 真实发过的样子」，与手工抓包等价。
       // 注意：只写 opencode/<版本> 这一段 UA——中间两段是 opencode 内部依赖版本，
       // 日志里没有也无从可靠推断；实测这一段足够（测试有锚点）。不编造版本号。
       ...(fp ? {
         'User-Agent': fp.userAgent,
+        'x-opencode-client': 'cli',
+        'x-opencode-project': 'global',
+        'x-opencode-session': fp.sessionID,
+        'x-opencode-request': mintZenRequestId(),
+        // 旧键附带：历史工具链可能读它们；真客户端虽不发，多带经实测不影响判定。
         'x-session-id': fp.sessionID,
         'x-session-affinity': fp.sessionID,
       } : {}),
-      // 不要加 x-opencode-*（毒头，见 upstream.applyZenFingerprint）。
     },
     priority: 1,
     models: [
@@ -574,7 +582,7 @@ export async function checkZen(
       f.actions = [
         'Zen 免费档只接受 opencode 官方客户端的指纹。最省事：安装并运行一次 opencode（opencode run "hi"），它会写入真实指纹，再回本页重扫即可',
         '已装但重扫仍无效？确认数据目录在默认位置，或用 OPENCODE_DATA_DIR 指定其数据目录后重启网关',
-        '若不打算用 opencode：在该 Provider 头里手填 User-Agent 与 x-session-id/x-session-affinity（抓包取真值），或设 ZEN_UA 环境变量',
+        '若不打算用 opencode：在该 Provider 头里手填 User-Agent 与 x-opencode-session（抓包取真值），或设 ZEN_UA 环境变量；x-opencode-request 缺了网关会自动现铸',
         '以上都不想：改用付费档凭据（免费档的限制与额度无关，是客户端身份校验）',
       ]
     }
@@ -587,7 +595,7 @@ export async function checkZen(
 
 // ---- OpenCode 客户端指纹自动识别 ----
 //
-// 免费档要求「官方客户端样子」：真实 User-Agent + 真实 x-session-id/affinity。
+// 免费档要求「官方客户端样子」：真实 User-Agent + x-opencode-* 指纹四件套。
 // 这些**不用让用户手抄**——opencode 自己会把它们写进本地日志，直接从日志里读。
 //
 // 日志里的可信来源（宁缺勿滥，避免把无关字符串当指纹）：
@@ -654,8 +662,7 @@ export function openCodeLogFiles(dirs: string[]): string[] {
 // 从日志内容提取指纹。纯函数（便于测试），不碰文件系统。
 // 策略：取**最后一个**可用会话（最近一次真实运行的最可能还新鲜）；
 // 需要「自建会话」与「确实对 opencode(zen) 发起过 stream」两个证据同时成立。
-export function parseFingerprintFromLog(text: string): { sessionID: string; version: string; modelID?: string } | null {
-  // 会话自建：在 message=created 的那一行里同时拿到 id 与 version。
+export function parseFingerprintFromLog(text: string): { sessionID: string; version: string; modelID?: string } | null {  // 会话自建：在 message=created 的那一行里同时拿到 id 与 version。
   //
   // 刻意**不依赖字段顺序**：早先的写法假设 `id=` 在 `version=` 之前，字段序一变
   // （换版本、不同构建）就整条识别不出来 → 用户明明装了 opencode、却被告知
@@ -679,6 +686,45 @@ export function parseFingerprintFromLog(text: string): { sessionID: string; vers
     new RegExp(`message=stream providerID=opencode modelID=([^\\s]+) session\\.id=${sessionID}`, 'g'),
   )]
   return { sessionID, version, modelID: used.length > 0 ? used[used.length - 1]![1] : undefined }
+}
+
+// ---- Zen 指纹刷新（x-opencode-session / x-opencode-request） ----
+//
+// 真客户端一次会话内四件套稳定：session = 本次运行的 ses_…，request = 首条用户消息的
+// msg_…（同一会话后续请求沿用同一个，见 2026-09-18 取证：1285 次请求同一 msg）。
+// 网关刷新策略与之对齐：取最新会话 + 该会话在日志里最后一次出现的 msg ID（
+// message=process 行同时带 session.id 与 messageID）；找不到 msg 时现铸一个
+// （格式与观测一致即可，见 mintZenRequestId），绝不复用别的会话的。
+// key+sid 出现后必须跟分隔符（空白/逗号/引号）或行尾才算命中。
+function ownsSessionRef(line: string, sessionID: string): boolean {
+  for (const key of ['session.id=', 'id=']) {
+    let at = line.indexOf(key + sessionID)
+    while (at !== -1) {
+      const tail = line.slice(at + key.length + sessionID.length)
+      if (tail === '' || /[\s,"\x27]/.test(tail[0]!)) return true
+      at = line.indexOf(key + sessionID, at + 1)
+    }
+  }
+  return false
+}
+const MSG_ID_RE = /messageID=(msg_[A-Za-z0-9_-]{8,64})/
+
+// 取某会话在日志中最后一次关联的 msg ID（纯函数）。同一行须同时出现
+// session.id=<sid> 与 messageID=msg_…（即 message=process 行的形状）。
+export function latestSessionMessageId(text: string, sessionID: string): string | undefined {
+  if (!sessionID) return undefined
+  let out: string | undefined
+  for (const line of text.split('\n')) {
+    if (!line.includes(sessionID)) continue
+    const m = MSG_ID_RE.exec(line)
+    if (!m) continue
+    // 同一行必须同时点名该会话（避免串到别的会话的 msg）。
+    // 归属用边界感知匹配：key+id 后必须跟分隔符或行尾，否则会话 A 是会话 B
+    // 前缀时会把 B 的 process 行误归属给 A（后 24 位随机，概率极小但防一手）。
+    if (!ownsSessionRef(line, sessionID)) continue
+    out = m[1]
+  }
+  return out
 }
 
 // 扫描本机 opencode 日志，返回指纹（找不到返回 null）。

@@ -234,7 +234,7 @@ describe('checkZen', () => {
     expect(f.detail).toContain('未找到可用的客户端指纹')
     // 出路按门槛从低到高：先「装并运行一次 opencode」，抓包排在后面。
     expect(f.actions?.[0]).toContain('运行一次 opencode')
-    expect(f.actions?.some((a) => a.includes('x-session-id'))).toBe(true)
+    expect(f.actions?.some((a) => a.includes('x-opencode-session'))).toBe(true)
   })
 
   test('列表通且真实调用成功 → ready，并标出实测模型', async () => {

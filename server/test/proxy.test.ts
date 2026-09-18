@@ -674,3 +674,17 @@ describe('mapUpstreamError：推理参数 400 带指引（按“发过档位”�
     expect(mapUpstreamError(undefined).message).toBe('无可用上游')
   })
 })
+
+describe('mapUpstreamError：指纹拒绝指引含体裁与流式要求（2026-09-18 取证）', () => {
+  // zen 免费档的拒绝有两半开关：指纹头 + agent 体裁（read/bash 工具声明 +
+  // tool_choice，且须流式）。网关转发时已自动补工具声明，但 stream 是客户端
+  // 语义、网关不代改——指引必须把这两句都点名，否则用户照着刷会话也过不了。
+  test('FINGERPRINT 指引保留刷新入口，并点名体裁/流式', () => {
+    const e = mapUpstreamError(new UpstreamError(403, UPSTREAM.FINGERPRINT, 'free tier'))
+    expect(e.type).toBe('authentication_error')
+    expect(e.httpStatus).toBe(401)
+    expect(e.message).toContain('refresh-fingerprint')
+    expect(e.message).toContain('read/bash')
+    expect(e.message).toContain('stream=false')
+  })
+})

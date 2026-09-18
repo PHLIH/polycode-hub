@@ -1,11 +1,12 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createServer, type Server } from 'node:http'
 import { AddressInfo } from 'node:net'
-import { Upstream, joinURL, probeOrder, shouldTryOtherProtocol, resolveProtocol, egressProxyURI, buildRequestURL, classifyUpstreamError, applyZenFingerprint, sanitizeUA, summarizeUpstreamBody } from '../src/router/upstream.ts'
+import { Upstream, joinURL, probeOrder, shouldTryOtherProtocol, resolveProtocol, egressProxyURI, buildRequestURL, classifyUpstreamError, applyZenFingerprint, sanitizeUA, summarizeUpstreamBody, ensureZenAgentShape, ZEN_FLOOR_TOOL_NAMES } from '../src/router/upstream.ts'
 import { UpstreamError } from '../src/ir/index.ts'
 import { forgetProtocol, rememberProtocol } from '../src/model/index.ts'
 import type { Provider } from '../src/model/index.ts'
-import { UPSTREAM } from '../src/ir/index.ts'
+import { UPSTREAM, getOutbound } from '../src/ir/index.ts'
+import type { IrRequest } from '../src/ir/index.ts'
 import '../src/codec/anthropicmessages.ts'
 import '../src/codec/openaicompletions.ts'
 import '../src/codec/openairesponses.ts'
@@ -402,20 +403,47 @@ test('setEgresses 热更新：换表并清 dispatcher 缓存（旧表引用失�
   await new Promise<void>((r) => px.close(() => r()))
 })
 
-// zen 指纹校准（通用机制：网关不内置版本号、不伪造 UA）：
-// 去毒头（旧 x-opencode-* 四件套带了必 403 FreeTierError）必须删；
+// zen 指纹校准（与真客户端对齐：发 x-opencode-* 四件套，不删）：
+// 2026-09-18 真机取证推翻了旧的“毒头”假设——官方客户端本来就发四件套，
+// 删掉才会 403。会话取值 透传 > 静态 x-opencode-session > 旧 x-session-id 晋升；
 // UA 缺省时按 静态 > 透传 > ZEN_UA 补位，全无则如实不发；
-// 会话头按 透传 > 静态 落实，affinity 缺省跟 id。
 describe('zen 指纹校准 applyZenFingerprint', () => {
-  test('去毒头：x-opencode-* 四件套一律删除（大小写不敏感）', () => {
+  test('x-opencode-* 四件套保留并补全（大小写不敏感，不再删除）', () => {
     const h: Record<string, string> = {
       'x-opencode-client': 'cli', 'X-OpenCode-Project': 'global',
       'x-opencode-request': 'msg_x', 'x-opencode-session': 'ses_x',
       'Content-Type': 'application/json',
     }
-    applyZenFingerprint(h, { id: 'ses_real' })
-    expect(Object.keys(h).some((k) => k.toLowerCase().startsWith('x-opencode-'))).toBe(false)
+    applyZenFingerprint(h, { id: 'ses_real' }, true, '')
+    expect(h['x-opencode-session']).toBe('ses_real') // 透传覆盖静态
+    expect(h['x-opencode-request']).toBe('msg_x') // 静态 request 保留（真机一次会话内稳定）
     expect(h['Content-Type']).toBe('application/json') // 无关头不动
+    // 大小写不敏感：X-OpenCode-Project 就地识别，不新增重复键
+    expect(Object.keys(h).filter((k) => k.toLowerCase() === 'x-opencode-project')).toHaveLength(1)
+  })
+
+  test('旧 x-session-id 晋升为 x-opencode-session；缺 request 则现铸', () => {
+    const h: Record<string, string> = { 'x-session-id': 'ses_legacy' }
+    applyZenFingerprint(h, undefined, true, '')
+    expect(h['x-opencode-session']).toBe('ses_legacy')
+    expect(h['x-opencode-request']).toMatch(/^msg_[A-Za-z0-9]{24}$/)
+    expect(h['x-opencode-client']).toBe('cli')
+    expect(h['x-opencode-project']).toBe('global')
+  })
+
+  test('显式配的 client/project 不覆盖；脏会话不硬凑', () => {
+    const h: Record<string, string> = {
+      'x-opencode-client': 'mine', 'x-opencode-project': 'proj9',
+      'x-opencode-session': 'ses_static',
+    }
+    applyZenFingerprint(h, { id: 'has space!' }, true, '')
+    expect(h['x-opencode-session']).toBe('ses_static') // 脏透传回退静态
+    expect(h['x-opencode-client']).toBe('mine')
+    expect(h['x-opencode-project']).toBe('proj9')
+    const h2: Record<string, string> = {}
+    applyZenFingerprint(h2, { id: '' }, true, '')
+    expect(h2['x-opencode-session']).toBeUndefined()
+    expect(h2['x-session-id']).toBeUndefined()
   })
 
   test('UA 补位：静态优先（已配不动）；缺时透传；再缺用 ZEN_UA；全无不发', () => {
@@ -477,5 +505,82 @@ describe('zen 指纹校准 applyZenFingerprint', () => {
     applyZenFingerprint(h2, { id: '' })
     expect(h2['x-session-id']).toBeUndefined()
     expect(h2['x-session-affinity']).toBeUndefined()
+  })
+})
+
+describe('zen agent 体裁保底 ensureZenAgentShape（2026-09-18 真机取证）', () => {
+  // 取证结论：FreeTierError 的另一半开关在请求体——tools 须同时含 read+bash
+  // （按名判定，schema 不校验），且 tool_choice 必须显式出现，还须流式。
+  // 缺任一项即 403（与指纹头无关的独立判定）；补齐当次转 200。
+  const ZEN = 'https://opencode.ai/zen/v1'
+  const bare = (): IrRequest => ({
+    model: 'mimo-v2.5-free', stream: true,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+  })
+  const tool = (name: string) => ({ name, description: `${name} file operation.`, inputSchema: { type: 'object', properties: {} } })
+
+  test('非 zen 原样返回（同一引用，不碰别的上游）', () => {
+    const r = bare()
+    expect(ensureZenAgentShape(r, 'https://api.deepseek.com')).toBe(r)
+  })
+
+  test('zen 缺 tools+choice → 补 read/bash + auto，且不改入参', () => {
+    const r = bare()
+    const out = ensureZenAgentShape(r, ZEN)
+    expect(out).not.toBe(r)
+    expect(r.tools).toBeUndefined()
+    expect(r.toolChoice).toBeUndefined()
+    expect(out.tools?.map((t) => t.name)).toEqual([...ZEN_FLOOR_TOOL_NAMES])
+    expect(out.toolChoice).toEqual({ mode: 'auto' })
+  })
+
+  test('zen 已齐（read+bash+choice）→ 同一引用（一字不动）', () => {
+    const r = bare()
+    r.tools = [tool('read'), tool('bash')]
+    r.toolChoice = { mode: 'auto' }
+    expect(ensureZenAgentShape(r, ZEN)).toBe(r)
+  })
+
+  test('有 tools 无 choice → 只补 choice，工具原样保留', () => {
+    const r = bare()
+    r.tools = [tool('read'), tool('bash'), tool('edit')]
+    const out = ensureZenAgentShape(r, ZEN)
+    expect(out.tools?.map((t) => t.name)).toEqual(['read', 'bash', 'edit'])
+    expect(out.toolChoice).toEqual({ mode: 'auto' })
+  })
+
+  test('有 choice 无 tools → 补两工具', () => {
+    const r = bare()
+    r.toolChoice = { mode: 'auto' }
+    const out = ensureZenAgentShape(r, ZEN)
+    expect(out.tools?.map((t) => t.name)).toEqual([...ZEN_FLOOR_TOOL_NAMES])
+    expect(out.toolChoice).toEqual({ mode: 'auto' })
+  })
+
+  test('只有假名工具 → 保留假名并补 read/bash（子集语义，不删不改名）', () => {
+    const r = bare()
+    r.tools = [tool('zen_ping')]
+    r.toolChoice = { mode: 'auto' }
+    const out = ensureZenAgentShape(r, ZEN)
+    expect(out.tools?.map((t) => t.name)).toEqual(['zen_ping', 'read', 'bash'])
+  })
+
+  test('线上形态：补齐后经 openai-completions 出站含 tools+choice', () => {
+    const out = ensureZenAgentShape(bare(), ZEN)
+    const wire = JSON.parse(Buffer.from(getOutbound('openai-completions').serializeRequest(out)).toString()) as {
+      tools: { function: { name: string } }[]; tool_choice: unknown; stream: unknown
+    }
+    expect(wire.tools.map((t) => t.function.name)).toEqual(['read', 'bash'])
+    expect(wire.tool_choice).toBe('auto')
+    expect(wire.stream).toBe(true)
+  })
+
+  test('线上形态：补齐后经 openai-responses 出站含 tools+choice（muse-spark 路径）', () => {
+    const out = ensureZenAgentShape(bare(), ZEN)
+    const wire = JSON.parse(Buffer.from(getOutbound('openai-responses').serializeRequest(out)).toString()) as {
+      tools: { name: string }[]; tool_choice: unknown
+    }
+    expect(wire.tools.map((t) => t.name)).toEqual(['read', 'bash'])
+    expect(wire.tool_choice).toBe('auto')
   })
 })

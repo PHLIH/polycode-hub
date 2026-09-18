@@ -99,6 +99,10 @@ export const api = {
   // 凭证明文按需查看（列表只下发引用，明文走这个显式端点）。
   providerCredential: (pid) => req('GET', `/admin/api/providers/${encodeURIComponent(pid)}/credential`),
   testProvider: (pid) => req('POST', `/admin/api/providers/${encodeURIComponent(pid)}/test`),
+  // Zen 指纹刷新：读本机新鲜会话写回静态头（自动续期）；本地无新鲜会话时
+  // 返回 {updated:false, next}，需先跑一次客户端再点（长闲置必须重取）。
+  // 手动刷新可能读日志+写库，60s 超时兜底（与其他写操作同口径），避免按钮卡死。
+  refreshFingerprint: (pid) => req('POST', `/admin/api/providers/${encodeURIComponent(pid)}/refresh-fingerprint`, undefined, { timeoutMs: 60000 }),
   fetchProviderModels: async (pid) => {
     const data = await req('GET', `/admin/api/providers/${encodeURIComponent(pid)}/models`)
     if (Array.isArray(data)) return { models: data, source: '', protocols: {}, caps: {}, free: [] }

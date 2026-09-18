@@ -22,7 +22,7 @@ import { registerDiscoverRoutes, workbuddyTokenHash } from './discover_api.ts'
 import type {
   AccountProber, AccountResetter, AccountRuntime, ChangeNotifier, DiscoverSource, ModelList,
   ProviderModelLister, ProviderModelProber, ProviderProber,
-  StatsSource,
+  StatsSource, FingerprintRefresherAdmin,
 } from './types.ts'
 export type { ModelList }
 
@@ -48,6 +48,8 @@ export interface AdminApiDeps {
   // WorkBuddy 签到（自动登录）上游调用：缺省走全局 fetch，测试注入桩。
   // 不注入真实网络——签到有上游成本且结果不可复现，单测必须离线可跑。
   workbuddyCheckinFetch?: typeof fetch
+  // Zen 指纹刷新（自动续期）：cli 注入，读本机 opencode 日志写回 Provider 静态头。
+  fingerprint?: FingerprintRefresherAdmin
 }
 
 // PATCH 白名单（只读字段出现即 400；ID 永久不可改；credential 只收引用）。
@@ -60,7 +62,7 @@ const PROVIDER_PATCH_ALLOW = new Set([
   // state 是三态开关（active/paused）；enabled 是它的布尔兼容写法。
   'name', 'state', 'enabled', 'priority', 'streamOnly', 'displayName', 'riskNote', 'risk',
   'credential', 'models', 'probeModel', 'egress', 'stability', 'accessKind', 'api',
-  'credentialInput', 'credentialKind', 'baseUrl',
+  'credentialInput', 'credentialKind', 'baseUrl', 'headers',
 ])
 
 const ACCOUNT_PATCH_ALLOW = new Set([
@@ -199,6 +201,27 @@ function parsePatchModels(v: unknown): PatchModel[] | undefined {
     out.push(pm)
   }
   return out
+}
+
+// headers 整包替换（Zen 指纹手填/纠偏入口）：键值全是字符串，防头注入。
+// 空对象 = 清空（回到无静态头，zen 指纹走透传/ZEN_UA）。返回 [头表, 错误文案]。
+function parseHeadersPatch(v: unknown): [Record<string, string> | undefined, string] {
+  if (!isObj(v)) return [undefined, 'headers 须为对象（{"头名": "头值"}）']
+  const keys = Object.keys(v)
+  if (keys.length > 32) return [undefined, 'headers 最多 32 个']
+  const out: Record<string, string> = {}
+  for (const k of keys) {
+    if (k.length === 0 || k.trim() === '' || k.length > 128 || /[\r\n:]/.test(k)) {
+      return [undefined, `头名非法: ${k.slice(0, 40)}`]
+    }
+    const val: unknown = (v as Record<string, unknown>)[k]
+    if (typeof val !== 'string') return [undefined, `头 ${k} 的值须为字符串`]
+    if (val.length > 2048 || /[\r\n]/.test(val)) {
+      return [undefined, `头 ${k} 的值非法（换行/超长）`]
+    }
+    out[k] = val
+  }
+  return [out, '']
 }
 
 // ---- 装配入口 ----
@@ -473,10 +496,17 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
       },
     }
     for (const [k, v] of Object.entries(patch)) {
-      if (k === 'models' || k === 'credentialInput' || k === 'credentialKind') continue
+      // headers 走下面的显式分支（要报精确的校验文案，不走 setter 的“类型错误”）。
+      if (k === 'models' || k === 'credentialInput' || k === 'credentialKind' || k === 'headers') continue
       const set = setters[k]
       if (!set) continue
       if (!set(v)) return errRes(c, 400, ERR.INVALID_REQUEST, `字段 ${k} 类型错误`)
+    }
+    // 静态头整包替换（Zen 指纹手填/纠偏入口；空对象 = 清空回透传）。
+    if ('headers' in patch) {
+      const [parsed, herr] = parseHeadersPatch(patch.headers)
+      if (herr) return errRes(c, 400, ERR.INVALID_REQUEST, herr)
+      p.headers = parsed
     }
     // 编辑时同样支持粘贴 Key 本体（语义同 POST）：非空才覆盖，空串 = 不动原引用。
     if (typeof patch.credentialInput === 'string' && patch.credentialInput.trim() !== '') {
@@ -864,6 +894,21 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
     const res: ProbeResult = await deps.prober.probeProvider(p.providerId)
     return ok(c, 200, res)
+  })
+
+  // Zen 指纹刷新：读本机 opencode 日志里的新鲜会话并写回该 Provider 静态头。
+  // 有新鲜会话 = 自动续期成功；没有（用户很久没打开过客户端）= 如实返回 next 指引，
+  // 必须先跑一次客户端产生会话，程序无中生有不了。
+  app.post('/admin/api/providers/:pid/refresh-fingerprint', async (c) => {
+    const raw = c.req.param('pid')
+    const p = findProvider(providers, raw)
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
+    if (!deps.fingerprint) return errRes(c, 501, ERR.API, '指纹刷新未接线')
+    try {
+      return ok(c, 200, await deps.fingerprint.refreshFingerprint(p.providerId))
+    } catch (e) {
+      return errRes(c, 500, ERR.API, '指纹刷新失败: ' + (e as Error).message)
+    }
   })
 
   // 批量实测候选模型；探到的协议写回模型目录（探测结果即事实，下次转发直达）。

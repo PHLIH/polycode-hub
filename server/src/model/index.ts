@@ -327,3 +327,94 @@ export function looksFree(id: string): boolean {
 }
 
 export * from './autoproto.ts'
+
+// ---- OpenCode Zen 反代指纹（与真客户端对齐的头集合） ----
+//
+// 2026-09-18 真机取证（本地日志端点实测官方客户端发出的请求头）：
+//   authorization: Bearer public
+//   user-agent: opencode/<ver> ai-sdk/provider-utils/<ver> runtime/bun/<ver>
+//   x-opencode-client: cli
+//   x-opencode-project: global（或该目录的 hex projectID）
+//   x-opencode-request: msg_<24位>（一次会话内稳定）
+//   x-opencode-session: ses_<…>（本次运行的真实会话）
+// 真客户端**不发** x-session-id / x-session-affinity（那是 ai-sdk 给别的上游用的，
+// zen 内建通道只认上面四件套）。此前网关把四件套当“毒头”删掉并只发 x-session-*，
+// 与真机行为完全相反——上游收紧校验（2026-09 要求 x-opencode-session）后全量 403。
+// 这里只定义头名常量与纯函数，取值（会话发现/刷新）由 discover 与 cli 层负责。
+
+export const ZEN_CLIENT_HEADER = 'x-opencode-client'
+export const ZEN_PROJECT_HEADER = 'x-opencode-project'
+export const ZEN_REQUEST_HEADER = 'x-opencode-request'
+export const ZEN_SESSION_HEADER = 'x-opencode-session'
+
+export const ZEN_DEFAULT_CLIENT = 'cli'
+export const ZEN_DEFAULT_PROJECT = 'global'
+
+// 是否 Zen 上游（与 router/upstream 的判定同口径，此处独立定义以免 model 反向依赖 router）。
+export function isZenBaseUrl(baseUrl: string): boolean {
+  try {
+    const h = new URL(baseUrl).hostname.toLowerCase()
+    return h === 'opencode.ai' || h.endsWith('.opencode.ai')
+  } catch {
+    return false
+  }
+}
+
+// 大小写不敏感的头查找（fetch 头名不敏感，但这里操作的是普通对象）。
+export function findHeaderKey(h: Record<string, string>, name: string): string | undefined {
+  const want = name.toLowerCase()
+  for (const k of Object.keys(h)) if (k.toLowerCase() === want) return k
+  return undefined
+}
+
+// 会话 token 白名单（与 upstream 一致：字母数字/_/-，≤128）。
+export function validZenToken(s: string): boolean {
+  return /^[A-Za-z0-9_-]{1,128}$/.test(s)
+}
+
+// 把指纹会话落实为 x-opencode-* 四件套（纯函数，就地改 h 并返回是否写过）：
+//   sessionID 必填（无效则什么都不写）；requestID 缺省时保留静态值（真机一次会话内稳定）。
+//   client/project 缺省时保留静态值，都没有才填默认值——显式配置优先，不覆盖运维手填。
+//   UA 不在这里动（upstream.sanitizeUA 按 静态 > 透传 > ZEN_UA 另行补位）。
+export function zenHeadersWithFingerprint(
+  h: Record<string, string>, sessionID: string, requestID?: string,
+): boolean {
+  const sid = (sessionID ?? '').trim()
+  if (!validZenToken(sid)) return false
+  const set = (name: string, value: string) => {
+    const k = findHeaderKey(h, name)
+    if (k !== undefined) h[k] = value
+    else h[name] = value
+  }
+  set(ZEN_SESSION_HEADER, sid)
+  const rid = (requestID ?? '').trim()
+  if (validZenToken(rid)) set(ZEN_REQUEST_HEADER, rid)
+  else if (findHeaderKey(h, ZEN_REQUEST_HEADER) === undefined) {
+    // 连静态值都没有：调用方应先铸一个再调（见本文件 mintZenRequestId），
+    // 这里不凭空编——缺了就缺了，报 403 时指引会点名。
+  }
+  if (findHeaderKey(h, ZEN_CLIENT_HEADER) === undefined) h[ZEN_CLIENT_HEADER] = ZEN_DEFAULT_CLIENT
+  if (findHeaderKey(h, ZEN_PROJECT_HEADER) === undefined) h[ZEN_PROJECT_HEADER] = ZEN_DEFAULT_PROJECT
+  return true
+}
+
+const ZEN_REQ_LOWER = '0123456789abcdefghijklmnopqrstuvwxyz'
+const ZEN_REQ_MIXED = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+
+// 现铸一个 x-opencode-request ID。观测形状：msg_ + 前 12 位小写字母数字 +
+// 后 12 位混合大小写（如 msg_0b20f9fce001SFZUUtZpYDSXKH）。
+// 前缀疑似含时间分量——网关无法复刻其编码，随机填之：
+// 若上游只验格式/唯一性则可用；若验时间绑定则与现状（陈旧复用）同样 403，不回归。
+export function mintZenRequestId(pick: (chars: string) => string = defaultPick): string {
+  let pre = ''
+  let suf = ''
+  for (let i = 0; i < 12; i++) {
+    pre += pick(ZEN_REQ_LOWER)
+    suf += pick(ZEN_REQ_MIXED)
+  }
+  return `msg_${pre}${suf}`
+}
+
+function defaultPick(chars: string): string {
+  return chars[Math.floor(Math.random() * chars.length)]!
+}

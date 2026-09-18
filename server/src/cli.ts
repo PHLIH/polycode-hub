@@ -31,6 +31,8 @@ import {
   Scanner, defaultConfig, discoverWorkBuddyModelsFrom, workBuddyDataDirs,
   discoverOpenCodeFingerprint, type ZenCallProbe,
 } from './discover/index.ts'
+import { refreshAllZenProviders, refreshZenProvider } from './discover/zen_refresh.ts'
+import { isZenBaseUrl, mintZenRequestId } from './model/index.ts'
 
 // 目录候选的安全取值（配置可能未提供该字段）。
 const workBuddyDataNullsafe = (dirs: string[] | undefined): string[] => dirs ?? []
@@ -221,6 +223,28 @@ export async function runServe(args: string[]): Promise<void> {
   }
   syncStores() // 启动即同步一次：DB 里有、配置文件没有的也要进调度
 
+  // Zen 指纹自愈（自动续期）：本机 opencode 日志是新鲜会话的唯一来源。
+  //   · 启动刷新一次（尽力而为：没日志/没会话不阻断启动，只打日志）；
+  //   · 转发中遇到 FINGERPRINT 失败 → 刷新后同候选重试一次（见 Proxy）；
+  //   · 管理台可手动触发（POST /admin/api/providers/:pid/refresh-fingerprint）。
+  // 本地无新鲜会话（用户很久没打开过客户端）时返回 null/指引——登录态无中生有不了，
+  // 必须先跑一次客户端（opencode run "hi"），这是唯一需要人工的一步。
+  const bootCfg = defaultConfig()
+  const openCodeDirs = bootCfg.openCodeDirs ?? []
+  const refreshOne = (providerId: number) =>
+    refreshZenProvider(providers, syncStores, providerId, openCodeDirs)
+  for (const rep of refreshAllZenProviders(providers, syncStores, openCodeDirs)) {
+    console.log(`指纹启动刷新 ${rep.providerName}(#${rep.providerId}): ${rep.detail}`)
+  }
+  syncStores() // 刷新可能改了 Provider 静态头，再同步一次让调度即时生效
+  px.setFingerprintRefresher(async (pv) => {
+    const cur = providers.get(pv.providerId)
+    if (!cur || !isZenBaseUrl(cur.baseUrl)) return null
+    const rep = refreshOne(cur.providerId)
+    if (!rep.updated) return null
+    return providers.get(cur.providerId) ?? null
+  })
+
   // zen 可调用性验证：发现页的探针必须真打一次，否则 GET /v1/models（免指纹）会把
   // 「网络通」误报成 ready，用户到手才发现 403 FreeTierError（真实假阳性）。
   const zenCallProbe: ZenCallProbe = async (model) => {
@@ -236,10 +260,20 @@ export async function runServe(args: string[]): Promise<void> {
     const configured = providers.list().find((x) => x.state !== 'deleted'
       && (x.name === 'opencode' || x.name === 'zen' || x.baseUrl.includes('opencode.ai')))
     // 与发现页同源：从本机 opencode 日志识别指纹（识别不到则为 null，不伪造）。
+    // 头集合与真机对齐（2026-09-18 取证）：x-opencode-* 四件套必带，
+    // 旧 x-session-id/affinity 附带兼容（真机不发但多带无害）。
     const fp = discoverOpenCodeFingerprint(
       workBuddyDataNullsafe(draft.openCodeDirs))
     const autoHeaders: Record<string, string> = fp
-      ? { 'User-Agent': fp.userAgent, 'x-session-id': fp.sessionID, 'x-session-affinity': fp.sessionID }
+      ? {
+        'User-Agent': fp.userAgent,
+        'x-opencode-client': 'cli',
+        'x-opencode-project': 'global',
+        'x-opencode-session': fp.sessionID,
+        'x-opencode-request': mintZenRequestId(),
+        'x-session-id': fp.sessionID,
+        'x-session-affinity': fp.sessionID,
+      }
       : {}
     const p: Provider = configured
       ? { ...configured, models: [{ id: model, manual: false, enabled: true, ...(configured.models.find((m) => m.id === model)?.api ? { api: configured.models.find((m) => m.id === model)!.api } : {}) }], probeModel: model }
@@ -299,6 +333,7 @@ export async function runServe(args: string[]): Promise<void> {
     },
     accountProber: { probeAccount: (id, model) => probe.probeAccount(id, model) },
     prober: { probeProvider: (pid) => probe.probeProvider(pid) },
+    fingerprint: { refreshFingerprint: async (pid) => refreshOne(pid) },
     lister: { listProviderModels: (pid) => probe.listProviderModels(pid) },
     modelProber: { probeModels: (pid, models) => probe.probeModels(pid, models) },
     notify: syncStores,

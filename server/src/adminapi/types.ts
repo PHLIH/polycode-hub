@@ -74,6 +74,25 @@ export interface AccountProber {
 // ChangeNotifier 存储变更通知（调度热重载用）。
 export type ChangeNotifier = () => void
 
+// ---- Zen 指纹刷新（自动续期 + 长闲置指引）----
+
+// 单次刷新的报告（JSON 可序列化，直接下发前端）。
+export interface FingerprintRefreshReport {
+  providerId: number
+  providerName: string
+  updated: boolean // true = 已写回新的会话
+  sessionChanged: boolean // true = 会话值确实变了（false 可能只是补了缺失的头）
+  detail: string // 人话说明（含新会话来源）
+  // 没刷成时的下一步（长闲置：本地无新鲜会话，必须先让用户跑一次客户端）。
+  // 刷成了则为空。
+  next?: string
+}
+
+// 指纹刷新器（cli 注入：读本机 opencode 日志 → 写回 Provider 静态头 → 通知热重载）。
+export interface FingerprintRefresherAdmin {
+  refreshFingerprint(providerId: number): Promise<FingerprintRefreshReport>
+}
+
 // ---- 本机 harness 发现（JSON 形状与 server/src/discover 的 Finding 一致）----
 // 此处只定义管理面消费的数据形状，main 接线时经 DiscoverSourceAdapter 适配。
 

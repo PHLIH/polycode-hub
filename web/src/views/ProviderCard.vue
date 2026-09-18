@@ -276,6 +276,35 @@ function onHeadClick() {
   else emit('models', props.p)
 }
 
+// Zen 指纹刷新：免费档会话会过期，网关平时自动续（转发失败自愈 + 启动刷新），
+// 这里是手动入口。本地无新鲜会话（很久没打开过客户端）时后端返回 next 指引，
+// 必须先跑一次客户端，程序无中生有不了。
+// 与后端 model.isZenBaseUrl 同口径：hostname 等于 opencode.ai 或以 .opencode.ai 结尾。
+// 以前是 substring 判断（foo-opencode.ai.evil.com 会误判），误判后果只是多显示
+// 一个按钮（点了后端回非 Zen），但口径一致省得以后排障扯皮。
+const isZen = computed(() => {
+  try {
+    const h = new URL(String(props.p.baseUrl || '')).hostname.toLowerCase()
+    return h === 'opencode.ai' || h.endsWith('.opencode.ai')
+  } catch { return false }
+})
+const refreshing = ref(false)
+async function refreshFingerprint() {
+  refreshing.value = true
+  try {
+    const r = await api.refreshFingerprint(props.p.providerId)
+    if (r.updated) {
+      ElMessage.success(r.detail || '指纹已刷新')
+      emit('reload')
+    } else if (r.next) {
+      ElMessage.warning({ message: `${r.detail || '无新鲜会话'}。${r.next}`, duration: 10000 })
+    } else {
+      ElMessage.success(r.detail || '已是最新，无需刷新')
+    }
+  } catch (e) { ElMessage.error(`刷新失败：${e instanceof Error ? e.message : String(e)}`) }
+  finally { refreshing.value = false }
+}
+
 async function toggle() {
   try {
     await api.updateProvider(props.p.providerId, { state: props.p.state !== 'active' ? 'active' : 'paused' })
@@ -333,6 +362,9 @@ async function toggle() {
           <button class="act" @click.stop="emit('models', p)">模型</button>
           <button class="act" :disabled="testing" @click.stop="emit('test', p)">
             {{ testing ? '测试中…' : '测试' }}</button>
+          <button v-if="isZen" class="act" :disabled="refreshing" title="读本机新鲜会话写回静态头（会话过期后点这个续期；很久没打开过客户端时需先跑一次 opencode）"
+            @click.stop="refreshFingerprint">
+            {{ refreshing ? '刷新中…' : '刷新指纹' }}</button>
           <button class="act" @click.stop="emit('edit', p)">编辑</button>
           <button class="act danger" @click.stop="emit('remove', p)">删除</button>
           <span class="vr" aria-hidden="true" />

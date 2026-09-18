@@ -20,6 +20,12 @@ export interface UsageSink {
   insertLog(l: UsageLog): Promise<void> | void
 }
 
+// 指纹刷新器（cli 注入）：上游报 FINGERPRINT（免费档指纹被拒）时，去本机重扫
+// opencode 日志里的新鲜会话并写回 Provider，返回刷新后的 Provider（供重试一次），
+// 或 null（本地也没有新鲜指纹——用户很久没打开过客户端，只能重新登录，无可刷新）。
+// 返回 null 时不重试，原错直接返回并照常冷却。
+export type FingerprintRefresher = (pv: Provider) => Promise<Provider | null>
+
 // 失败分类 → 账号冷却时长（限流 1min、耗尽 10min、鉴权/指纹/地区 30min、其他 30s）。
 // 指纹缺失与鉴权同类：不配好 UA/会话就永远 403，30s 冷却只会让它反复爬起来空撞。
 // 地区限制（REGION）同理：挂上 egress 之前都白试。
@@ -82,7 +88,8 @@ export function mapUpstreamError(ue: UpstreamError | undefined, sentEffort?: str
     // 否则用户只拿到一句英文 403，不知道该去 Provider 头里配什么。
     case UPSTREAM.FINGERPRINT: return irError(ERR.AUTHENTICATION,
       '上游只接受官方客户端指纹（免费档限制）: ' + ue.message
-      + '；请在该 Provider 头里配真实 User-Agent 与 x-session-id/x-session-affinity（opencode run --print-logs 取 created id=），或设 ZEN_UA 环境变量；用 opencode 做客户端时自动透传')
+      + '；先在本机跑一次 opencode（如 opencode run "hi"）产生新鲜会话，再调 POST /admin/api/providers/:pid/refresh-fingerprint 自动续上（或在 Provider 头里手填真实 x-opencode-session，会话过期后需重填；用 opencode 做客户端时自动透传）'
+      + '；另：zen 免费档还要求请求是流式 agent 体裁（含 read/bash 工具声明 + tool_choice，网关转发时已自动补齐）——若这次是非流式调用（stream=false），上游照样拒，请改用流式后重试')
     // 地区限制同理：不是「模型没了」也不是「Key 错了」，而是出口 IP 不在可用地区。
     // 不给这句指引，用户会以为模型下线了。
     case UPSTREAM.REGION: return irError(ERR.AUTHENTICATION,
@@ -196,6 +203,7 @@ export class Proxy {
   private up: Upstream
   private usage: UsageSink | null
   private accounts: AccountPool | null = null
+  private fingerprintRefresher: FingerprintRefresher | null = null
 
   constructor(cfg: Config, sched: Scheduler, up: Upstream, usage: UsageSink | null) {
     this.cfg = cfg
@@ -210,6 +218,11 @@ export class Proxy {
 
   setAccountPool(ap: AccountPool): void {
     this.accounts = ap
+  }
+
+  // 指纹自愈钩子（cli 注入，见 FingerprintRefresher）：未注入时行为不变。
+  setFingerprintRefresher(f: FingerprintRefresher | null): void {
+    this.fingerprintRefresher = f
   }
 
   // 三个入站端点 + OpenAI 兼容的模型发现挂到 app（含裸路径别名）。
@@ -298,28 +311,55 @@ export class Proxy {
 
     // 用指定账号（null = Provider 级凭据）尝试一个候选；成功则锁定（上游 2xx 头已到，
     // 首字节闸门尚未过：forward() 会先等首个真实事件再承诺 200，此后才禁止换源）。
+    // 指纹自愈：首错为 FINGERPRINT 且刷新器能给出新鲜会话时，同候选重试一次
+    // （用户刚跑过 opencode、网关静态头还没跟上的常见情形）；刷新器返回 null
+    // （本地无新鲜指纹）则不重试，原错走正常换源/冷却。
     const attempt = async (pv: Provider, acct: Account | null): Promise<boolean> => {
-      const pvv: Provider = acct ? { ...pv, credential: acct.credential } : { ...pv } // 账号 JWT 覆盖 Provider 凭据
-      const [m] = this.sched.modelOf(pv.providerId, irReq.model)
-      if (m.egress) pvv.egress = m.egress // 模型级出口覆盖 Provider 级（未声明的模型继承 Provider）
-      // 模型级推理预设（强制覆盖）：配了就替换客户端档位，没配跟随客户端。
-      const effReq = applyReasoningPreset(irReq, m)
-      if ((effReq.reasoningEffort ?? '').trim() !== '') triedEffort = effReq.reasoningEffort!.trim()
-      try {
+      const fire = async (base: Provider): Promise<void> => {
+        const pvv: Provider = acct ? { ...base, credential: acct.credential } : { ...base } // 账号 JWT 覆盖 Provider 凭据
+        const [m] = this.sched.modelOf(base.providerId, irReq.model)
+        if (m.egress) pvv.egress = m.egress // 模型级出口覆盖 Provider 级（未声明的模型继承 Provider）
+        // 模型级推理预设（强制覆盖）：配了就替换客户端档位，没配跟随客户端。
+        const effReq = applyReasoningPreset(irReq, m)
+        if ((effReq.reasoningEffort ?? '').trim() !== '') triedEffort = effReq.reasoningEffort!.trim()
         const stream = await this.up.stream(pvv, effReq, session)
         locked = { stream, provider: pvv, acctId: acct?.id ?? '' }
         lockedReq = effReq
+      }
+      const toUE = (err: unknown): UpstreamError => err instanceof UpstreamError
+        ? err
+        : new UpstreamError(0, UPSTREAM.UNKNOWN, (err as Error).message)
+      try {
+        await fire(pv)
         return true
       } catch (err) {
-        const ue = err instanceof UpstreamError
-          ? err
-          : new UpstreamError(0, UPSTREAM.UNKNOWN, (err as Error).message)
+        let ue = toUE(err)
+        if (ue.kind === UPSTREAM.FINGERPRINT && this.fingerprintRefresher) {
+          let fresh: Provider | null = null
+          try {
+            fresh = await this.fingerprintRefresher(pv)
+          } catch {
+            fresh = null
+          }
+          if (fresh) {
+            try {
+              await fire(fresh)
+              console.log(`指纹已刷新并重试成功 provider=${pv.name} account=${acct?.id ?? '-'}`)
+              return true
+            } catch (err2) {
+              ue = toUE(err2)
+            }
+          }
+        }
         lastErr = ue
         lastAcctId = acct?.id ?? ''
         if (acct) {
           this.accounts!.markResult(acct.id, false, cooldownFor(ue.kind), new Date(), ue.kind)
           if (ue.kind === UPSTREAM.AUTH) {
-            console.error(`账号鉴权失败已冷却，疑似凭据过期，请重登后用 POST /admin/api/accounts/{id}/recheck 恢复 account=${acct.id} provider=${pvv.name}`)
+            console.error(`账号鉴权失败已冷却，疑似凭据过期，请重登后用 POST /admin/api/accounts/{id}/recheck 恢复 account=${acct.id} provider=${pv.name}`)
+          }
+          if (ue.kind === UPSTREAM.FINGERPRINT) {
+            console.error(`指纹被拒且本地无新鲜会话（或重试仍失败），请在本机跑一次 opencode（如 opencode run "hi"）产生新鲜会话，再调刷新指纹接口恢复 provider=${pv.name}`)
           }
         }
         console.warn(`上游失败，尝试换源 provider=${pv.name} account=${acct?.id ?? '-'} kind=${ue.kind} status=${ue.status} err=${ue.message}`)
