@@ -696,6 +696,12 @@ class Outbound implements OutboundCodec {
       input,
       tools: tools.length > 0 ? tools : undefined,
       tool_choice: toolChoiceWire(req.toolChoice),
+      // truncation: disabled 与真机对齐（2026-09-13 真机抓包回显）。
+      // 上下文超限时不让上游自作主张截断（auto 会砍掉工具定义/历史导致模型
+      // “看不见”工具）；超了就报错，调用方压缩或重开会话。
+      // 兼容：老/兼容上游若报 400 且直指 truncation，调用方去字段重发一次
+      // （见 router/upstream.ts streamWith 内的 truncation 回退 withoutTruncation）。
+      truncation: 'disabled',
       max_output_tokens: req.maxTokens || undefined,
       temperature: req.temperature,
       top_p: req.topP,

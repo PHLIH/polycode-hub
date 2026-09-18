@@ -29,6 +29,8 @@ export type { ModelList }
 
 export interface AdminApiDeps {
   adminKey: string
+  // 概览页接入区用：只暴露「是否需要鉴权 + 默认模型」，绝不下发 key 本体。
+  gateway?: { authRequired: boolean; defaultModel?: string }
   egresses?: EgressStore
   providers?: ProviderStore
   accounts?: AccountStore
@@ -376,7 +378,10 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
       if (other && other.state !== 'deleted' && other.providerId !== p.providerId) {
         return errRes(c, 409, ERR.INVALID_REQUEST, `名称 ${next} 已被 #${other.providerId} 占用`)
       }
+      const oldName = p.name
       p.name = next
+      // 改名迁缓存：协议探测缓存以 Provider 名为 key，旧名残留查不到、新名沿用旧值都要清掉。
+      if (oldName !== p.name) { forgetProtocol(oldName, ''); forgetProtocol(p.name, ''); }
     }
     if ('models' in patch) {
       // 模型采用：只增不减。已有 ID 不删（元数据保留），但补协议与能力（上游新声明的以本次为准）。
@@ -536,6 +541,8 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     // 回显原始 pid：非法 pid 与不存在的 Provider 一律 404，排查时要能看出调用方传的是什么。
     if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
     p.state = 'deleted'
+    // 删号防继承：同名可被复用，探测缓存以名为 key，不清会把旧协议带给新号。
+    forgetProtocol(p.name, '');
     providers.put(p)
     changed()
     return c.body(null, 204)
@@ -557,6 +564,8 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     if (!providers.delete(p.providerId)) {
       return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
     }
+    // 删号防继承：物理删同样清掉该名的探测缓存，避免同名复用继承旧协议。
+    forgetProtocol(p.name, '');
     changed()
     return c.body(null, 204)
   })
@@ -817,6 +826,14 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
 
   // ---- stats ----
 
+  // 概览页接入区用：只暴露「是否需要鉴权 + 默认模型」，绝不下发 key 本体。
+  // gateway_key 非空 = 客户端须带 Authorization: Bearer <key>（见 proxy.ts serve/handleModels）；
+  // 为空 = 免校验，客户端 API Key 随便填（部分客户端非空校验，填 sk-anything 即可）。
+  app.get('/admin/api/gateway', (c) => ok(c, 200, {
+    authRequired: deps.gateway?.authRequired ?? false,
+    defaultModel: deps.gateway?.defaultModel ?? '',
+  }))
+
   app.get('/admin/api/stats', async (c) => {
     if (!deps.stats) return errRes(c, 501, ERR.API, '统计未接线')
     try {
@@ -1070,6 +1087,9 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     p.models.splice(i, 1)
     providers.put(p)
     changed()
+    // 删模型同步清协议探测缓存：DB 行删了就没残留，但进程内 autoProtocol
+    // 还记着旧值——不清理的话，同名模型重建时会直接用过期协议，不再试错。
+    forgetProtocol(p.name, modelID)
     return c.body(null, 204)
   })
 

@@ -103,6 +103,7 @@ const providerBody = {
 
 interface BuildOpts {
   key?: string
+  gateway?: { authRequired: boolean; defaultModel?: string }
   egresses?: { id: string; kind: string; addr: string }[]
   providers?: Provider[]
   accounts?: Account[]
@@ -126,6 +127,7 @@ interface BuildOpts {
 function build(o: BuildOpts = {}): Hono {
   return createAdminApi({
     adminKey: o.key ?? 'secret',
+    gateway: o.gateway,
     egresses: o.egresses && (() => { const st = new MemoryEgressStore(); for (const e of o.egresses) st.put(e); return st })(),
     providers: o.stores?.providers ?? new MemoryProviderStore(o.providers),
     accounts: o.stores?.accounts ?? new MemoryAccountStore(o.accounts),
@@ -234,6 +236,29 @@ const readyProvider = (name: string): Provider => ({
   riskNote: 'n', stability: 'beta', api: 'openai-completions',
   baseUrl: 'https://x.example.com/v2', priority: 0, models: [],
   credential: {},
+})
+
+// ---- 接入信息（概览页接入区）----
+// 只暴露「要不要鉴权 + 默认模型」，key 本体绝不下发（转发面密钥不经管理面）。
+describe('GET /admin/api/gateway（概览接入区）', () => {
+  test('缺省 = 免鉴权 + 空默认模型', async () => {
+    const call = caller(build())
+    const res = await call('GET', '/admin/api/gateway', { key: 'secret' })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ authRequired: false, defaultModel: '' })
+  })
+
+  test('配了 gateway_key/default_model 就原样透出布尔与模型名', async () => {
+    const call = caller(build({ gateway: { authRequired: true, defaultModel: 'zen/m1' } }))
+    const res = await call('GET', '/admin/api/gateway', { key: 'secret' })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toEqual({ authRequired: true, defaultModel: 'zen/m1' })
+  })
+
+  test('无管理口令也 401（与其它管理端点同口径）', async () => {
+    const call = caller(build({ gateway: { authRequired: true } }))
+    expect((await call('GET', '/admin/api/gateway')).status).toBe(401)
+  })
 })
 
 // ---- 鉴权 ----
@@ -2216,7 +2241,8 @@ describe('DELETE /admin/api/providers/:pid/models/:model（删单个模型）', 
     })
     p.models = p.models.map((m) => ({ ...m, providerId: p.providerId }))
     let notified = 0
-    const call = caller(build({ providers: [p], notify: () => { notified++ } }))
+    const stores = { providers: new MemoryProviderStore([p]), accounts: new MemoryAccountStore() }
+    const call = caller(build({ stores, notify: () => { notified++ } }))
 
     const del = await call('DELETE', `/admin/api/providers/${p.providerId}/models/hand-typed`, { key: 'secret' })
     expect(del.status).toBe(204)
@@ -2225,10 +2251,57 @@ describe('DELETE /admin/api/providers/:pid/models/:model（删单个模型）', 
     const list = await (await call('GET', '/admin/api/providers', { key: 'secret' })).json() as { providers: Provider[] }
     expect(list.providers[0]!.models.map((m) => m.id)).toEqual(['m2'])
 
+    // 删模型同步清掉协议探测缓存（脏数据不留）：同名模型重建时重新试错，
+    // 而不是直接用过期协议。DB 行删了就没残留，清的是进程内 autoProtocol。
+    const { autoProtocol, rememberProtocol } = await import('../src/model/index.ts')
+    const { resolveProtocol } = await import('../src/router/upstream.ts')
+    rememberProtocol('pz', 'hand-typed', 'openai-responses')
+    expect(autoProtocol('pz', 'hand-typed')).toBe('openai-responses')
+    // 重建同名模型再删一次，触发 forgetProtocol
+    await call('PATCH', `/admin/api/providers/${p.providerId}`, { key: 'secret', body: { models: ['hand-typed'] } })
+    // PATCH 重建后 GET：DB 里回来了但协议未定（新建模型无 api，内存缓存仍是旧值——删了才清）
+    const rebuilt = await (await call('GET', '/admin/api/providers', { key: 'secret' })).json() as { providers: Provider[] }
+    const rebuiltRow = rebuilt.providers[0]!.models.find((m) => m.id === 'hand-typed')
+    expect(rebuiltRow).toBeDefined()
+    expect(rebuiltRow!.api).toBeUndefined() // DB 行无协议残留：重建是干净行
+    expect((await call('DELETE', `/admin/api/providers/${p.providerId}/models/hand-typed`, { key: 'secret' })).status).toBe(204)
+    expect(autoProtocol('pz', 'hand-typed')).toBeUndefined()
+    // DELETE 后 DB 断言：列表无该行 + 底层 store 无该行（列表端点不过滤模型行，直读双保险）
+    const after = await (await call('GET', '/admin/api/providers', { key: 'secret' })).json() as { providers: Provider[] }
+    expect(after.providers[0]!.models.map((m) => m.id)).toEqual(['m2'])
+    expect(stores.providers.get(p.providerId)!.models.map((m) => m.id)).toEqual(['m2'])
+    // 未定态：DB 无行 + 缓存已清 → resolveProtocol 回到 Provider 级声明
+    const [proto, known] = resolveProtocol({ ...stores.providers.get(p.providerId)!, name: 'pz' }, 'hand-typed')
+    expect(known).toBe(true) // Provider 级 api 兜底仍在（删的是模型行，不是 Provider 声明）
+    expect(proto).toBe('anthropic-messages')
+
     // 重复删 / 未知模型 / 未知 provider
     expect((await call('DELETE', `/admin/api/providers/${p.providerId}/models/hand-typed`, { key: 'secret' })).status).toBe(404)
     expect((await call('DELETE', `/admin/api/providers/${p.providerId}/models/nope`, { key: 'secret' })).status).toBe(404)
     expect((await call('DELETE', '/admin/api/providers/99999/models/m2', { key: 'secret' })).status).toBe(404)
+  })
+
+  test('先 remember 再删：缓存不清会盖住重建行的未定态（B-P1-2 顺序人造问题）', async () => {
+    const p = mkProviderFixed({
+      name: 'pz2', api: 'anthropic-messages',
+      models: [{ id: 'hand-typed', manual: true, enabled: true }],
+    })
+    p.models = p.models.map((m) => ({ ...m, providerId: p.providerId }))
+    const stores = { providers: new MemoryProviderStore([p]), accounts: new MemoryAccountStore() }
+    const call = caller(build({ stores }))
+    const { autoProtocol, rememberProtocol } = await import('../src/model/index.ts')
+    const { resolveProtocol } = await import('../src/router/upstream.ts')
+    // 先记住一个过期协议（模拟扫描/转发留下的进程内事实），再删模型
+    rememberProtocol('pz2', 'hand-typed', 'openai-responses')
+    expect((await call('DELETE', `/admin/api/providers/${p.providerId}/models/hand-typed`, { key: 'secret' })).status).toBe(204)
+    // 删即清缓存：不等重建，不留脏数据盖住后面的未定态
+    expect(autoProtocol('pz2', 'hand-typed')).toBeUndefined()
+    // 重建：DB 行干净无 api，解析回到 Provider 级声明（而不是记住的过期协议）
+    await call('PATCH', `/admin/api/providers/${p.providerId}`, { key: 'secret', body: { models: ['hand-typed'] } })
+    const list = await (await call('GET', '/admin/api/providers', { key: 'secret' })).json() as { providers: Provider[] }
+    expect(list.providers[0]!.models.find((m) => m.id === 'hand-typed')!.api).toBeUndefined()
+    const [proto] = resolveProtocol({ ...stores.providers.get(p.providerId)!, name: 'pz2' }, 'hand-typed')
+    expect(proto).toBe('anthropic-messages')
   })
 
   test('删除后 PATCH models 仍只增不减（删了再加能回来）', async () => {

@@ -10,6 +10,10 @@ import { spawn } from 'node:child_process'
 import { fetch as undiciFetch, ProxyAgent } from 'undici'
 import { getOutbound, kindForStatus, UpstreamError, UPSTREAM,
   type IrRequest, type Protocol } from '../ir/index.ts'
+import {
+  flushZenPoolToLib, recordZenFailure, recordZenSuccess, refillZenPool, takeNextZenSession,
+  zenPoolActiveLen, ZEN_FAIL_THRESHOLD, ZEN_FAIL_WINDOW_MS,
+} from './zen_pool.ts'
 import { autoProtocol, forgetProtocol, rememberProtocol,
   capabilitiesFrom, credentialResolve, dynamicHeadersTimeout,
   findHeaderKey, isZenBaseUrl, mintZenRequestId, validZenToken, zenHeadersWithFingerprint,
@@ -37,6 +41,15 @@ export interface UpstreamOpts {
   noAutoProtocol?: boolean
   // 出口代理表：egress id → 代理 URI。Provider.egress 引用 id 走对应 dispatcher，未引用 = 直连。
   egresses?: Record<string, string>
+  // 会话补位候选（cli 注入）：淘汰一个 zen 会话后，从这里取新的补进池。
+  // 返回本机 opencode 日志里的候选会话（与本机真实运行绑定，程序造不出来）。
+  refillCandidates?: () => string[]
+  // 会话池写透钩子（cli 注入）：补位/淘汰后把运行时池写回库内池头。
+  // 参数：provider 内部 id、写回后的完整会话列表。抛错会被吞掉打日志。
+  onZenPoolFlushed?: (providerId: number, sessions: string[]) => void
+  // 协议落盘钩子（cli 注入）：转发时自动探测成功的，把协议写回模型目录（DB）。
+  // 参数：provider 内部 id、模型 id、探到的协议。抛错会被吞掉打日志（不影响转发）。
+  onProtocolLearned?: (providerId: number, modelId: string, protocol: Protocol) => void
 }
 
 type Lookup = (name: string) => [string, boolean]
@@ -214,11 +227,10 @@ export const TRANSIENT_RETRY_BUDGET_MS = 5000
 // 开多个窗口（每窗口新会话）一点事没有；换会话立刻恢复。结论：限流维度是会话
 // 而不是 IP（出口同为 clash 代理）。
 //
-// 策略：会话池（discover 写进 x-polycode-session-pool）做 429 触发式轮换。
-// 注意不是逐请求预防性轮换：每请求都换会话只会把所有会话的配额窗口同时打满，
-// 还破坏上游按会话的亲和性；正确做法是首打用主会话（池首 = 最新），
-// 撞 429 才在本请求副本内换下一个重打（最多 min(池长,4) 个不同会话）。
-// 池只有 1 个会话时行为等同旧版（不轮换，429 原样上报）。
+// 策略：会话池（discover 写进 x-polycode-session-pool）做轮询 + 429 触发式轮换，
+// 详见 router/zen_pool.ts：每请求用池游标取首打会话并前移（均摊），
+// 撞配额 429 在本请求副本内换下一个重打；网络抖动/5xx 记失败、达阈值淘汰补位。
+// 池只有 1 个会话时退化为单会话（不轮换，429 原样上报）。
 const zenPoolCursor = new Map<number, number>()
 
 // 取 Provider 的会话池（无池返回空数组）。池头由 discover/zen_refresh 写。
@@ -279,12 +291,24 @@ export class Upstream {
   private credLookup: Lookup
   private noAutoProtocol: boolean
   private egresses: Record<string, string>
+  private refillCandidatesFn: () => string[]
+  private onZenPoolFlushedFn: ((providerId: number, sessions: string[]) => void) | undefined
+  private onProtocolLearnedFn: ((providerId: number, modelId: string, protocol: Protocol) => void) | undefined
+  private protoBackfillInFlight = new Set<string>() // 协议回填单 flight：同模型并发只落一次
   private dispatchers = new Map<string, unknown>()
 
   constructor(opts: UpstreamOpts = {}) {
     this.credLookup = opts.credLookup ?? defaultLookup
     this.noAutoProtocol = opts.noAutoProtocol ?? false
     this.egresses = opts.egresses ?? {}
+    this.refillCandidatesFn = opts.refillCandidates ?? (() => [])
+    this.onZenPoolFlushedFn = opts.onZenPoolFlushed
+    this.onProtocolLearnedFn = opts.onProtocolLearned
+  }
+
+  // 会话补位候选（淘汰后补新用）。cli 注入的是「本机 opencode 日志里的全部候选」。
+  private zenRefillCandidates(): string[] {
+    return this.refillCandidatesFn()
   }
 
   // 出口代理表热更新（管理面增删 egress 后调用）：换表并丢弃旧 dispatcher 缓存。
@@ -322,6 +346,9 @@ export class Upstream {
       credLookup: over.credLookup ?? this.credLookup,
       noAutoProtocol: over.noAutoProtocol ?? this.noAutoProtocol,
       egresses: over.egresses ?? this.egresses,
+      refillCandidates: over.refillCandidates ?? this.refillCandidatesFn,
+      onZenPoolFlushed: over.onZenPoolFlushed ?? this.onZenPoolFlushedFn,
+      onProtocolLearned: over.onProtocolLearned ?? this.onProtocolLearnedFn,
     })
     return derived
   }
@@ -342,10 +369,22 @@ export class Upstream {
     let lastErr: unknown
     if (known) {
       try {
-        return await this.streamWith(p, irReq, proto, session)
+        const s = await this.streamWith(p, irReq, proto, session)
+        // 内存命中回填：协议来自 autoProtocol 内存缓存（DB 里还没有）时，
+        // 成功即补写 DB——否则重启即丢，下次又要三协议试错（B-P1-1 落盘缺口）。
+        // 单 flight：同 provider+模型并发只落一次，落完即忘（lost-update 由写前重读兜底，见 cli）。
+        // 透明代理（p.models 为空、模型未在 DB 声明）不回填：DB 里没这行，写了也没处落。
+        const declared = p.models?.find((x) => x.id === irReq.model)
+        const memHit = declared && !declared.api && autoProtocol(p.name, irReq.model) === proto
+        if (memHit) this.backfillProtocol(p, irReq.model, proto)
+        return s
       } catch (err) {
-        if (!shouldTryOtherProtocol(err)) throw err
-        forgetProtocol(p.name, irReq.model) // 记住的协议失效 → 丢掉并重探
+        // 清缓存与换协议是两件事（B-P0-1 拆分）：
+        //   · 只有 BAD_REQUEST（路径不对）才忘掉记住的协议；
+        //   · SERVER/NETWORK 照样进 for 循环试下一个（错协议也可能回 500，
+        //     如 zen muse-spark 走错端点；且 5xx 多为上游病了，换个端点或能好）。
+        if (isBadRequestErr(err)) forgetProtocol(p.name, irReq.model) // 记住的协议失效 → 丢掉并重探
+        if (!shouldTryNextProtocol(err)) throw err
         lastErr = err
       }
     }
@@ -353,10 +392,13 @@ export class Upstream {
       try {
         const s = await this.streamWith(p, irReq, cand, session)
         rememberProtocol(p.name, irReq.model, cand)
+        // 外部调用自动记录：没经过测试的模型，成功那次的协议写回 DB，
+        // 下次转发/测试直接用，不再试错。失败不影响转发（只打日志）。
+        this.backfillProtocol(p, irReq.model, cand)
         return s
       } catch (err) {
         lastErr = err
-        if (!shouldTryOtherProtocol(err)) throw err // 凭据/请求侧硬错误：换协议无意义
+        if (!shouldTryNextProtocol(err)) throw err // 凭据/配额硬错误：换协议无意义
       }
     }
     throw lastErr ?? new UpstreamError(0, UPSTREAM.UNKNOWN, '没有可用协议')
@@ -376,8 +418,10 @@ export class Upstream {
     const upReq: IrRequest = irReq.stream ? irReq : { ...irReq, stream: true }
     let body: Uint8Array
     let path: string
+    // 编解码器按协议取一次即可，后面 truncation 回退复用它（避免重复 getOutbound）。
+    const codec = getOutbound(proto)
+    const needsTruncationFallback = proto === 'openai-responses'
     try {
-      const codec = getOutbound(proto)
       // zen 免费档要 agent 体裁才放行（缺 read/bash 工具声明或 tool_choice 即 403，
       // 与指纹头无关的独立判定）：这里统一补，转发侧无需逐个操心。
       body = codec.serializeRequest(ensureZenAgentShape(upReq, p.baseUrl))
@@ -400,38 +444,55 @@ export class Upstream {
       await new Promise<void>((r) => setTimeout(r, 500))
       return true
     }
-    // 会话池 429 轮换（仅 zen）：限流按会话算，换一个就恢复。
-    // 池快照（请求级深拷贝）：游标 + 池内顺序全在本地副本上推进，
-    // 库内 Provider.headers 与其他在途请求一律不动（并发隔离）。
-    // 池在头里（x-polycode-session-pool），游标进程内自增，等效 opencode 多窗口。
+    // 会话池（仅 zen）：轮询 + 失败淘汰，见 router/zen_pool.ts。
+    //   · 轮询：每个请求用池游标取首打会话并前移——16 个会话均摊，
+    //     不会有任何一个被反复打满（旧实现每请求都从池首开始，池首永远挨打）；
+    //   · 淘汰：网络抖动/上游 5xx 在 15s 窗口内累计 3 次 → 剔除该会话并补新（写透到库）；
+    //   · 429 限流换会话重试不计失败（会话没坏，只是这个窗口配额满）；
+    //     QUOTA（402/额度用尽）不轮换：充值前换谁都没用，直接抛；
+    //   · API 类错误（AUTH/FINGERPRINT/REGION/BAD_REQUEST）立刻抛，不重试不淘汰。
+    // 池快照（请求级深拷贝）：库内 Provider.headers 与其他在途请求一律不动。
     const zenPool = isZenUpstream(p.baseUrl) ? zenSessionPoolOf(p) : []
-    const zenHeaders: Record<string, string> | null = zenPool.length > 1 ? { ...(p.headers ?? {}) } : null
-    // 已试过的会话（按首打快照顺序）：首打用池首主会话，重试只取没试过的，
-    // 同一会话绝不打第二遍（它刚回 429，立刻重打是浪费额度）。
+    const zenActiveLen = zenPoolActiveLen(p.providerId, zenPool)
+    // 空池/全淘汰（A-P1-6）：picked 为 undefined 时禁用轮换，直接按原会话路径走——
+    // 绝不回退到库内 primary（active 为空时库里剩的多半正是刚淘汰的坏会话）。
+    const zenEnabled = zenActiveLen > 0
+    const zenHeaders: Record<string, string> | null = zenEnabled ? { ...(p.headers ?? {}) } : null
+    let zenStart = ''
+    if (zenHeaders) {
+      const picked = takeNextZenSession(p.providerId, zenPool)
+      if (picked) {
+        zenStart = picked
+        shiftZenSessionHeaders(zenHeaders, zenPool, picked)
+      }
+    }
+    // picked 为 undefined（池空了）：本请求彻底不用池逻辑，zenHeaders 置空。
+    const zenLive = zenStart !== ''
+    const zenH: Record<string, string> | null = zenLive ? zenHeaders : null
+    // 已试过的会话：同一会话绝不打第二遍（刚 429 的会话立刻重打是浪费额度）。
     const zenTriedSet = new Set<string>()
     let zenTried = 0
-    // 内存轮换（本请求副本内）：按首打快照顺序取下一个没试过的会话，
-    // 提池首并同步 x-opencode-session。用副本内自己的顺序推进，
-    // 不碰进程游标、不碰库内 Provider（并发隔离）。
+    if (zenStart) zenTriedSet.add(zenStart)
+    // 换下一个没试过的会话（429 轮换用），返回新会话 ID。
     const shiftLocal = (): string | undefined => {
-      if (!zenHeaders) return undefined
-      const pool = parseZenSessionPool(zenHeaders)
+      if (!zenH) return undefined
+      const pool = parseZenSessionPool(zenH)
       const next = zenPool.find((s) => pool.includes(s) && !zenTriedSet.has(s))
       if (!next) return undefined
       zenTriedSet.add(next)
       zenTried++
-      shiftZenSessionHeaders(zenHeaders, pool, next)
+      shiftZenSessionHeaders(zenH, pool, next)
       return next
     }
+    // 本次请求实际用的会话（成功/失败记账都指向它）。
+    let zenCurrent = zenStart
+    if (process.env.ZEN_DIAG === '1' && zenStart) {
+      console.log(`[zen-pool] 首打会话=${zenStart.slice(0, 16)}… 池=${zenPool.length}`)
+    }
     for (let a = 0; a < attempts; a++) {
-      // 本次 fetch 用的 Provider 视图：429 轮换中（已换过会话）用副本，否则用原件。
-      // 副本 headers 已深拷贝，buildHeaders 再怎么合并也不会污染库内那份。
-      const view: Provider = zenHeaders && zenTried > 0 ? { ...p, headers: zenHeaders } : p
-      // 首打会话记入已试集：重试时跳过它（刚 429 的会话不打第二遍）。
-      if (zenHeaders && zenTried === 0) {
-        const first = parseZenSessionPool(zenHeaders)[0]
-        if (first) zenTriedSet.add(first)
-      }
+      // 本次 fetch 用的 Provider 视图：picked 非空首打即用副本（A-P0-1），
+      // 否则 buildHeaders 读的还是库内 primary，轮询白选、记账错位。
+      const view: Provider = zenH ? { ...p, headers: zenH } : p
       let dyn: Record<string, string> | null = null
       if (p.dynamicHeaders) {
         try {
@@ -454,30 +515,63 @@ export class Upstream {
         })
       } catch (err) {
         if (err instanceof UpstreamError) throw err // 凭据缺失等本地错误：原样上报，别降级成 network
+        // 连接级抛错（DNS/拒连/超时）：重试中的中间失败不记（A-P1-5 同 HTTP 口径）；
+        // 重试成功 recordZenSuccess 清零，重试耗尽才记一次确定失败。
         if (await retryable()) { a--; continue } // 连接级抖动：同条件再打一次
+        // 重试走完仍失败：确定失败，记一次并可能触发淘汰+补位写库。
+        if (zenCurrent) {
+          const evicted = recordZenFailure(p.providerId, zenCurrent, Date.now(), zenPool)
+          if (evicted) this.evictAndRefill(p.providerId, zenPool, zenCurrent)
+        }
         throw new UpstreamError(0, UPSTREAM.NETWORK, (err as Error).message)
       }
       if (resp.status >= 200 && resp.status <= 299) {
+        // 成功：清掉该会话的失败记录（偶尔抖一下不该攒成淘汰）。
+        if (zenCurrent) recordZenSuccess(p.providerId, zenCurrent)
         return resp.body! // 已到首字节：此后不可换源
       }
       const text = await resp.text() // text() 已消费 body，无需再 cancel
       console.warn(`[upstream] POST ${url} -> ${resp.status} (${ue2s(resp.status, text)})`)
       const ue = new UpstreamError(resp.status, classifyUpstreamError(resp.status, text), summarizeUpstreamBody(text))
-      // 429 且池里还有没试过的会话：换会话重打（限流按会话算，换一个就恢复）。
-      // 不占用 transient 额度——这是与 500 抖动不同维度的重试。
-      // 边界：首打 1 个 + 最多 min(池长, ZEN_POOL_RETRY_MAX) - 1 次换会话，
-      // 同一会话不打第二遍（shiftLocal 按已试集过滤）。
-      if (ue.kind === UPSTREAM.RATE_LIMIT && zenHeaders && zenTriedSet.size < Math.min(zenPool.length, ZEN_POOL_RETRY_MAX)) {
+      // truncation 兼容回退（B-P1-3）：老/兼容上游严格校验未知字段会 400，
+      // 且 400 正触发换协议重试——烧三次也修不好。body 里直指 truncation
+      // 时去该字段重发一次（同条件，不耗 attempts；仅一次，防循环）。
+      if (ue.kind === UPSTREAM.BAD_REQUEST && needsTruncationFallback
+        && /truncat/i.test(text) && await retryable()) {
+        body = withoutTruncation(body)
+        a--
+        continue
+      }
+      // 会话健康分流（用户拍板）：
+      //   · 配额 429（RATE_LIMIT）→ 换会话重打（会话没坏，只是这个窗口配额满），不计失败；
+      //   · QUOTA（402/额度用尽）→ 不轮换直接抛：充值前换谁都没用，还烧调用（A-P1-4）；
+      //   · 网络抖动 / 上游 5xx → 计失败，15s 内累计 3 次淘汰该会话并补新（写透到库）；
+      //   · API 问题（AUTH/FINGERPRINT/REGION/BAD_REQUEST）→ 直接抛，
+      //     模型下线/地区限制/凭据失效/参数错要尽快让用户知道，换会话也救不了。
+      //   上限按运行时 active 长算（A-P1-6）：库长会把已淘汰的也算进去，高估可用数。
+      const rateLimitKind = ue.kind === UPSTREAM.RATE_LIMIT
+      const transientKind = ue.kind === UPSTREAM.SERVER || ue.kind === UPSTREAM.NETWORK
+      const zenLimit = Math.min(zenPoolActiveLen(p.providerId, zenPool), ZEN_POOL_RETRY_MAX)
+      if (rateLimitKind && zenH && zenTriedSet.size < zenLimit) {
         const next = shiftLocal()
         if (next) {
-          console.warn(`[zen-pool] 429 换会话重试（第 ${zenTried} 次）：${next.slice(0, 16)}…`)
+          zenCurrent = next
+          console.warn(`[zen-pool] 配额限制换会话重试（第 ${zenTried} 次）：${next.slice(0, 16)}…`)
           a-- // 不消耗 attempts
           continue
         }
       }
-      if ((ue.kind === UPSTREAM.SERVER || ue.kind === UPSTREAM.NETWORK) && await retryable()) {
+      // 网络类失败记账（A-P1-5）：每请求对同一会话只记一次——记账点在
+      // “重试额度耗尽、确定要抛之前”，重试中的中间失败不记（成功即清零对冲）。
+      // 淘汰后从本机日志补新会话并写透到库（A-P0-2）；拿不到候选就只淘汰不补。
+      if (transientKind && await retryable()) {
         a-- // 快失败的过载 500 系：同条件再打一次（动态头重铸次数不受影响）
         continue
+      }
+      // 重试走完仍失败：这一次才是“确定失败”，记账并可能触发淘汰+补位写库。
+      if (transientKind && zenCurrent) {
+        const evicted = recordZenFailure(p.providerId, zenCurrent, Date.now(), zenPool)
+        if (evicted) this.evictAndRefill(p.providerId, zenPool, zenCurrent)
       }
       // 换 token 信号看原文全文：提炼只留人话 + 业务码，散落在其它字段的标记会丢。
       if (a === 0 && p.dynamicHeaders && needsRemint(text, p.dynamicHeaders.retryOn)) {
@@ -486,6 +580,52 @@ export class Upstream {
       throw ue
     }
     throw new UpstreamError(0, UPSTREAM.UNKNOWN, 'unreachable')
+  }
+
+  // 协议回填单 flight + 写前重读（B-P1-1）：同模型并发只落一次；
+  // 落盘前由 cli 侧重读 DB 比对（m.api 已有值则跳过），lost-update 只影响
+  // “谁先写”，不影响正确性（值都是某次真实成功的协议）。
+  private backfillProtocol(p: Provider, modelId: string, protocol: Protocol): void {
+    const flightKey = `${p.providerId}\x00${modelId}`
+    if (this.protoBackfillInFlight.has(flightKey)) return
+    this.protoBackfillInFlight.add(flightKey)
+    try {
+      this.onProtocolLearnedFn?.(p.providerId, modelId, protocol)
+    } catch (e) {
+      console.warn(`协议落盘失败 provider=${p.name} model=${modelId}: ${(e as Error).message}`)
+    } finally {
+      this.protoBackfillInFlight.delete(flightKey)
+    }
+  }
+
+  // 淘汰并补位写库（A-P0-2/A-P0-3）：refill 只进内存 active，
+  // 不写库下次 sync 即被剔除——这里经 onZenPoolFlushed 写透到库内池头。
+  // 淘汰的是哪个会话由 recordZenFailure 内部决定；这里只负责“补一个 + 写库”。
+  private evictAndRefill(providerId: number, libPool: string[], evictedSid: string): void {
+    let refilled: string | undefined
+    try {
+      refilled = refillZenPool(providerId, this.zenRefillCandidates(), libPool)
+    } catch { refilled = undefined }
+    console.warn(
+      `[zen-pool] 会话连续 ${ZEN_FAIL_THRESHOLD} 次失败（${ZEN_FAIL_WINDOW_MS / 1000}s 窗口）已淘汰：` +
+      `${evictedSid.slice(0, 16)}…${refilled ? `，补入 ${refilled.slice(0, 16)}…` : '，无可用补位'}`)
+    // 写透到库：运行时 active（含新补位、不含淘汰）落回库内池头，
+    // 下次 sync 不再把它剔除。写失败只打日志（内存态仍有效，本次运行可用）。
+    try {
+      const ok = flushZenPoolToLib(providerId, (sessions) => {
+        let done = false
+        try {
+          this.onZenPoolFlushedFn?.(providerId, sessions)
+          done = true
+        } catch (e) {
+          console.warn(`[zen-pool] 补位写库失败 provider=${providerId}: ${(e as Error).message}`)
+        }
+        return done
+      })
+      if (!ok) console.warn(`[zen-pool] 补位写库跳过 provider=${providerId}（无可用会话或未接 writer）`)
+    } catch (e) {
+      console.warn(`[zen-pool] 补位写库异常 provider=${providerId}: ${(e as Error).message}`)
+    }
   }
 
   // 按协议设置鉴权与必要头（传输层知识，不属于 IR 消息边界）。
@@ -762,11 +902,47 @@ export function probeOrder(first: Protocol): Protocol[] {
   return [first, ...all.filter((p) => p !== first)]
 }
 
-// 是否值得换协议重试：5xx/网络抖/协议路径不匹配（400/404 归入 BAD_REQUEST）可试；
-// 401/403 凭据硬错误换协议无意义。
-export function shouldTryOtherProtocol(err: unknown): boolean {
+// 去掉 responses 请求体里的 truncation 字段（B-P1-3 兼容回退用）。
+// JSON 解析失败则原样返回（调用方按原 body 重发，不引入新错）。
+function withoutTruncation(body: Uint8Array): Uint8Array {
+  try {
+    const obj = JSON.parse(Buffer.from(body).toString()) as Record<string, unknown>
+    if (!('truncation' in obj)) return body
+    delete obj['truncation']
+    return new TextEncoder().encode(JSON.stringify(obj))
+  } catch {
+    return body
+  }
+}
+
+// 是否值得换协议重试（B-P0-1 拆分后：只回答“要不要试下一个协议”）。
+// BAD_REQUEST（400/404 路径不对）必试；SERVER/NETWORK 也试——错协议也可能
+// 回 500（如 zen muse-spark 走错端点），且 5xx 多为上游病了，换个端点或能好。
+// AUTH/QUOTA/RATE_LIMIT/FINGERPRINT/REGION 不试：凭据/配额/限流/指纹/地区跟协议无关。
+export function shouldTryNextProtocol(err: unknown): boolean {
   if (!(err instanceof UpstreamError)) return false
-  return err.kind === UPSTREAM.SERVER || err.kind === UPSTREAM.NETWORK || err.kind === UPSTREAM.BAD_REQUEST
+  return err.kind === UPSTREAM.BAD_REQUEST
+    || err.kind === UPSTREAM.SERVER
+    || err.kind === UPSTREAM.NETWORK
+}
+
+// 该错误是否说明“记住的协议错了”（只回答“要不要清缓存”）。
+// 只有 BAD_REQUEST 才清：路径不对 = 协议真错了。SERVER/NETWORK 不清——
+// 上游病了不代表协议错了，清掉只会让下个请求重新三协议试错（旧行为教训）。
+export function shouldForgetProtocol(err: unknown): boolean {
+  if (!(err instanceof UpstreamError)) return false
+  return err.kind === UPSTREAM.BAD_REQUEST
+}
+
+// 旧名兼容（测试/外部调用）：语义收窄为“路径不对才换”（任一调用方须按新语义复查）。
+// 新代码请用 shouldTryNextProtocol（试下一个）/ shouldForgetProtocol（清缓存）。
+export function shouldTryOtherProtocol(err: unknown): boolean {
+  return shouldForgetProtocol(err)
+}
+
+// 内部小工具：err 是否 BAD_REQUEST（清缓存判定用，避免重复 instanceof）。
+function isBadRequestErr(err: unknown): boolean {
+  return err instanceof UpstreamError && (err as UpstreamError).kind === UPSTREAM.BAD_REQUEST
 }
 
 // ---- 动态头铸币（对齐 Go internal/router/dynheaders.go）----

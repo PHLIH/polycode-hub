@@ -127,4 +127,17 @@ describe('探测协议回退：404 必须换协议继续试', () => {
     expect(r.ok).toBe(false)
     expect(count).toBe(1) // 只打了一次：401 立即早停
   })
+
+  // B-P0-2 fallthrough：模型目录里记的协议过期了（上游切换/500 系），
+  // 探测不能砖掉——recorded 那次失败后自动全量试错，探到新的成功即覆盖旧记录。
+  test('recorded stale 回退：模型记着 completions 但只有 /responses 能用，仍探到 responses', async () => {
+    const base = await onlyResponsesServer() // 照抄本文件桩：只有 /responses 能用，其余 404
+    const p = mkProv(base, {
+      models: [{ id: 'muse-spark-1.3-contributor-free', manual: false, enabled: true, api: 'openai-completions' }],
+    })
+    const probe = new Probe(new Scheduler([p], 'high'), new Upstream({ credLookup: () => ['', false] }), null)
+    const r = await probe.probeWithProtocols(p, 'muse-spark-1.3-contributor-free')
+    expect(r.ok).toBe(true)
+    expect(r.protocol).toBe('openai-responses') // 过期记录被纠正，不再砖测试
+  })
 })

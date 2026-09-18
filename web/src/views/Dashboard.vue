@@ -72,14 +72,16 @@ const METRICS_LABEL = '总 token' // 热力图着色口径（下拉已移除，�
 
 async function load() {
   try {
-    const [hb, ab, ps] = await Promise.all([
-      api.breakdown({ days: heatDays }),
-      api.breakdown(rangeQuery.value),
-      api.providers().catch(() => [])
+    const [hb, ab, ps, gw] = await Promise.all([
+      api.breakdown({ days: heatDays }).catch(() => null),
+      api.breakdown(rangeQuery.value).catch(() => null),
+      api.providers().catch(() => []),
+      api.gatewayInfo().catch(() => ({ authRequired: false, defaultModel: '' }))
     ])
     heatBd.value = hb || {}
     attrBd.value = ab || {}
     providers.value = ps
+    gatewayInfo.value = gw || { authRequired: false, defaultModel: '' }
     err.value = ''
     page.value = 1
   } catch (e) {
@@ -334,8 +336,17 @@ const busiest = computed(() => {
   return daily.reduce((a, b) => (b.totalTokens > a.totalTokens ? b : a))
 })
 
-// ---- 接入信息（紧凑保留）----
+// ---- 接入信息：一行 = Base URL + Key/协议说明（模型不展示，省地方） ----
 const gatewayBase = computed(() => window.location.origin)
+const gatewayInfo = ref({ authRequired: false, defaultModel: '' })
+// 默认模型拼进提示：有配才拼一行，没配保持原样（超长靠 ellipsis + title 显示全文）
+const apiKeyHint = computed(() => {
+  const base = gatewayInfo.value.authRequired
+    ? 'API Key 须填 gateway_key · 协议随便选（三协议均可）'
+    : 'API Key 随便填，如 sk-anything · 协议随便选（三协议均可）'
+  const dm = gatewayInfo.value.defaultModel || ''
+  return dm ? `${base} · 默认模型 ${dm}` : base
+})
 
 // 复制：按钮自己变「已复制」1.6s（就地反馈，比飘一个 toast 更轻）。
 // copied 存按钮标识，多个复制点各亮各的。
@@ -638,6 +649,7 @@ function ttftText(m) {
   <section class="panel access">
     <span class="dim access-label">网关</span>
     <code class="gw">{{ gatewayBase }}</code>
+    <span class="dim access-hint" :title="apiKeyHint">{{ apiKeyHint }}</span>
     <button class="copy-btn" :class="{ done: copied === 'gw' }" @click="copy(gatewayBase, '网关地址', 'gw')">
       <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
         <rect x="5.5" y="5.5" width="8" height="8" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.4"/>
@@ -949,13 +961,18 @@ function ttftText(m) {
 .panel-head h3 { margin: 0; }
 .controls { display: flex; gap: 8px; }
 
-/* ---- 接入信息条 ----
-   一行三件：标签 / 地址框 / 复制键。地址框占满剩余宽度，
-   复制键与地址框同高同边框——两者是同一组控件，不再是一大一小两截。 */
-.access { display: flex; align-items: center; gap: 10px; padding: 10px 16px; }
+/* ---- 接入信息条（一行） ----
+   标签 / 地址框 / Key 说明 / 复制键。地址框与 Key 说明各占一半剩余宽度
+   （flex:1 1 0），整行铺满不留白——之前地址框限宽 320px，全挤在左边是被嫌的原因。 */
+.access { display: flex; align-items: center; gap: 12px; padding: 10px 16px; }
 .access-label { flex: 0 0 auto; font-size: 12px; }
+.access-hint {
+  flex: 1 1 0; min-width: 0; font-size: 12px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .access code.gw {
-  flex: 1; min-width: 0; font-family: var(--mono); font-size: 12px; line-height: 1.6;
+  flex: 1.4 1 0; min-width: 0;
+  font-family: var(--mono); font-size: 12px; line-height: 1.6;
   background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 10px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }

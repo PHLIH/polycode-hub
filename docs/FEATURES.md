@@ -78,7 +78,7 @@
 ### 协议自动识别
 
 - 解析顺序：模型级 `api` → 进程内事实缓存 → Provider 默认 `api`（`resolveProtocol`，`upstream.ts:316-323`）；三者皆无时逐个试候选协议，首个成功者被记住（`upstream.ts:113-123`，`rememberProtocol`）。
-- 事实缓存：进程内 Map，key = `providerID + modelID`（`model/autoproto.ts:7-30`）；已知协议失败且错误值得换协议（仅 server / network / bad_request，401/403/404 不换）时丢弃重探（`shouldTryOtherProtocol:333-336`）。
+- 事实缓存：进程内 Map，key = `providerID + modelID`（`model/autoproto.ts:7-30`）；清缓存与换协议是两件事（`upstream.ts shouldForgetProtocol / shouldTryNextProtocol`）：只有 BAD_REQUEST（路径不对）才忘掉记住的协议，SERVER / NETWORK 不清（上游病了不代表协议错了）但照样换下一个协议试；AUTH / QUOTA / RATE_LIMIT / FINGERPRINT / REGION 不换（`shouldTryOtherProtocol` 旧名兼容，语义 = shouldForgetProtocol）。
 - 管理台“扫描可用性”：并发打最小真实请求（`maxTokens: 16`，`probe.ts:235-239`），单模型超时 90s、最多 3 次（`probe.ts:55-57`，仅 rate_limit / quota / server / network 可重试，批量并发 4），成功后把协议写回模型目录持久化。
 
 ## 5. 配置：YAML 严格模式与凭据
@@ -158,10 +158,13 @@
 
 **网关对策（会话池轮换）**：
 
-- `x-polycode-session-pool`（网关自定义头，上游不认识）：`discover` 从本机 opencode 日志收**全部**真实会话（实测 227 个），取最近 16 个、**新→旧**排列写入——越新的会话配额窗口越干净（`parseAllFingerprintsFromLog` / `discoverAllOpenCodeFingerprints`，`model.parseZenSessionPool` / `writeZenSessionPool`）。
-- 转发侧**首打池首主会话**（最新那个），撞 429 才在**本请求副本内**顺序换下一个重打（最多 min(池长, 4) 个不同会话，不占用瞬时重试额度，并发隔离、池头永不上 wire），日志前缀 `[zen-pool]`（`upstream.ts zenSessionPoolOf/shiftZenSessionHeaders`）。刻意不用逐请求预防性轮换：每请求换一个只会把所有会话的配额窗口同时打满，还破坏上游按会话的亲和性。
-- 实测：换会话立即恢复（429 转成功）；`[zen-pool]` 只在真撞 429 时触发。
-- 池只有 1 个会话时行为等同旧版（不轮换，429 原样上报）。
+- 池载体 `x-polycode-session-pool`（网关自定义内网头，上游不认识）：`discover` 从本机 opencode 日志收**全部**真实会话，**新→旧**排列，最多 16 个（`ZEN_POOL_MAX`）写入——越新的会话配额窗口越干净（`parseAllFingerprintsFromLog` / `discoverAllOpenCodeFingerprints`，`parseZenSessionPool` / `writeZenSessionPool`）。
+- 轮询首打：每个请求用池游标取首打会话并前移（`takeNextZenSession`），池内会话均摊，不再每请求都打池首。
+- 配额 429（`rate_limit`）才换会话：在本请求副本内按序换下一个没试过的重试，有界（min(池长,4)），同一会话不打第二遍；池头在发往上游前剥掉，永不上 wire；副本隔离，并发请求互不污染库内 Provider。池长为 1 时无会话可换，429 原样上报。
+- QUOTA（402 / 额度用尽，如 quota/insufficient_quota/余额不足）不轮换，直接抛：充值前换谁都没用。
+- 网络抖动 / 上游 5xx 才记失败：15s 窗口内累计 3 次淘汰该会话，并从本机日志取新会话补位写透到库；淘汰有时效（TTL，到期后若刷新仍在库池内则重纳）；成功一次清掉该会话失败计数。
+- API 类错误（AUTH / FINGERPRINT / REGION / BAD_REQUEST）直接抛，不重试不淘汰。
+- 实测：配额 429 换会话立即恢复（429 转成功）。
 
 **运维含义**：会话是稀缺资源（一次 `opencode run` 产一个）。本机跑过的客户端越多，池越厚、越抗限流；长期不开客户端则池停止更新，旧会话配额窗口会越用越紧——届时跑一次 `opencode run "hi"` 再刷新指纹即可续上。
 

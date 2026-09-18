@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createServer, type Server } from 'node:http'
 import { AddressInfo } from 'node:net'
-import { Upstream, joinURL, probeOrder, shouldTryOtherProtocol, resolveProtocol, egressProxyURI, buildRequestURL, classifyUpstreamError, applyZenFingerprint, sanitizeUA, summarizeUpstreamBody, ensureZenAgentShape, ZEN_FLOOR_TOOL_NAMES } from '../src/router/upstream.ts'
+import { Upstream, joinURL, probeOrder, shouldTryNextProtocol, shouldForgetProtocol, shouldTryOtherProtocol, resolveProtocol, egressProxyURI, buildRequestURL, classifyUpstreamError, applyZenFingerprint, sanitizeUA, summarizeUpstreamBody, ensureZenAgentShape, ZEN_FLOOR_TOOL_NAMES } from '../src/router/upstream.ts'
 import { UpstreamError } from '../src/ir/index.ts'
 import { forgetProtocol, rememberProtocol } from '../src/model/index.ts'
 import type { Provider } from '../src/model/index.ts'
@@ -85,11 +85,32 @@ describe('协议解析与探测（对齐 upstream.go）', () => {
     ])
   })
 
-  test('shouldTryOtherProtocol：5xx/网络/400 可试；凭据/限流硬错误不试', () => {
+  test('shouldTryNextProtocol：400/500/网络都换协议试；凭据/配额/限流不换', () => {
+    // B-P0-1 拆分：清缓存（shouldForgetProtocol）只有 400 才做；
+    // 换协议（shouldTryNextProtocol）500/网络也试——错协议也可能回 500
+    // （zen muse-spark 走错端点实测），且 5xx 多为上游病了，换个端点或能好。
     const e = (kind: string) => new UpstreamError(0, kind, 'x')
-    expect(shouldTryOtherProtocol(e(UPSTREAM.SERVER))).toBe(true)
-    expect(shouldTryOtherProtocol(e(UPSTREAM.NETWORK))).toBe(true)
+    expect(shouldTryNextProtocol(e(UPSTREAM.BAD_REQUEST))).toBe(true)
+    expect(shouldTryNextProtocol(e(UPSTREAM.SERVER))).toBe(true)
+    expect(shouldTryNextProtocol(e(UPSTREAM.NETWORK))).toBe(true)
+    expect(shouldTryNextProtocol(e(UPSTREAM.AUTH))).toBe(false)
+    expect(shouldTryNextProtocol(e(UPSTREAM.RATE_LIMIT))).toBe(false)
+    expect(shouldTryNextProtocol(e(UPSTREAM.QUOTA))).toBe(false)
+  })
+
+  test('shouldForgetProtocol：只有 400 才清记住的协议（5xx 不清，防下个请求重探）', () => {
+    const e = (kind: string) => new UpstreamError(0, kind, 'x')
+    expect(shouldForgetProtocol(e(UPSTREAM.BAD_REQUEST))).toBe(true)
+    expect(shouldForgetProtocol(e(UPSTREAM.SERVER))).toBe(false)
+    expect(shouldForgetProtocol(e(UPSTREAM.NETWORK))).toBe(false)
+    expect(shouldForgetProtocol(e(UPSTREAM.AUTH))).toBe(false)
+  })
+
+  test('shouldTryOtherProtocol 旧名兼容：语义 = shouldForgetProtocol（路径不对才换）', () => {
+    const e = (kind: string) => new UpstreamError(0, kind, 'x')
     expect(shouldTryOtherProtocol(e(UPSTREAM.BAD_REQUEST))).toBe(true)
+    expect(shouldTryOtherProtocol(e(UPSTREAM.SERVER))).toBe(false)
+    expect(shouldTryOtherProtocol(e(UPSTREAM.NETWORK))).toBe(false)
     expect(shouldTryOtherProtocol(e(UPSTREAM.AUTH))).toBe(false)
     expect(shouldTryOtherProtocol(e(UPSTREAM.RATE_LIMIT))).toBe(false)
     expect(shouldTryOtherProtocol(e(UPSTREAM.QUOTA))).toBe(false)
@@ -127,6 +148,75 @@ describe('换源闸门（硬约束）', () => {
     expect(hits.some((h) => h.includes('chat/completions'))).toBe(true)
     expect(hits.some((h) => h.includes('responses'))).toBe(true)
     expect(hits.some((h) => h.includes('/v1/messages'))).toBe(true)
+  })
+
+  test('协议自动探测：首候选 500 时换下一个协议（错协议也可能回 500，如 muse-spark）', async () => {
+    // B-P0-1 回归：shouldTry 收窄时这条会挂——首试 500 直接抛，次候选轮不到。
+    const { startOneShot } = await import('./helpers/one-shot-server.ts')
+    await import('../src/codec/openaicompletions.ts')
+    await import('../src/codec/openairesponses.ts')
+    await import('../src/codec/anthropicmessages.ts')
+    const hits: string[] = []
+    const { server: sx, base } = await startOneShot((req, res) => {
+      hits.push(req.url ?? '')
+      if (req.url?.includes('/responses')) {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' })
+        res.write('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n')
+        res.write('event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}\n\n')
+        res.end()
+        return
+      }
+      res.writeHead(500, { 'Content-Type': 'application/json' })
+      res.end('{"error":{"message":"Internal server error"}}')
+    })
+    try {
+      const u = new Upstream({ credLookup: () => ['', false] })
+      const p = prov({ name: 'probe-500', api: '', baseUrl: base })
+      forgetProtocol('probe-500', 'mm')
+      const stream = await u.stream(p, {
+        model: 'mm', stream: true,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      } as never)
+      await stream.cancel().catch(() => {})
+      expect(hits.some((h) => h.includes('chat/completions'))).toBe(true) // 首试 completions 撞 500
+      expect(hits.some((h) => h.includes('/responses'))).toBe(true) // 回退 responses 成功
+    } finally {
+      await new Promise<void>((r) => sx.close(() => r()))
+    }
+  })
+
+  test('已知协议 500 不清缓存但仍换协议试（拆分语义）', async () => {
+    // known 路径：记住的是 completions 且回 500 → 缓存保留（下个请求不重探），
+    // 但本次请求仍试 responses 并成功。
+    const { startOneShot } = await import('./helpers/one-shot-server.ts')
+    await import('../src/codec/openaicompletions.ts')
+    await import('../src/codec/openairesponses.ts')
+    const { server: sx, base } = await startOneShot((req, res) => {
+      if (req.url?.includes('/responses')) {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' })
+        res.write('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n')
+        res.write('event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}\n\n')
+        res.end()
+        return
+      }
+      res.writeHead(500, { 'Content-Type': 'application/json' })
+      res.end('{"error":{"message":"boom"}}')
+    })
+    try {
+      const { rememberProtocol, autoProtocol } = await import('../src/model/index.ts')
+      rememberProtocol('known-500', 'mk', 'openai-completions')
+      const u = new Upstream({ credLookup: () => ['', false] })
+      const p = prov({ name: 'known-500', api: '', baseUrl: base })
+      const stream = await u.stream(p, {
+        model: 'mk', stream: true,
+        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      } as never)
+      await stream.cancel().catch(() => {})
+      // 缓存不清（仍是 completions），但本次成功记的是 responses
+      expect(autoProtocol('known-500', 'mk')).toBe('openai-responses')
+    } finally {
+      await new Promise<void>((r) => sx.close(() => r()))
+    }
   })
 })
 

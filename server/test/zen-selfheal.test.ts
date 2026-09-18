@@ -22,6 +22,7 @@ import { MemoryAccountStore, MemoryProviderStore } from '../src/adminapi/store.t
 import { Proxy } from '../src/gateway/proxy.ts'
 import { Scheduler } from '../src/router/scheduler.ts'
 import { Upstream, nextZenSession, resetZenPoolCursor, shiftZenSession, shiftZenSessionHeaders } from '../src/router/upstream.ts'
+import { flushZenPoolToLib, recordZenFailure, refillZenPool, resetZenPoolState, takeNextZenSession } from '../src/router/zen_pool.ts'
 import { UpstreamError, UPSTREAM } from '../src/ir/index.ts'
 import type { Config } from '../src/config/index.ts'
 import type { Provider } from '../src/model/index.ts'
@@ -473,7 +474,7 @@ describe('会话池：收集本机全部会话并轮换', () => {
     expect(parseZenSessionPool(p.headers!)).toEqual([S1, S2])
   })
 
-  test('429 换会话重试：首打主会话，撞 429 换下一个成功，且不污染库内 Provider', async () => {
+  test('429 换会话重试：首打池内之一，撞 429 换另一个成功，且不污染库内 Provider', async () => {
     const seen: string[] = []
     const { startOneShot } = await import('./helpers/one-shot-server.ts')
     const okSSE = 'event: message_start\ndata: {"type":"message_start"}\n\n'
@@ -489,8 +490,10 @@ describe('会话池：收集本机全部会话并轮换', () => {
       res.end(okSSE)
     })
     try {
+      resetZenPoolState() // 轮询游标进程内共享：清掉再打，首打才可预期
       const up = new Upstream({ credLookup: () => ['', false] })
       const orig = zenProvider({
+        providerId: 901,
         // isZenUpstream 只认 opencode.ai 域名：用 127.0.0.1 + 池会走“非 zen”分支；
         // 这里用 http://s1.opencode.ai 域名并劫持 fetch，把 host 指回本地桩。
         baseUrl: 'https://s1.opencode.ai/zen/v1', api: 'openai-completions',
@@ -516,10 +519,15 @@ describe('会话池：收集本机全部会话并轮换', () => {
       } as never)
       await stream.cancel().catch(() => {})
       expect(n).toBe(2) // 首打 429 + 换会话一次成功
-      expect(seen).toEqual([S1, S2]) // 首打主会话，重打下一个（不重复打同一会话）
+      // 轮询语义：首打是池内之一（游标推进决定是 S1 还是 S2），重点是两次打了不同会话
+      expect(seen).toHaveLength(2)
+      expect([S1, S2]).toContain(seen[0])
+      expect([S1, S2]).toContain(seen[1])
+      expect(seen[0]).not.toBe(seen[1]) // 不重复打同一会话
       // 库内 Provider 未被污染：会话与池顺序原样
       expect(orig.headers!['x-opencode-session']).toBe(S1)
       expect(orig.headers!['x-polycode-session-pool']).toBe(snapPool)
+      resetZenPoolState()
     } finally {
       await new Promise<void>((r) => sx.close(() => r()))
     }
@@ -534,8 +542,10 @@ describe('会话池：收集本机全部会话并轮换', () => {
       res.end('{"error":{"message":"rate_limit_exceeded"}}')
     })
     try {
+      resetZenPoolState() // 游标进程内共享：清掉再打，避免与前后用例串状态
       const up = new Upstream({ credLookup: () => ['', false] })
       const orig = zenProvider({
+        providerId: 902,
         baseUrl: 'https://s1.opencode.ai/zen/v1', api: 'openai-completions',
         headers: {
           'x-polycode-session-pool': `${S1},${S2}`,
@@ -551,8 +561,185 @@ describe('会话池：收集本机全部会话并轮换', () => {
         model: 'm', stream: true, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
       } as never)).rejects.toMatchObject({ status: 429 })
       expect(n).toBe(2) // 首打 + min(池长 2, 上限 4) - 1 次换会话 = 共 2 次
+      resetZenPoolState()
     } finally {
       await new Promise<void>((r) => sx.close(() => r()))
+    }
+  })
+})
+
+// 会话池轮询与写库（A-P0-1/A-P0-2/A-P1-4/A-P1-6 回归，2026-09-18 落地语义）。
+//
+// 背景：zen 免费档限流按 x-opencode-session 算——旧实现每请求都从池首打，
+// 池首永远挨打；且 429 配额与额度用尽曾混为一谈、空池曾回退到库内 primary
+// （多半正是刚淘汰的坏会话）、补位曾只进内存不写库（下次 sync 即被剔除）。
+// 本组用既有 s1.opencode.ai + fetch 劫持套路钉死新语义。
+describe('会话池轮询与写库（A-P0-1/A-P0-2/A-P1-4/A-P1-6 回归）', () => {
+  const S1 = 'ses_aaaa1111bbbb2222cccc3333'
+  const S2 = 'ses_dddd4444eeee5555ffff6666'
+  const POOL = [S1, S2]
+  // 各用例独立 providerId：游标/失败/淘汰全按 providerId 隔离，互不串状态。
+  const PID = { round: 911, quota: 912, empty: 913, refill: 914 }
+
+  // 桩恒 200 SSE：连打两次，看两次 fetch 的 x-opencode-session。
+  test('轮询首打生效：池 [S1,S2] 连打两次，游标推进且库内那份未被污染', async () => {
+    const { startOneShot } = await import('./helpers/one-shot-server.ts')
+    const okSSE = 'event: message_start\ndata: {"type":"message_start"}\n\n'
+    const seen: string[] = []
+    const { server: sx, base } = await startOneShot((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(okSSE)
+    })
+    try {
+      resetZenPoolState()
+      const up = new Upstream({ credLookup: () => ['', false] })
+      const mkOrig = () => zenProvider({
+        providerId: PID.round,
+        baseUrl: 'https://s1.opencode.ai/zen/v1', api: 'openai-completions',
+        headers: {
+          'x-polycode-session-pool': `${S1},${S2}`,
+          'x-opencode-session': S1,
+          'x-opencode-request': 'msg_aaaaaaaaaaaaaaaaaaaaaaaa',
+        },
+      })
+      const fetchSpy = up as unknown as {
+        fetch: (url: string, init: { headers: Record<string, string> }) => Promise<Response>
+      }
+      const realFetch = fetchSpy.fetch.bind(up)
+      fetchSpy.fetch = (async (url: string, init: { headers: Record<string, string> }) => {
+        seen.push(init.headers['x-opencode-session'] ?? '')
+        return realFetch(url.replace('https://s1.opencode.ai', base), init)
+      }) as typeof fetchSpy.fetch
+      const req = () => ({
+        model: 'm', stream: true, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      }) as never
+      // 连打两次：每次都传库内原样 Provider（模拟调度器每请求给的快照）
+      const o1 = mkOrig()
+      const s1 = await up.stream(o1, req())
+      await s1.cancel().catch(() => {})
+      const o2 = mkOrig()
+      const s2 = await up.stream(o2, req())
+      await s2.cancel().catch(() => {})
+      // 游标推进：两次首打依次为 S1、S2（不是每次都打池首）
+      expect(seen).toEqual([S1, S2])
+      // 库内那份未被污染：仍是 S1/原池序（轮换只发生在请求副本里）
+      for (const o of [o1, o2]) {
+        expect(o.headers!['x-opencode-session']).toBe(S1)
+        expect(o.headers!['x-polycode-session-pool']).toBe(`${S1},${S2}`)
+      }
+      resetZenPoolState()
+    } finally {
+      await new Promise<void>((r) => sx.close(() => r()))
+    }
+  })
+
+  test('QUOTA 不轮换：429 + 额度用尽只打 1 次，抛 quota（A-P1-4）', async () => {
+    const { startOneShot } = await import('./helpers/one-shot-server.ts')
+    let n = 0
+    const { server: sx, base } = await startOneShot((_req, res) => {
+      n++
+      res.writeHead(429, { 'content-type': 'application/json' })
+      res.end('{"error":{"code":14018,"message":"额度已用尽"}}')
+    })
+    try {
+      resetZenPoolState()
+      const up = new Upstream({ credLookup: () => ['', false] })
+      const orig = zenProvider({
+        providerId: PID.quota,
+        baseUrl: 'https://s1.opencode.ai/zen/v1', api: 'openai-completions',
+        headers: {
+          'x-polycode-session-pool': `${S1},${S2}`,
+          'x-opencode-session': S1,
+          'x-opencode-request': 'msg_aaaaaaaaaaaaaaaaaaaaaaaa',
+        },
+      })
+      const fetchSpy = up as unknown as { fetch: (url: string, init: unknown) => Promise<Response> }
+      const realFetch = fetchSpy.fetch.bind(up)
+      fetchSpy.fetch = ((url: string, init: unknown) =>
+        realFetch(url.replace('https://s1.opencode.ai', base), init)) as typeof fetchSpy.fetch
+      // UpstreamError.kind 字段名为 kind（见 ir/errors.ts）：QUOTA_HINT 命中 → kind 为 quota
+      await expect(up.stream(orig, {
+        model: 'm', stream: true, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      } as never)).rejects.toMatchObject({ status: 429, kind: UPSTREAM.QUOTA })
+      expect(n).toBe(1) // 充值前换谁都没用：不轮换，直接抛
+      resetZenPoolState()
+    } finally {
+      await new Promise<void>((r) => sx.close(() => r()))
+    }
+  })
+
+  test('空池/全淘汰回退：takeNextZenSession 为 undefined 时仍按库内原会话发出（A-P1-6）', async () => {
+    const { startOneShot } = await import('./helpers/one-shot-server.ts')
+    const okSSE = 'event: message_start\ndata: {"type":"message_start"}\n\n'
+    const seen: string[] = []
+    const { server: sx, base } = await startOneShot((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(okSSE)
+    })
+    try {
+      resetZenPoolState()
+      // 先把池内会话全淘汰：同一时钟连记 3 次（阈值 3 即淘汰，见 zen_pool.ts）
+      const t0 = 1_000_000
+      for (const sid of POOL) {
+        for (let i = 0; i < 3; i++) recordZenFailure(PID.empty, sid, t0 + i * 100, POOL)
+      }
+      // 全淘汰后游标取不到首打（同一时钟，否则 TTL 判定用 Date.now 会当场重纳）
+      expect(takeNextZenSession(PID.empty, POOL, t0 + 1000)).toBeUndefined()
+      const up = new Upstream({ credLookup: () => ['', false] })
+      const orig = zenProvider({
+        providerId: PID.empty,
+        baseUrl: 'https://s1.opencode.ai/zen/v1', api: 'openai-completions',
+        headers: {
+          'x-polycode-session-pool': `${S1},${S2}`,
+          'x-opencode-session': S1,
+          'x-opencode-request': 'msg_aaaaaaaaaaaaaaaaaaaaaaaa',
+        },
+      })
+      const fetchSpy = up as unknown as {
+        fetch: (url: string, init: { headers: Record<string, string> }) => Promise<Response>
+      }
+      const realFetch = fetchSpy.fetch.bind(up)
+      fetchSpy.fetch = (async (url: string, init: { headers: Record<string, string> }) => {
+        seen.push(init.headers['x-opencode-session'] ?? '')
+        return realFetch(url.replace('https://s1.opencode.ai', base), init)
+      }) as typeof fetchSpy.fetch
+      const stream = await up.stream(orig, {
+        model: 'm', stream: true, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      } as never)
+      await stream.cancel().catch(() => {})
+      // 回退不断言轮换：只断仍按库内原会话发出（fetch 看到的是库内 primary S1）
+      expect(seen).toEqual([S1])
+      resetZenPoolState()
+    } finally {
+      await new Promise<void>((r) => sx.close(() => r()))
+    }
+  })
+
+  test('补位写透：淘汰后 writer 收到含补位、不含淘汰的 active（A-P0-2）', () => {
+    // 快路径：直接调 recordZenFailure 单元（3 次独立记账即淘汰，新口径下
+    // 每请求只记一次，这里三次调用模拟三个独立失败请求）+ flushZenPoolToLib
+    // 断 writer 链路——比走三次 500 wire 快（瞬时重试 500ms 退避会拖慢用例）。
+    resetZenPoolState()
+    try {
+      const t0 = 2_000_000
+      // 候选必须过 validZenToken 白名单（字母数字/_/-，≤128）
+      const FRESH = 'ses_fresh0001abcd0001'
+      // 同一时钟初始化 active（takeNext 走 sync 落 active，后续记账才有池可淘）
+      expect(takeNextZenSession(PID.refill, POOL, t0)).toBe(S1)
+      // 同一会话三个独立失败请求 → 第 3 次淘汰 S1（返回 true）
+      expect(recordZenFailure(PID.refill, S1, t0 + 100, POOL)).toBe(false)
+      expect(recordZenFailure(PID.refill, S1, t0 + 200, POOL)).toBe(false)
+      expect(recordZenFailure(PID.refill, S1, t0 + 300, POOL)).toBe(true)
+      // 补位：从候选里收一个没进过池的新会话（同一时钟，冷却中的 S1 不重纳）
+      expect(refillZenPool(PID.refill, [FRESH], POOL, t0 + 400)).toBe(FRESH)
+      // 写透：writer 收到运行时 active（含补位 FRESH、不含淘汰 S1）
+      const got: string[][] = []
+      expect(flushZenPoolToLib(PID.refill, (sessions) => { got.push(sessions); return true })).toBe(true)
+      expect(got).toHaveLength(1)
+      expect(got[0]).toContain(FRESH)
+      expect(got[0]).not.toContain(S1)
+    } finally {
+      resetZenPoolState()
     }
   })
 })

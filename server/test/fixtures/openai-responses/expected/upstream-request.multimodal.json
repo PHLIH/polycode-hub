@@ -19,5 +19,6 @@
       ]
     }
   ],
+  "truncation": "disabled",
   "max_output_tokens": 512
 }

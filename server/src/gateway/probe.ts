@@ -1,11 +1,12 @@
 // Provider 测试与模型发现（对齐 Go internal/gateway/proxy.go 后半段）。
 // 管理面 SetProber/SetModelLister/SetModelProber 的实现。
 
-import { getOutbound, UpstreamError, type IrRequest, type StreamEvent } from '../ir/index.ts'
+import { getOutbound, UpstreamError, UPSTREAM, type IrRequest, type StreamEvent } from '../ir/index.ts'
 import {
   autoProtocol, rememberProtocol, looksFree, accountEffectiveStatus, applyReasoningFloor,
   type Provider, type UsageLog,
 } from '../model/index.ts'
+import { validProtocol } from '../ir/index.ts'
 import type { AccountPool } from '../pool/account.ts'
 import type { Scheduler } from '../router/scheduler.ts'
 import type { Upstream } from '../router/upstream.ts'
@@ -189,12 +190,51 @@ export class Probe {
   }
 
   // 依次用候选协议探测同一模型，返回首个成功的；全失败时报告最有信息量的那次错误。
+  // 库里已有协议记录（m.api）时先测这一个（上次成功的事实，大概率仍对）；
+  // 但它失败且错误可换协议（BAD_REQUEST 路径不对 / SERVER 上游病了）时，
+  // 自动 fallthrough 到全量试错——stale 记录（上游切换/500 系）不再砖掉“测试”，
+  // 探到新的成功即覆盖旧记录。非法记录（不在三协议内）直接走全量。
   async probeWithProtocols(pv: Provider, modelID: string): Promise<ModelProbe> {
+    const recorded = pv.models.find((x) => x.id === modelID)?.api
+    if (recorded && validProtocol(recorded)) {
+      const attempt: Provider = { ...pv, api: recorded }
+      const m = pv.models.find((x) => x.id === modelID)
+      if (m?.egress) attempt.egress = m.egress
+      attempt.models = pinModelProtocol(pv.models, modelID, recorded)
+      const r = await this.probeOne(attempt, modelID)
+      if (r.ok) {
+        void this.usage?.insertLog({ ...r.ul, status: 'ok', latencyMs: r.firstMs })
+        return { model: modelID, ok: true, protocol: recorded, text: r.text, latencyMs: r.firstMs }
+      }
+      const kind = r.ul.errorKind ?? ''
+      // 记录过期也可能只是凭据/限流问题（换协议救不了）→ 如实报，不试错；
+      // 只有“协议可能错了”才 fallthrough（B-P0-2）。
+      const maybeStale = kind === UPSTREAM.BAD_REQUEST || kind === UPSTREAM.SERVER
+      if (!maybeStale) {
+        void this.usage?.insertLog({ ...r.ul, status: 'upstream_error', latencyMs: r.latencyMs })
+        return { model: modelID, ok: false, error: r.error, kind: kind || undefined }
+      }
+      // fallthrough：带着这次失败参与 best-rank，全量试错（下）。
+      return this.probeAllProtocols(pv, modelID, { err: r.error, kind, ul: r.ul, latencyMs: r.latencyMs })
+    }
+    return this.probeAllProtocols(pv, modelID)
+  }
+
+  // 全量协议试错（被记录优先路径复用；seed 为已失败的 recorded 那次，不丢病因）。
+  async probeAllProtocols(
+    pv: Provider, modelID: string,
+    seed?: { err: string; kind: string; ul: UsageLog; latencyMs: number },
+  ): Promise<ModelProbe> {
     const candidates = probeProtocolOrder(pv, modelID)
-    let lastErr = ''
-    let lastUL: UsageLog | null = null
-    let lastLatency = 0
+    let lastErr = seed?.err ?? ''
+    let lastUL: UsageLog | null = seed?.ul ?? null
+    let lastLatency = seed?.latencyMs ?? 0
     let best: { err: string; kind: string; rank: number } | null = null
+    if (seed && seed.kind) {
+      // recorded 那次失败同样参与 best-rank：它可能是真病因（凭据/限流），
+      // 不能因为后面试错的 404 噪音把它盖掉。
+      best = { err: seed.err, kind: seed.kind, rank: errorRank(seed.kind, seed.err) }
+    }
     for (const proto of candidates) {
       const attempt: Provider = { ...pv, api: proto }
       const m = pv.models.find((x) => x.id === modelID)

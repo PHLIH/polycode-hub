@@ -155,6 +155,15 @@ async function setModelProtocol(p, id, proto) {
   } catch (e) { ElMessage.error(e.message) }
 }
 
+// 清除已记录的协议：回到「未识别 · 继承默认」，手选下拉自动回来，也可重新识别覆盖
+async function clearProtocol(p, id) {
+  try {
+    await api.updateProviderModelProtocol(p.providerId, id, '')
+    patchRowModel(p, id, 'api', '')
+    ElMessage.success('已清除协议记录，可手选或重新识别')
+  } catch (e) { ElMessage.error(e.message) }
+}
+
 async function setModelEgress(p, id, eg) {
   try {
     await api.updateProviderModelEgress(p.providerId, id, eg)
@@ -221,8 +230,7 @@ async function detect(p, id) {
     if (!r) throw new Error('无结果')
     scanRes.value[k] = r // 行内标签立即反映结果
     if (r.ok) {
-      const m = modelOf(p, id)
-      if (m && r.protocol) m.api = r.protocol // 协议已写回服务端，同步到本地行
+      if (r.protocol) patchRowModel(p, id, 'api', r.protocol) // 协议已写回服务端，同步到本地行
     } else {
       ElMessage.error(`${id}：${(r.error || '').slice(0, 60)}`)
     }
@@ -422,8 +430,16 @@ async function toggle() {
             </template>
           </span>
 
-          <el-select :model-value="protoValue(p, m.id)" size="small" class="lane-sel"
-            :placeholder="protoPlaceholder(p, m.id)" :title="protoValue(p, m.id) || protoPlaceholder(p, m.id)"
+          <!-- 协议：有记录 = 已验证事实，锁死只读（点「改」清除后可手选，点「识别」重扫覆盖）；
+               无记录 = 未识别，可手选纠偏。见服务端 resolveProtocol 优先级。 -->
+          <span v-if="protoValue(p, m.id)" class="mono proto-locked"
+            :title="`协议已验证：${protoValue(p, m.id)}（转发/测试直达；点「改」清除后可手选，点「识别」重扫覆盖）`">
+            ✓ {{ protoValue(p, m.id) }}
+            <button class="act tiny" title="清除协议记录，回到手选"
+              @click="clearProtocol(p, m.id)">改</button>
+          </span>
+          <el-select v-else :model-value="''" size="small" class="lane-sel"
+            :placeholder="protoPlaceholder(p, m.id)" :title="protoPlaceholder(p, m.id)"
             clearable filterable @change="v => setModelProtocol(p, m.id, v || '')">
             <el-option v-for="pp in PROTOCOLS" :key="pp" :value="pp" :label="pp" />
           </el-select>
@@ -448,8 +464,8 @@ async function toggle() {
 
           <span class="lane-detect">
             <button class="act tiny" :class="{ busy: detecting[keyOf(p, m.id)] }"
-              :title="detecting[keyOf(p, m.id)] ? '正在探测，点此取消' : '探测这个模型的协议与可用性'"
-              @click="detect(p, m.id)">{{ detecting[keyOf(p, m.id)] ? '取消' : '识别' }}</button>
+              :title="detecting[keyOf(p, m.id)] ? '正在探测，点此取消' : (protoValue(p, m.id) ? `用已记录协议 ${protoValue(p, m.id)} 复测（不试错其他协议）` : '全协议试错并记录成功的那个')"
+              @click="detect(p, m.id)">{{ detecting[keyOf(p, m.id)] ? '取消' : (protoValue(p, m.id) ? '复测' : '识别') }}</button>
             <span v-if="scanRes[keyOf(p, m.id)]" class="mono scan"
               :class="scanRes[keyOf(p, m.id)].ok ? 'ok' : 'bad'"
               :title="scanRes[keyOf(p, m.id)].error || ''">
@@ -657,6 +673,13 @@ async function toggle() {
 .lane-sel :deep(.el-select__wrapper.is-focused) { background: var(--bg); border-color: var(--accent); }
 .lane-sel :deep(.el-select__placeholder) { color: var(--dim); }
 .lane-detect { flex: none; width: 104px; display: flex; align-items: center; gap: 6px; }
+/* 协议已验证：只读展示，锁死不可改（改走「复测/识别」重扫覆盖）。
+   与 lane-sel 同宽，保证行内对齐不跳动。 */
+.proto-locked {
+  flex: 0 0 176px; width: 176px; min-height: 26px; line-height: 26px;
+  color: var(--ok, #67c23a); font-size: 11.5px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
 .scan { font-size: 11px; }
 .scan.ok { color: var(--ok); }
 .scan.bad { color: var(--bad); }

@@ -42,6 +42,7 @@
     }
   ],
   "tool_choice": "auto",
+  "truncation": "disabled",
   "max_output_tokens": 1024,
   "stream": true
 }

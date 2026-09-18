@@ -29,10 +29,10 @@ import { Store as ProjectsStore } from './projects/store.ts'
 import { openLog, startDetached } from './projects/process.ts'
 import {
   Scanner, defaultConfig, discoverWorkBuddyModelsFrom, workBuddyDataDirs,
-  discoverOpenCodeFingerprint, type ZenCallProbe,
+  discoverOpenCodeFingerprint, discoverAllOpenCodeFingerprints, type ZenCallProbe,
 } from './discover/index.ts'
 import { refreshAllZenProviders, refreshZenProvider } from './discover/zen_refresh.ts'
-import { isZenBaseUrl, mintZenRequestId } from './model/index.ts'
+import { isZenBaseUrl, mintZenRequestId, parseZenSessionPool, writeZenSessionPool } from './model/index.ts'
 
 // 目录候选的安全取值（配置可能未提供该字段）。
 const workBuddyDataNullsafe = (dirs: string[] | undefined): string[] => dirs ?? []
@@ -112,7 +112,43 @@ export async function runServe(args: string[]): Promise<void> {
   for (const e of cfg.egresses) {
     if (!egresses.get(e.id)) egresses.put(e)
   }
-  const up = new Upstream()
+  // 会话补位候选：淘汰坏会话后补新用。惰性求值（调用时才读配置）——
+  // openCodeDirs 在后面才解析，这里不能提前捕获。
+  const up = new Upstream({
+    onProtocolLearned: (providerId, modelId, protocol) => {
+      // 外部调用自动记录：转发时新探到的协议写回该模型的 api（DB 落盘），
+      // 下次转发/测试直接用，不再试错。模型已被删除时 get 返回空，直接跳过
+      // （删模型时进程缓存同步清，见 api.ts DELETE models/:model）。
+      // 写前重读比对（B-P1-1）：并发两请求探到不同协议时后写覆盖先写，
+      // 值都是某次真实成功的协议，不影响正确性；已有值则跳过，少一次写库。
+      const p = providers.get(providerId)
+      if (!p) return
+      const m = p.models.find((x) => x.id === modelId)
+      if (!m || m.api === protocol) return
+      m.api = protocol
+      providers.put(p)
+      syncStores()
+    },
+    // 补位写透到库（A-P0-2）：淘汰+refill 只改内存 active，不写库下次 sync
+    // 即被剔除。这里把运行时池落回库内池头（去抖：内容一致则跳过写库）。
+    onZenPoolFlushed: (providerId, sessions) => {
+      const p = providers.get(providerId)
+      if (!p) return
+      const h: Record<string, string> = { ...(p.headers ?? {}) }
+      const before = parseZenSessionPool(h).join(',')
+      writeZenSessionPool(h, sessions)
+      if (parseZenSessionPool(h).join(',') === before) return // 一致：跳过写库
+      p.headers = h
+      providers.put(p)
+      syncStores()
+    },
+    refillCandidates: () => {
+      try {
+        const dirs = defaultConfig().openCodeDirs ?? []
+        return discoverAllOpenCodeFingerprints(dirs).map((x) => x.sessionID)
+      } catch { return [] }
+    },
+  })
   const syncEgresses = () => {
     up.setEgresses(Object.fromEntries(egresses.list().map((e) => [e.id, egressProxyURI(e)])))
   }
@@ -318,6 +354,12 @@ export async function runServe(args: string[]): Promise<void> {
 
   const admin = createAdminApi({
     adminKey: cfg.gateway.adminKey,
+    // 概览页接入区：前端据此决定 API Key 那行是「随便填」还是「去配 gateway_key」。
+    // 只传布尔 + 默认模型名，不传 key 本体（管理口令都防泄漏，何况转发面密钥）。
+    gateway: {
+      authRequired: cfg.gateway.gatewayKey !== '',
+      defaultModel: cfg.gateway.defaultModel,
+    },
     egresses,
     providers,
     accounts,

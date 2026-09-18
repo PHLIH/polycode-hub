@@ -66,6 +66,11 @@ function unwrapList(data, field) {
 
 export const api = {
   stats: () => req('GET', '/admin/api/stats'),
+  // 概览页接入区用：{authRequired, defaultModel}。只暴露是否要鉴权，不下发 key 本体。
+  gatewayInfo: async () => {
+    const data = await req('GET', '/admin/api/gateway')
+    return { authRequired: !!(data && data.authRequired), defaultModel: (data && data.defaultModel) || '' }
+  },
   // 区间语义（TIME-RANGE-FILTER）：range = {days} 或 {since, until}（YYYY-MM-DD 本地日历日）
   breakdown: (range = {}) => {
     const q = new URLSearchParams()
