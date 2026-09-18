@@ -10,6 +10,7 @@ import { execFileSync } from 'node:child_process'
 import {
   Sidecar,
   assetName,
+  normalizeGOOS,
   checkDownloadURL,
   killSidecarSpec,
   latestRelease,
@@ -33,6 +34,44 @@ describe('assetName 平台映射', () => {
   })
   test('未知平台无产物', () => {
     expect(assetName('sunos', 'x64')).toBe('')
+  })
+
+  // 回归锚点（真实缺陷）：Windows 上 process.platform 是 "win32"，而 assetName
+  // 只认 Go 口径的 "windows"。install() 以前直接把 process.platform 传进来，
+  // 于是 Windows 恒抛「平台 win32/x64 无预编译产物」——**从来就装不上**，
+  // 且与网络/代理无关（在下载之前就返回了）。
+  // 旧测试全用 goos:'windows' 显式传参，恰好绕开了这条真实入参路径，
+  // 所以一直没暴露。这里锚死「Node 口径进来也要能出产物」。
+  test('Node 口径 win32 必须也能映射出产物（回归锚点）', () => {
+    expect(assetName(normalizeGOOS('win32'), 'x64')).toBe('zcode-proxy.exe')
+    expect(assetName(normalizeGOOS('win32'), 'arm64')).toBe('zcode-proxy.exe')
+    expect(normalizeGOOS('win32')).toBe('windows')
+    // 其余平台同名直通；幂等（已归一的值再归一不变）
+    expect(normalizeGOOS('darwin')).toBe('darwin')
+    expect(normalizeGOOS('linux')).toBe('linux')
+    expect(normalizeGOOS(normalizeGOOS('win32'))).toBe('windows')
+  })
+
+  test('Windows 上 install 直接吃 process.platform 也能安装（真实入参路径）', async () => {
+    // 模拟 Windows 进程：goos 显式传 "win32"（等价于该平台的 process.platform）
+    const dir = makeTemp('polycode-swin-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const body = {
+        tag_name: 'v9.9.9',
+        assets: [{ name: 'zcode-proxy.exe', browser_download_url: 'https://objects.githubusercontent.com/bin.exe', size: 7 }],
+      }
+      const bin = new TextEncoder().encode('FAKEBIN')
+      const f = async (url: string | URL | Request): Promise<Response> =>
+        String(url).includes('api.github.com')
+          ? new Response(JSON.stringify(body), { status: 200 })
+          : new Response(bin, { status: 200 })
+      const dest = await s.install(false, { fetch: f, goos: 'win32', arch: 'x64' })
+      expect(dest).toBe(join(dir, 'bin', 'zcode-proxy'))
+      expect(readFileSync(dest, 'utf8')).toBe('FAKEBIN')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
 

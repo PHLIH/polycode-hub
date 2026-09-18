@@ -65,7 +65,10 @@ export type FetchLike = typeof fetch
 
 export interface InstallOptions {
   fetch?: FetchLike
-  goos?: string // 默认 process.platform
+  // goos 用 Go 口径（darwin/linux/windows）；缺省取 process.platform 并经
+  // normalizeGOOS 归一（Windows 上是 win32 → windows）。传 "win32" 也可以，
+  // 归一这一步是幂等的。
+  goos?: string
   arch?: string // 默认 process.arch
   // expectedSha256 期望的二进制摘要（十六进制，大小写不敏感）。
   // GitHub release API 不提供 digest，所以只能由调用方/配置文件给出；
@@ -97,13 +100,28 @@ export interface SidecarOptions {
 const sleep = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, ms) })
 
 // assetName 返回当前平台的 release 资产名（与上游命名约定对齐）。
+//
+// 注意 goos 用的是 **Go 的口径**（darwin/linux/windows），不是 Node 的
+// process.platform（后者 Windows 上是 "win32"）。两者必须经 normalizeGOOS
+// 转换后再进来——历史缺陷：install() 直接把 process.platform 传进来，
+// Windows 上得 "win32"，落到 default 返回空串，于是抛「平台 win32/x64
+// 无预编译产物」——Windows 从来就装不上，且与网络/代理无关。
 export function assetName(goos: string, arch: string): string {
   switch (goos) {
     case 'darwin': return 'zcode-proxy-darwin-' + arch
     case 'linux': return 'zcode-proxy-linux-' + arch
+    // Windows 只有单一构建（release 里就一个 zcode-proxy.exe，不带架构后缀），
+    // 故不拼 arch；arm64 Windows 也能跑该 x64 产物（系统自带仿真）。
     case 'windows': return 'zcode-proxy.exe'
     default: return ''
   }
+}
+
+// normalizeGOOS 把 Node 的 process.platform 归一到 Go 的 GOOS 口径。
+// win32 → windows（其余同名）；无法识别的原样返回，由 assetName 的 default
+// 分支给出「无预编译产物」的明确报错（不在这里提前抛，保持单一判定点）。
+export function normalizeGOOS(platform: string): string {
+  return platform === 'win32' ? 'windows' : platform
 }
 
 // randomKey 生成 24 字节 hex 随机 proxyApiKey。
@@ -174,7 +192,9 @@ export class Sidecar {
 
   // install 下载官方 release 二进制到 binDir（0700）。已存在时跳过（force 强制重装）。
   async install(force = false, opts: InstallOptions = {}): Promise<string> {
-    const goos = opts.goos ?? process.platform
+    // process.platform 是 Node 口径（Windows = "win32"），assetName 要的是 Go 口径
+    // （"windows"）——必须归一，否则 Windows 恒抛「无预编译产物」。
+    const goos = normalizeGOOS(opts.goos ?? process.platform)
     const arch = opts.arch ?? process.arch
     const name = assetName(goos, arch)
     if (name === '') {

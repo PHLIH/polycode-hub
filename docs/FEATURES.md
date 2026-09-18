@@ -188,6 +188,7 @@ SQLite 持久化（`usage/store.ts`，schema v2，`user_version` 前向迁移，
   - 管理面 `GET /` 与 `ensure` 回执都带 `downloadProxy`（**脱敏**，密码位打码）/`downloadProxySource`；`ensure` 失败时把「走了哪个代理 + 来源」写进错误信息——首次要下 ~66MB，直连卡住时不能再只给一个转圈的「安装中…」。
   - 代理实现复用已有依赖 `undici` 的 `ProxyAgent`（与转发面同源，不新增依赖）；CLI 侧不再用 `setGlobalDispatcher` 全局污染（那是进程级副作用，改为按次注入 fetch）。
   - 实测（2026-09-18，本机 egress `clash`=127.0.0.1:7897）：release `v4.6.7` / `zcode-proxy-darwin-arm64` 63.4MB 经代理下载成功，约 1.0 MB/s。修复前管理台 `ensure` 走全局 fetch 直连，同一网络下必然长时间卡住。
+- **平台口径（易错点）**：`assetName()` 吃的是 **Go 的 GOOS**（`darwin`/`linux`/`windows`），而 Node 的 `process.platform` 在 Windows 上是 `win32`。两者必须在边界处经 `normalizeGOOS()` 归一。历史缺陷：`install()` 直接把 `process.platform` 传进去，Windows 恒抛「平台 win32/x64 无预编译产物」——**从来就装不上**，且与网络无关（在下载之前就返回了）；旧测试全用 `goos:'windows'` 显式传参，恰好绕开了真实入参路径所以没暴露。Windows 资产是单一构建 `zcode-proxy.exe`（不带架构后缀，v4.6.7 为 87.1MB），arm64 靠系统仿真运行。
 - OAuth（`zcodeauth/index.ts`）：`TOKEN_BASE https://zcode.z.ai` / `LOGIN_BASE https://api.z.ai`；`startFlow`（`POST …/oauth/cli/init` 拿 flowID/authorizeURL）→ `pollFlow`（`GET …/poll/{flowID}` 等 ready，5 分钟有效）→ `resolveBusinessToken`（`POST …/api/auth/z/login` 换 business JWT）；JWT 只打印不落盘。
 
 ## 11. 本地项目管理器（与代理链路解耦）
