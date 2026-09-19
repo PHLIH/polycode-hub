@@ -15,6 +15,24 @@ export function shellCommand(platform: string = process.platform): { shell: stri
   return { shell: 'sh', flag: '-c' }
 }
 
+// quoteArg 把单个参数包成 shell 安全的形式（跨平台，两种方言都要对）。
+//
+// 为什么需要它：调用方要把「可执行文件路径 + 一整段脚本」拼进一条 shell 命令，
+// 而这两个值都可能含空格、引号或特殊字符（真实例子：Windows 的
+// `C:\Program Files\nodejs\node.exe`、脚本里的双引号与 $）。
+// 拼错一次就是命令被拆坏或注入——所以转义规则集中在这里，并有单测锚定。
+//
+// posix：单引号包裹，内部的 ' 用 '\'' 收尾再续（唯一无法在单引号里表示的字符）。
+// windows(cmd)：双引号包裹，内部的 " 用 "" 表示（cmd 的转义写法）。
+export function quoteArg(s: string, platform: string = process.platform): string {
+  if (platform === 'win32') {
+    // cmd.exe 里 % 会被展开成环境变量，需写成 %% 才原样传递；
+    // " 用 "" 表示。反斜杠在 cmd 的双引号内不是转义符，无需处理。
+    return `"${s.replace(/"/g, '""').replace(/%/g, '%%')}"`
+  }
+  return `'${s.replace(/'/g, `'\\''`)}'`
+}
+
 // 常见工具目录：网关常以 launchd/service 身份运行，继承到的 PATH 极简
 // （常见只有 /usr/bin:/bin），npm / node / dsh / cargo 一概找不到。用户被迫
 // 在启动命令里手写 `export PATH=/Users/xxx/node/bin:$PATH; npm run dev`——

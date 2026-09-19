@@ -595,9 +595,11 @@ export function zcodeLoginFingerprint(home: string): { source: 'cli' | 'desktop'
   return undefined
 }
 
-// 递归找 options.apiKey 形态的非空字符串值（provider.*.options.apiKey）。
-// 刻意只认 options.apiKey 这一个键：碰到别的键名一律忽略，避免把无关
-// 文件内容当凭据指纹。
+// 按 ZCode 客户端的真实结构取凭据：provider.<名>.options.apiKey。
+//
+// 必须沿路径取，不能「任意层级叫 apiKey 就算」：客户端配置文件里还有别处的
+// apiKey（遥测、第三方插件等），全收会把这些无关凭据误判成「ZCode 已登录」，
+// 并把它们的 sha256 前 12 位显示在发现页——既误报，又是没必要的指纹外泄。
 function hasZcodeCredential(cfg: unknown): boolean {
   return zcodeApiKeyValues(cfg).length > 0
 }
@@ -607,14 +609,23 @@ function zcodeCredentialFingerprint(cfg: unknown): string {
   return createHash('sha256').update(first, 'utf8').digest('hex').slice(0, 12)
 }
 
-function zcodeApiKeyValues(node: unknown, depth = 0): string[] {
-  if (depth > 4 || node === null || typeof node !== 'object') return []
+function zcodeApiKeyValues(cfg: unknown): string[] {
+  if (!isRecord(cfg)) return []
+  const providers = cfg.provider
+  if (!isRecord(providers)) return []
   const out: string[] = []
-  for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
-    if (k === 'apiKey' && typeof v === 'string' && v.length >= 20) out.push(v)
-    else out.push(...zcodeApiKeyValues(v, depth + 1))
+  for (const entry of Object.values(providers)) {
+    if (!isRecord(entry)) continue
+    const options = entry.options
+    if (!isRecord(options)) continue
+    const key = options.apiKey
+    if (typeof key === 'string' && key.length >= 20) out.push(key)
   }
   return out
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === 'object' && !Array.isArray(v)
 }
 
 // ---- OpenCode Zen（连通性探针，无需凭据） ----

@@ -393,7 +393,11 @@ export function isWorkBuddyAiBaseUrl(baseUrl: string): boolean {
 }
 
 // 上游 base_url → WorkBuddy 版本。非 WorkBuddy 上游返回 undefined。
-// 与发现层的 realmFromIssuer 同口径（域后缀判定），供账号-Provider 一致性校验复用。
+//
+// 口径与 isWorkBuddyAiBaseUrl 对称：裸域与子域都算（workbuddy.cn 与
+// www.workbuddy.cn 是同一套后端，用户两种写法都常见）。此前国内版只认
+// *.workbuddy.cn，漏掉裸域，于是 baseUrl 写成 https://workbuddy.cn/v2 时
+// 「账号-Provider 版本校验」与「归因头迁移」双双静默失效（两处都靠本函数判版本）。
 export function workBuddyRealmOfBaseUrl(baseUrl: string): 'cn' | 'ai' | undefined {
   let h: string
   try {
@@ -402,7 +406,7 @@ export function workBuddyRealmOfBaseUrl(baseUrl: string): 'cn' | 'ai' | undefine
     return undefined
   }
   if (h === 'workbuddy.ai' || h.endsWith('.workbuddy.ai')) return 'ai'
-  if (h === 'copilot.tencent.com' || h.endsWith('.workbuddy.cn')) return 'cn'
+  if (h === 'workbuddy.cn' || h.endsWith('.workbuddy.cn') || h === 'copilot.tencent.com') return 'cn'
   return undefined
 }
 

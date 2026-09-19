@@ -140,13 +140,19 @@ export function createSidecarApp(
   }
 
   // cancelJob 比暂停多一步：把已下的一半删掉。
-  // 删除放在 abort 之后、作业态收尾之前：下载循环随后就会停。竞态上存在一个
-  // 已缓冲的 chunk 在 unlink 之后落盘的窗口（写入目标是已 unlink 的 inode /
-  // Windows delete-pending 文件，无害）——关键性质是「文件不会因此复现」，
-  // 而不是「绝不会再写」。
+  //
+  // 顺序很重要：先 abort，再**等作业真正收尾**，最后才删。
+  // 旧实现 abort 之后立刻同步删除。在 Windows 上，正在被写入的 .part 会因文件
+  // 被占用而 unlink 失败（EPERM），而 discardPartial 静默吞异常——接口照样回
+  // cancelled:true、日志照样打「清除半成品 0 字节」，文件却还在，下次安装又带着
+  // Range 从一半续起，正是这个 commit 声称修好的现象。先等收尾（fd 已关）再删，
+  // 就没有这个窗口了。
   async function cancelJob(): Promise<boolean> {
     if (!job.running || jobAbort === null) return false
     jobAbort.abort()
+    // 等作业 promise 落定：下载循环观察到 abort 后会退出并关闭 fd。
+    // catch 兜住取消本身引起的 reject——取消路径不关心作业成败。
+    if (job.promise !== null) await job.promise.catch(() => {})
     const removed = svc.discardPartial(dir())
     console.log(`sidecar: 已取消安装，清除半成品 ${removed} 字节（下次从 0 开始）`)
     return true

@@ -489,7 +489,9 @@ async function setWeight(a, v) {
           <el-switch :model-value="isEnabled(a)" size="small"
             :title="isEnabled(a) ? '启用中：参与轮询，点击停用' : '已停用：不接请求，点击启用'"
             @change="v => toggleEnabled(a, v)" />
-          <button v-if="a.importSource === 'workbuddy'" class="linklike"
+          <!-- 两个发行版都能签到（后端已按 Provider 版本推导 host 与 X-Domain）；
+               只显示 'workbuddy' 会让海外版账号永远没有签到入口。 -->
+          <button v-if="a.importSource === 'workbuddy' || a.importSource === 'workbuddy-ai'" class="linklike"
             :disabled="checkingIn.has(a.id)" @click="checkin(a)"
             title="使用此账号的导入登录态签到一次，不自动重试">
             {{ checkingIn.has(a.id) ? '签到中…' : '签到' }}

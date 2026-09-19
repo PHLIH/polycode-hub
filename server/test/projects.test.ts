@@ -6,7 +6,7 @@ import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, realpathSyn
 import { tmpdir } from 'node:os'
 import { basename, join, sep } from 'node:path'
 import { createServer, type AddressInfo } from 'node:net'
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { Store, newID, type Project, type Service } from '../src/projects/store.ts'
 import { createProjectsApp, readTailLines, validateProject } from '../src/adminapi/projects_app.ts'
 import { Manager, isConflictError } from '../src/projects/manager.ts'
@@ -20,7 +20,7 @@ import {
   portBusy,
   portOwner,
   portPids,
-  shellCommand,
+  shellCommand, quoteArg,
   startDetached,
 } from '../src/projects/process.ts'
 
@@ -255,6 +255,35 @@ describe('startDetached / killTree', () => {
     expect(shellCommand('win32')).toEqual({ shell: 'cmd', flag: '/c' })
     expect(shellCommand('linux')).toEqual({ shell: 'sh', flag: '-c' })
     expect(shellCommand('darwin')).toEqual({ shell: 'sh', flag: '-c' })
+  })
+
+  // quoteArg 的转义正确性：调用方（自我重启）要把「node 路径 + 一整段脚本」
+  // 拼进一条 shell 命令，路径与脚本都可能含空格/引号/特殊字符。转义错了
+  // 轻则命令被拆坏、重则注入，所以两种 shell 方言都逐条锚定。
+  describe('quoteArg', () => {
+    test('posix：单引号包裹，内部单引号用 \'\\\'\' 收尾续接', () => {
+      expect(quoteArg('/usr/local/bin/node', 'darwin')).toBe(`'/usr/local/bin/node'`)
+      // 含空格必须整体被引号包住（否则会被 shell 拆成两个参数）
+      expect(quoteArg('/Applications/My App/node', 'linux')).toBe(`'/Applications/My App/node'`)
+      // 单引号是唯一无法直接在单引号串里表示的字符
+      expect(quoteArg("a'b", 'darwin')).toBe(`'a'\\''b'`)
+    })
+
+    test('windows(cmd)：双引号包裹，内部 " 写成 ""、% 写成 %%', () => {
+      expect(quoteArg('C:\\Program Files\\nodejs\\node.exe', 'win32'))
+        .toBe(`"C:\\Program Files\\nodejs\\node.exe"`)
+      // cmd 里 "" 表示一个字面双引号
+      expect(quoteArg('say "hi"', 'win32')).toBe(`"say ""hi"""`)
+      // % 会被 cmd 当环境变量展开，必须写成 %% 才原样传递
+      expect(quoteArg('100%done', 'win32')).toBe(`"100%%done"`)
+    })
+
+    test('posix 结果里不出现未转义的单引号对（能被 sh 正确还原）', () => {
+      // 用真实 sh 还原一次：把命令交给 sh -c 打印出来，应与原文一致
+      const nasty = `a'b "c" $HOME \`x\` ${'${y}'}`
+      const out = execFileSync('sh', ['-c', `printf %s ${quoteArg(nasty, 'darwin')}`], { encoding: 'utf8' })
+      expect(out).toBe(nasty)
+    })
   })
 
   // 回归：网关以 launchd/service 身份运行时继承到的 PATH 极简（常只有

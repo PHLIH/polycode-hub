@@ -937,6 +937,46 @@ describe('下载断点续传', () => {
       rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  // 回归：磁盘上残留**旧版本**半成品时，绝不能带 Range 续传。
+  // 旧实现只守 received >= asset.size（挡住「半成品更大」），反向没守：
+  // 旧包更小时会把新版本字节追加到旧数据后面，拼出一个长度恰好等于
+  // asset.size 的「缝合怪」——长度校验照样通过，然后被 chmod 0700 执行。
+  // 现在 .part 旁记来源（tag+资产名+大小+digest），对不上就整包重下。
+  test('残留旧版本半成品：不续传，整包重下（不拼出缝合怪）', async () => {
+    const dir = makeTemp('polycode-stale-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      // 造一个「旧版本的半成品」：内容与本次要下的资产不同，长度 30 < 100
+      const partFile = join(dir, 'bin', 'zcode-proxy.part')
+      mkdirSync(join(dir, 'bin'), { recursive: true })
+      const stale = Buffer.alloc(30, 0xAA)
+      writeFileSync(partFile, stale)
+      // 且**没有** .meta（旧实现遗留的半成品正是这个形态）
+
+      const seenRanges: (string | null)[] = []
+      const { fetch: f } = flakyFetch()
+      const spy = async (url: string | URL | Request, init?: RequestInit): Promise<Response> => {
+        if (String(url).includes('api.github.com')) {
+          return new Response(JSON.stringify(releaseBody), { status: 200 })
+        }
+        seenRanges.push(new Headers(init?.headers).get('range'))
+        return f(url, init)
+      }
+      const dest = await s.install(false, {
+        goos: 'darwin', arch: 'arm64', fetch: spy as never, sleep: async () => {},
+      })
+      // 关键：第一次下载就不能带 Range（旧半成品不属于本次资产）
+      expect(seenRanges[0]).toBeNull()
+      // 落地内容必须是本次资产的完整字节，绝不含旧数据的 0xAA 前缀
+      const got = readFileSync(dest)
+      expect(got.length).toBe(100)
+      expect(Buffer.compare(got, full)).toBe(0)
+      expect(got[0]).not.toBe(0xAA)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
 })
 
 

@@ -8,7 +8,7 @@ import { createHash } from 'node:crypto'
 import { normalize, posix } from 'node:path'
 import { writeFile0600 } from './credential_file.ts'
 import { ERR } from '../ir/index.ts'
-import { providerValidate, type Account, type Provider } from '../model/index.ts'
+import { providerValidate, workBuddyRealmOfBaseUrl, type Account, type Provider } from '../model/index.ts'
 import type { Context, Hono } from 'hono'
 import type { DiscoveredAccount, Finding } from './types.ts'
 import type { AdminCtx } from './api.ts'
@@ -138,7 +138,7 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     // 与 quick-import 共用同一段逻辑，避免两条路径的凭据处理再次漂移。
     const warnings = applyCredentialDefaults(p)
     const { warnings: importWarnings, imported } =
-      importSuggestedAccounts(key, found.suggestedAccounts, p.providerId, p.name)
+      importSuggestedAccounts(key, found.suggestedAccounts, p)
     warnings.push(...importWarnings)
     if (imported > 0) changed()
     // 与 quick-import 同样自动补全模型目录（两条路径行为必须一致，
@@ -264,7 +264,7 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     // ③ 全量导入共存登录态（只导扫描结果里、活着的；按 token 内容去重；
     //    tokenPath 来自本次扫描结果，不收前端路径）。
     const { warnings: importWarnings, imported, skipped } =
-      importSuggestedAccounts(key, found.suggestedAccounts, p.providerId, p.name)
+      importSuggestedAccounts(key, found.suggestedAccounts, p)
     if (imported > 0) changed()
     warnings.push(...importWarnings)
 
@@ -345,11 +345,13 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
 
   // 把本次扫描到的共存登录态导入账号池（adopt 与 quick-import 共用）。
   // 只导活着的；tokenPath 一律取自扫描结果，不收前端传入的路径。
-  // ownerName：目标 Provider 名，用于版本守卫（账号版本必须与 Provider 版本一致）。
+  // owner：目标 Provider，用于版本守卫（账号版本必须与 Provider 版本一致）。
+  // 传整个 Provider 而不是名字：版本要从 baseUrl 推导——名字可被用户改（UI 支持
+  // 改名），按名字判版本会在改名后误拒正确账号（见 realmMismatch 的注释）。
   function importSuggestedAccounts(
-    key: string, suggested: DiscoveredAccount[] | undefined, ownerId: number,
-    ownerName = '',
+    key: string, suggested: DiscoveredAccount[] | undefined, owner: Provider,
   ): { warnings: string[]; imported: number; skipped: number } {
+    const ownerId = owner.providerId
     const warnings: string[] = []
     let imported = 0
     let skipped = 0
@@ -357,11 +359,15 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
       if (!acc.alive) continue
       // 版本守卫：账号版本与目标 Provider 不符时跳过并说明，绝不让它入池。
       // 入池后再发现就已经晚了——它会被轮询到，请求才 401（见 realmMismatch 注释）。
-      if (ownerName !== '' && acc.realm) {
-        const wantName = wbProviderNameOf(acc.realm)
-        if (key.startsWith('workbuddy') && ownerName !== wantName) {
+      // 判据与 realmMismatch 同源：比 baseUrl 推出的 realm，不比 Provider 名字。
+      if (acc.realm) {
+        const ownerRealm = ownerRealmOf(owner)
+        if (key.startsWith('workbuddy') && ownerRealm && ownerRealm !== acc.realm) {
           const label = acc.realm === 'ai' ? '海外版' : '国内版'
-          warnings.push(`${acc.nickname}：跳过（登录态是${label}，与 Provider「${ownerName}」版本不符，不能入池）`)
+          const gotLabel = ownerRealm === 'ai' ? '海外版' : '国内版'
+          warnings.push(
+            `${acc.nickname}：跳过（登录态是${label}，与 Provider「${owner.name}」的${gotLabel}认证域不符，不能入池）`,
+          )
           continue
         }
       }
@@ -454,16 +460,26 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
   // （2026-09-19 实测：海外 token → copilot.tencent.com 回 HTML 401）。宁可导入时拒绝。
   //
   // 返回错误文案；通过校验返回 undefined。
+  // 版本一致判定必须按**认证域（baseUrl）**，不能按 Provider 名字。
+  // 管理台明确支持给 Provider 改名（api.ts 的「改名：只动 name」），一旦把
+  // workbuddy 改成自定义名，按名字比对就会拿「my-wb」去和 'workbuddy' 比，
+  // 于是拒绝完全正确的账号，还报出「该登录态是国内版，而 Provider「my-wb」是国内版」
+  // 这种自相矛盾的文案。realm 从 baseUrl 推导才是稳定口径（改名不影响 baseUrl）。
+  function ownerRealmOf(owner: Provider): 'cn' | 'ai' | undefined {
+    return workBuddyRealmOfBaseUrl(owner.baseUrl)
+  }
+
   function realmMismatch(key: string, owner: Provider, realm?: 'cn' | 'ai'): string | undefined {
     if (!key.startsWith('workbuddy')) return undefined // 非 WorkBuddy 源不适用
     if (!realm) return undefined // 版本未知（老客户端）：无从校验，放行
-    const want = wbProviderNameOf(realm)
-    if (owner.name === want) return undefined
+    const ownerRealm = ownerRealmOf(owner)
+    if (!ownerRealm) return undefined // Provider 的 baseUrl 认不出该源：不做无据指控
+    if (ownerRealm === realm) return undefined
     const wantLabel = realm === 'ai' ? '海外版' : '国内版'
-    const gotLabel = owner.name === 'workbuddy-ai' ? '海外版' : '国内版'
+    const gotLabel = ownerRealm === 'ai' ? '海外版' : '国内版'
     return `版本不符：该登录态是${wantLabel}（认证域 ${realm === 'ai' ? 'www.workbuddy.ai' : 'copilot.tencent.com'}），`
-      + `而 Provider「${owner.name}」是${gotLabel}。`
-      + `两版 token 互不通用，请先在发现页「一键导入」采用${wantLabel} Provider（${want}）后再导账号`
+      + `而 Provider「${owner.name}」是${gotLabel}（${owner.baseUrl}）。`
+      + `两版 token 互不通用，请先在发现页「一键导入」采用${wantLabel} Provider（${wbProviderNameOf(realm)}）后再导账号`
   }
 
   // 同 Provider 账号池里是否已有这个 token（按凭据文件内容比对；读不了视为不重复）。

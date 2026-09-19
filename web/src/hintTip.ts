@@ -54,15 +54,16 @@ export interface TipPlacement {
  * 纯定位计算（抽出来是为了可测：这部分算错就会压住目标或跑出视口，
  * 而它跟 Vue/DOM 无关，没必要连着组件一起测）。
  *
- * 策略：目标上方（首选，视线自然落在光标上方）；上方空间不足就翻到目标下方。
+ * 策略：目标上方（首选，视线自然落在光标上方）；上方空间不足就翻到目标下方；
+ * 下方也放不下（视口太矮）就推到目标右侧——这一条是「框永不压住目标」硬约束的
+ * 最后保障（styles.css 的 .heat-tip.right 箭头样式就服务于它）。
  * 水平方向始终以目标中心对齐，再做视口收边。
  *
- * 注：旧版（热力图内联实现）这里还有一条「上下都放不下就推到目标侧边」的
- * 分支，实测穷举各种 (top,bottom,h) 组合都不可达：翻到下方时
- * top = anchor.bottom + GAP 恒大于 anchor.bottom，而该分支的触发条件是
- * top < anchor.bottom，必然为假。所以去掉死分支，只保留它里面真正有用的一句——
- * 下方放置后若超出视口底部就上抬（视口比框还矮时该上抬会被 EDGE 压住，
- * 与旧版行为一致）。.heat-tip.right 箭头样式保留在 CSS 里，本函数不再产出它。
+ * 历史教训：曾把侧边分支当死代码删掉，理由是「翻到下方时 top 恒大于 anchor.bottom，
+ * 触发条件 top < anchor.bottom 必然为假」——那个推理只对**未夹取前**成立。
+ * 删掉后只剩「超出视口底部就上抬」（下方 top 被夹成 vh-EDGE-h），短视口下这个
+ * 夹取会把框正好压回目标身上（vh=200/h=96 就是一例），硬约束被破坏，而当时的
+ * 测试把视口高度写死 800，永远扫不到夹取分支，所以是假绿。
  */
 export function placeTip(
   anchor: { left: number; right: number; top: number; bottom: number },
@@ -74,15 +75,30 @@ export function placeTip(
   // 垂直：默认放目标上方；上方放不下就翻到下方
   const above = anchor.top - h - GAP >= EDGE
   let top = above ? anchor.top - h - GAP : anchor.bottom + GAP
-  const side: TipPlacement['side'] = above ? 'top' : 'below'
+  let side: TipPlacement['side'] = above ? 'top' : 'below'
 
   // 水平：以目标中心对齐，再做视口收边
   let left = anchor.left + (anchor.right - anchor.left) / 2 - w / 2
   if (left < EDGE) left = EDGE
   if (left + w > vw - EDGE) left = vw - EDGE - w
 
-  // 横向收边后仍可能把框推出视口顶部/底部（目标太靠下、视口太矮），统一夹回。
-  if (top + h > vh - EDGE) top = Math.max(EDGE, vh - EDGE - h)
+  // 下方放置后若超出视口底部，先试着上抬。短视口下上抬会压住目标（见上方注释），
+  // 这时改推到目标右侧：垂直方向以目标为中心对齐，仍做视口收边。
+  if (top + h > vh - EDGE) {
+    const lifted = Math.max(EDGE, vh - EDGE - h)
+    // 上抬后仍与目标纵向相交 → 右侧放置（放得下才推，放不下就保留上抬结果）。
+    const overlaps = lifted < anchor.bottom && lifted + h > anchor.top
+    const rightLeft = anchor.right + GAP
+    if (overlaps && rightLeft + w <= vw - EDGE) {
+      left = rightLeft
+      top = anchor.top + (anchor.bottom - anchor.top) / 2 - h / 2
+      if (top < EDGE) top = EDGE
+      if (top + h > vh - EDGE) top = Math.max(EDGE, vh - EDGE - h)
+      side = 'right'
+    } else {
+      top = lifted
+    }
+  }
   if (top < EDGE) top = EDGE
 
   return { left, top, side }
@@ -144,9 +160,15 @@ export function useHintTip(opts: HintTipOptions = {}) {
     return p ? { left: p.left + 'px', top: p.top + 'px' } : {}
   })
   // 单行（占比条）不锁宽：靠 title 是否为空区分是不是热力图那种多行框。
+  //
+  // 判据必须看 tip.value（原始提示数据，带 title），**不能**看 pos.value：
+  // pos 是 placeTip() 的结果（只有 left/top/side，没有 title 字段），
+  // 而 nextTick 校正后 pos 几乎总是有值——取 `pos.value || tip.value` 会让
+  // 'title' in p 恒为 false，于是 wide 恒真，热力图多行框也被套上 .tip-wide
+  // （width:auto; white-space:nowrap），186px 的固定宽多行排版直接塌成一行。
   const tipClass = computed(() => {
     const p = pos.value || tip.value
-    const wide = p ? !('title' in p && p.title) : false
+    const wide = tip.value ? !tip.value.title : false
     return [p?.side || 'top', { 'tip-wide': wide }]
   })
 

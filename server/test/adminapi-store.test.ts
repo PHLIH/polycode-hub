@@ -141,6 +141,30 @@ describe('SQLite 存储（admin.db 两表 + 内存实现）', () => {
     as.close()
   })
 
+  // 回归：只做「缺失就补」会把用户删掉的号在每次重启时复活——账号是硬删且无墓碑，
+  // 「从没进过库」与「用户主动删了」在 admin_accounts 里长得一模一样。
+  // 种子账本（admin_meta）记住播过种的 id，播过就不再补，删除因此是终态。
+  test('种子账本：删掉的号重启不复活，但新加的种子仍能补进来', async () => {
+    const path = join(dir, 'seed-ledger.db')
+    const mk = (id: string, displayName = id): Account => ({ ...account, id, displayName })
+
+    const s1 = await SQLiteAccountStore.open(path)
+    await seedAccountsIfEmpty(s1, [mk('zcode-1')], s1.seedLedger())
+    expect(s1.get('zcode-1')).toBeDefined()
+    expect(s1.delete('zcode-1')).toBe(true) // 用户在管理台删掉
+    s1.close()
+
+    const s2 = await SQLiteAccountStore.open(path) // 重启
+    await seedAccountsIfEmpty(s2, [mk('zcode-1')], s2.seedLedger())
+    expect(s2.get('zcode-1'), '删掉的号不该被种子复活').toBeUndefined()
+
+    // 同一次播种里，新增的种子必须照常进来（否则又回到「配置文件里的号永远进不来」）
+    await seedAccountsIfEmpty(s2, [mk('zcode-1'), mk('zcode-3')], s2.seedLedger())
+    expect(s2.get('zcode-3'), '新增种子必须补进来').toBeDefined()
+    expect(s2.get('zcode-1')).toBeUndefined()
+    s2.close()
+  })
+
   test('新建（providerId=0）由 AUTOINCREMENT 分配并回填', async () => {
     const path = join(dir, 'autoinc.db')
     const ps = await SQLiteProviderStore.open(path)

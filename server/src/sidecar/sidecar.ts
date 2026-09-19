@@ -602,13 +602,33 @@ export class Sidecar {
     const part = partPath(dest)
     let received = 0
     try { received = statSync(part).size } catch { received = 0 }
-    if (received > 0 && asset.size > 0 && received >= asset.size) {
-      // 半成品已经不小了：要么上一轮其实下完了（只是没来得及 rename），
-      // 要么上游重新打过包。两种情况下都不要续传——后者会拼出一个坏文件，
-      // 前者应当直接进入校验。删掉重下，让 sha256 做最终裁判。
+    // 续传前必须确认这个半成品就是**本次这个资产**的下半截。
+    // 只守 received >= asset.size 只能挡住「半成品更大」一个方向；磁盘上残留的
+    // **旧版本**半成品比新包小时，会带着 Range 把新版本字节追加到旧数据后面，拼出
+    // 一个长度恰好等于 asset.size 的「缝合怪」——长度校验照样通过，随后被 chmod
+    // 0700 并执行。所以把来源（tag + 资产名 + 大小 + digest）记在 .part 旁边，
+    // 对不上就整包重下。
+    const partMeta = part + '.meta'
+    const wantSource = JSON.stringify({
+      tag: info.tagName, name, size: asset.size, digest: asset.digest ?? '',
+    })
+    let sourceMatches = false
+    if (received > 0) {
+      try { sourceMatches = readFileSync(partMeta, 'utf8') === wantSource } catch { sourceMatches = false }
+    }
+    if (received > 0 && !sourceMatches) {
+      // 来源对不上（旧版本残留 / 换了资产 / 没有元数据）：不能续传，删掉重下。
       try { unlinkSync(part) } catch { /* 本来就不在 */ }
       received = 0
     }
+    if (received > 0 && asset.size > 0 && received >= asset.size) {
+      // 半成品已经不小了：上一轮其实下完了（只是没来得及 rename）。
+      // 删掉后进入校验，让 sha256 做最终裁判。
+      try { unlinkSync(part) } catch { /* 本来就不在 */ }
+      received = 0
+    }
+    // 记下来源，供本轮中断后下一次续传核对（写失败不影响下载本身）。
+    try { writeFileSync(partMeta, wantSource, { mode: 0o600 }) } catch { /* 尽力而为 */ }
     notify({ phase: 'downloading', received, total: asset.size })
 
     let lastErr: unknown = new Error('sidecar: 未尝试下载')
@@ -749,7 +769,11 @@ export class Sidecar {
       // 只有 206 才是真续传。若服务端回 200（不支持 Range 的镜像/代理），
       // 必须 'w' 截断重写——用 'a' 会把两遍数据拼在一起，产生一个错位的文件。
       const resumeFrom = res.status === 206 ? have : 0
-      const fd = openSync(part, resumeFrom > 0 ? 'a' : 'w')
+      // 显式给 0o700：这个 .part 是「即将被 chmod 0700 并执行的二进制」的下半截，
+      // 不应该在整个下载期间（以及暂停后长期驻留期间）对同机其他用户可读。
+      // 不给 mode 会按 umask 落成 0644——收紧权限的 chmod 发生在下载**之后**，
+      // 中间这段窗口就白开了（对比 projects/process.ts 的 openLog 用 0o600）。
+      const fd = openSync(part, resumeFrom > 0 ? 'a' : 'w', 0o700)
       try {
         // 边收边写盘：中断时已收到的部分留在 part 里，下一轮接着下。
         await readBodyWithProgress(res, asset.size, notify, resumeFrom, (chunk) => {

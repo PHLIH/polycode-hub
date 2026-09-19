@@ -158,6 +158,13 @@ async function openAdminDB(path: string): Promise<DB> {
   for (const ddl of [
     `CREATE TABLE IF NOT EXISTS admin_accounts (id TEXT PRIMARY KEY, data TEXT NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS admin_egresses (id TEXT PRIMARY KEY, data TEXT NOT NULL)`,
+    // 种子账本的标记位：记录「哪些种子账号 id 已经播过种」。
+    // 没有它就分不清「这个号从没进过库」和「用户主动删了」——两种情况在
+    // admin_accounts 里都是「查不到」，补种逻辑只能二选一：
+    //   一律补 → 用户删掉的号每重启一次就复活（实测过的真实回归）；
+    //   一律不补 → 配置文件里新加的号永远进不来（就是本次要修的老缺陷）。
+    // 所以额外记一笔：播过种的 id 永不再补，删除因此是终态。
+    `CREATE TABLE IF NOT EXISTS admin_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)`,
   ]) {
     db.exec(ddl)
   }
@@ -343,6 +350,12 @@ export class SQLiteAccountStore implements AccountStore {
     return new SQLiteAccountStore(await openAdminDB(path))
   }
 
+  // 种子账本（与账号表同一个库，跨重启有效）。cli 播种时用它区分
+  // 「从没播过种」与「用户删掉了」——见 seedAccountsIfEmpty 的注释。
+  seedLedger(): SeedLedger {
+    return new SQLiteSeedLedger(this.db)
+  }
+
   close(): void {
     this.db.close()
   }
@@ -412,11 +425,71 @@ export function migrateWorkBuddyAttributionHeaders(s: ProviderStore): number {
   return fixed
 }
 
-// 缺失补种：种子表里有、库里没有的账号补进去（按 id 判等，已存在的一律不动）。
-// 不能只认「空库才播种」：账号表一旦有别的渠道（如 workbuddy 先导了几行），
+// 缺失补种：种子表里有、库里没有、且**从没播过种**的账号补进去。
+//
+// 为什么不能只认「空库才播种」：账号表一旦有别的渠道（如 workbuddy 先导了几行），
 // apps.yaml 里的账号就永远进不来——静默丢失，管理台上看不到，池子里也不轮换。
-// 种子是配置文件的口径，运行时改动（惩罚/disabled）都在库里已有的行上，互不打架。
-export function seedAccountsIfEmpty(s: AccountStore, seed: Account[]): void {
+//
+// 为什么不能简单地「缺就补」：账号删除是硬删且没有墓碑，于是「从没进过库」
+// 和「用户主动删了」在库里长得一模一样。只看 admin_accounts 的话，补种会把
+// 用户明确删掉的号在每次重启时复活（实测复现过）。所以用 admin_meta 里的
+// 已播种账本记住播过的 id：播过就不再补，删除是终态。
+//
+// 该用哪个函数：
+//   · seedAccountsIfEmpty —— 需要「删除是终态」的持久化场景（cli 启动、管理面）。
+//   · seedAccountsPlain    —— 内存库/测试等没有账本也不该复活的场景。
+export function seedAccountsIfEmpty(s: AccountStore, seed: Account[], seen?: SeedLedger): void {
+  for (const a of seed) {
+    // 播过种的一律跳过（哪怕现在查不到——那是用户删的）。
+    if (seen?.has(a.id)) continue
+    if (s.get(a.id)) {
+      // 库里已有（可能是用户导入后改过），记进账本即可，绝不覆盖。
+      seen?.add(a.id)
+      continue
+    }
+    s.put(a)
+    seen?.add(a.id)
+  }
+}
+
+// SeedLedger 记录已播种过的账号 id（落盘，跨重启有效）。
+export interface SeedLedger {
+  has(id: string): boolean
+  add(id: string): void
+}
+
+export class SQLiteSeedLedger implements SeedLedger {
+  constructor(private readonly db: DB) {}
+
+  private read(): Set<string> {
+    const row = this.db.prepare(`SELECT v FROM admin_meta WHERE k = 'seededAccountIds'`).get() as
+      { v: string } | undefined
+    if (!row) return new Set()
+    try {
+      const arr: unknown = JSON.parse(row.v)
+      return Array.isArray(arr) ? new Set(arr.filter((x): x is string => typeof x === 'string')) : new Set()
+    } catch {
+      return new Set()
+    }
+  }
+
+  has(id: string): boolean {
+    return this.read().has(id)
+  }
+
+  add(id: string): void {
+    const set = this.read()
+    if (set.has(id)) return
+    set.add(id)
+    this.db.prepare(
+      `INSERT INTO admin_meta (k, v) VALUES ('seededAccountIds', ?)
+       ON CONFLICT(k) DO UPDATE SET v = excluded.v`,
+    ).run(JSON.stringify([...set]))
+  }
+}
+
+// seedAccountsPlain 无账本版本：库里没有就补（用于内存库与单测）。
+export function seedAccountsPlain(s: AccountStore, seed: Account[]): void {
   for (const a of seed) {
     if (s.get(a.id)) continue
     s.put(a)

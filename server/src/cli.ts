@@ -27,7 +27,7 @@ import { Sidecar } from './sidecar/sidecar.ts'
 import { maskProxyURI, resolveSidecarDownloadFetch } from './sidecar/httpproxy.ts'
 import { Manager } from './projects/manager.ts'
 import { Store as ProjectsStore } from './projects/store.ts'
-import { openLog, startDetached } from './projects/process.ts'
+import { openLog, quoteArg, startDetached } from './projects/process.ts'
 import {
   Scanner, defaultConfig, discoverWorkBuddyModelsFrom, workBuddyDataDirs,
   discoverOpenCodeFingerprint, discoverAllOpenCodeFingerprints, type ZenCallProbe,
@@ -211,7 +211,7 @@ export async function runServe(args: string[]): Promise<void> {
       delete (a as { providerName?: string }).providerName
     }
   }
-  seedAccountsIfEmpty(accounts, cfg.accounts)
+  seedAccountsIfEmpty(accounts, cfg.accounts, accounts.seedLedger())
 
   // 用量表的历史行：provider_id 由「Provider 名」迁到数字内部 id。
   // 必须在 Provider 入库之后跑（名字→id 的权威来源就是这张表）。
@@ -255,16 +255,41 @@ export async function runServe(args: string[]): Promise<void> {
     selfRestart: () => {
       try {
         const fd = openLog(join(cwd, 'config', 'projects', 'self-restart.log'))
-        // argv 原样复用（含 --port 等自定义参数），换个进程重新执行同一条命令。
-        // 单引号转义防路径带空格/特殊字符把命令拆坏。
-        const args = process.argv.slice(1).map((a) => `'${a.replace(/'/g, `'\\''`)}'`)
         const port = cfg.gateway.port
-        const host = cfg.gateway.host
-        // 轮询等端口释放：lsof 无输出 = 已释放。最多等 30 秒（约 60 次 × 0.5s）。
-        const wait = `i=0; while [ $i -lt 60 ]; do `
-          + `lsof -tiTCP:${port} -sTCP:LISTEN >/dev/null 2>&1 || break; `
-          + `sleep 0.5; i=$((i+1)); done`
-        const cmd = `${wait}; exec '${process.execPath}' ${args.join(' ')}`
+        // 等端口释放的逻辑写成一段**独立 Node 脚本**，而不是 shell 片段。
+        // 为什么不用 shell：startDetached 在 Windows 上走 `cmd /c`，而
+        // `while [ ] / $(( )) / ||` 那套是 POSIX 语法，cmd.exe 根本不认——
+        // 上一版把等待写成 sh 片段，在 Windows 上等于没有等待（语法直接报错）。
+        // 交给 Node 就没有方言问题：本进程已经在跑 Node，用同一个可执行文件。
+        const waiter = `
+          const net = require('net')
+          const { spawn } = require('child_process')
+          const port = ${JSON.stringify(port)}
+          const argv = ${JSON.stringify(process.argv.slice(1))}
+          const exe = ${JSON.stringify(process.execPath)}
+          const cwd = ${JSON.stringify(cwd)}
+          const deadline = Date.now() + 30000
+          function free(cb) {
+            const s = net.connect({ port, host: '127.0.0.1' })
+            let done = false
+            const fin = (ok) => { if (!done) { done = true; s.destroy(); cb(ok) } }
+            s.once('connect', () => fin(false))   // 还连得上 = 旧进程仍在监听
+            s.once('error', () => fin(true))      // 连不上 = 已释放
+            setTimeout(() => fin(false), 1000)
+          }
+          ;(function poll() {
+            free((isFree) => {
+              if (isFree || Date.now() > deadline) {
+                // 起新进程：与旧实现同样 detached + argv 原样复用
+                const c = spawn(exe, argv, { cwd, detached: true, stdio: 'ignore' })
+                c.unref()
+                return
+              }
+              setTimeout(poll, 500)
+            })
+          })()
+        `
+        const cmd = `${quoteArg(process.execPath)} -e ${quoteArg(waiter)}`
         startDetached(cwd, cmd, [], fd)
         return true
       } catch (e) {
@@ -426,7 +451,17 @@ export async function runServe(args: string[]): Promise<void> {
     let settled = false
     server.on('listening', () => { if (!settled) { settled = true; resolve(true) } })
     server.on('error', (err: NodeJS.ErrnoException) => {
-      if (settled) return
+      if (settled) {
+        // 绑定成功之后的错误不能吞：修复前的代码没有监听器，这类错误会作为
+        // 「未处理的 'error' 事件」大声崩掉进程。若在这里静默 return，就从
+        // 「崩得响」退化成「半死不活」——服务已经不听使唤，日志里却什么都没有。
+        // 如实打出来（带够定位信息），进程去留交给进程管理器判断。
+        console.error(
+          `网关运行期错误（监听已建立后）：${err.code ?? 'unknown'} ${err.message}`
+            + (err.stack ? `\n${err.stack}` : ''),
+        )
+        return
+      }
       settled = true
       if (err.code === 'EADDRINUSE') {
         console.error(

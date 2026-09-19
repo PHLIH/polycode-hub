@@ -354,6 +354,25 @@ describe('checkZCode', () => {
     expect(f.detail).toContain('桌面')
     expect(f.detail).not.toContain('desktop-secret-key')
   })
+
+  // 回归：凭据必须按客户端的真实结构（provider.<名>.options.apiKey）取。
+  // 曾经写成「任意层级叫 apiKey 就算」——配置文件里别处的 apiKey（遥测、
+  // 第三方插件）会被误判成 ZCode 登录态，并把它们的 sha256 前 12 位显示在
+  // 发现页：既误报「已登录」，又是没必要的指纹外泄。
+  test('只在 provider.*.options.apiKey 上取凭据，别处的 apiKey 不算', async () => {
+    const home = await tempDir()
+    const cliDir = join(home, '.zcode', 'cli')
+    await mkdir(cliDir, { recursive: true })
+    await writeFile(join(cliDir, 'config.json'), JSON.stringify({
+      telemetry: { apiKey: 'unrelated-telemetry-key-0123456789' },
+      plugin: { nested: { deep: { apiKey: 'unrelated-plugin-key-0123456789' } } },
+      provider: { zai: { options: { baseURL: 'https://api.z.ai/api/anthropic' } } }, // 无凭据
+    }))
+    const f = checkZCode([], home)
+    // 没有任何 provider.*.options.apiKey → 不能判成已登录
+    expect(f.status).toBe('missing')
+    expect(f.detail ?? '').not.toContain('unrelated-telemetry-key')
+  })
 })
 
 describe('checkZen', () => {

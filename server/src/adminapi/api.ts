@@ -793,12 +793,23 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
   app.post('/admin/api/accounts/:id/checkin', async (c) => {
     const ac = accounts.get(c.req.param('id'))
     if (!ac) return errRes(c, 404, ERR.NOT_FOUND, '账号不存在')
-    if (ac.importSource !== 'workbuddy') {
+    // 两个发行版都支持签到：只认 'workbuddy' 会让海外版账号恒被 400 拒掉
+    // （importSource 现在是 'workbuddy' 或 'workbuddy-ai'，见 discover_api 的
+    // 版本分区——两版 UID 命名空间不同，必须分开标记）。
+    const src = ac.importSource ?? ''
+    if (src !== 'workbuddy' && src !== 'workbuddy-ai') {
       return errRes(c, 400, ERR.INVALID_REQUEST, '仅支持一键导入的 WorkBuddy 账号')
     }
-    if (!providerForAccount(ac.providerId)) {
+    const owner = providerForAccount(ac.providerId)
+    if (!owner) {
       return errRes(c, 400, ERR.INVALID_REQUEST, '账号归属 Provider 不存在或已删除')
     }
+    // 签到端点的 host 与 X-Domain 必须跟账号所属版本走：两版是独立后端，
+    // 拿国内域去签到海外账号请求必然失败（认证域不同，见 model 的 realm 判定）。
+    // 以 Provider 的 baseUrl 为准（与版本校验同一口径）；认不出时退回账号来源标记。
+    const realm = workBuddyRealmOfBaseUrl(owner.baseUrl)
+      ?? (src === 'workbuddy-ai' ? 'ai' as const : 'cn' as const)
+    const checkinHost = realm === 'ai' ? 'www.workbuddy.ai' : 'copilot.tencent.com'
     const uid = ac.workbuddyUid
     if (!uid || !/^[\x21-\x7e]{1,256}$/.test(uid)) {
       return errRes(c, 400, ERR.INVALID_REQUEST, '缺少有效 WorkBuddy UID，请重新登录后扫描导入')
@@ -814,7 +825,7 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     const timer = setTimeout(() => controller.abort(), 15_000)
     const checkinFetch = deps.workbuddyCheckinFetch ?? globalThis.fetch
     try {
-      const response = await checkinFetch('https://copilot.tencent.com/billing/meter/daily-checkin', {
+      const response = await checkinFetch(`https://${checkinHost}/billing/meter/daily-checkin`, {
         method: 'POST',
         redirect: 'error',
         signal: controller.signal,
@@ -823,7 +834,7 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
           Accept: 'application/json',
           Authorization: `Bearer ${token}`,
           'X-User-Id': uid,
-          'X-Domain': 'copilot.tencent.com',
+          'X-Domain': checkinHost,
           // 签到端点在官方客户端里是**硬编码**身份（见 app.asar getActivityBanner）。
           // 注意：这与聊天端点的身份**不是同一套**（那边 X-Product = deploymentType）。
           // 不要因为这里用 WorkBuddy 就以为聊天也该用 —— 2026-09-19 已因此判错并回滚。
