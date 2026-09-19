@@ -243,7 +243,14 @@ export async function runServe(args: string[]): Promise<void> {
   // selfRestart：让用户能从管理台重启网关自己（网关本身也是项目列表里的一项）。
   // 必须在**本进程退出之后**才能重新启动，否则新进程会撞上还没释放的端口
   // （EADDRINUSE 直接死掉，用户看到的就是"重启完再也起不来"）。
-  // 做法：派一个脱离本进程的 shell，先 sleep 等我们退干净，再原地拉起同一条命令。
+  // 做法：派一个脱离本进程的 shell，先等端口真正空出来，再原地拉起同一条命令。
+  //
+  // 为什么不能只 sleep 固定秒数：旧实现写死 `sleep 2`，而退出耗时不确定——
+  // 还在服务的 SSE 流、SQLite WAL 收尾、巡检线程都可能让监听套接字晚于 2 秒才释放。
+  // 一旦超时，新进程立刻 EADDRINUSE 死掉，而且它是 detached 的、没人再拉它，
+  // 表现就是「点了重启，网关再也没起来」。改成轮询端口 + 上限兜底：
+  // 常见情况 1 秒内就位；真等到上限仍未释放也照常启动，让新进程自己把
+  // 「端口被占」报成一句人话（见下方 listen 失败分支），不再留原始栈。
   const projectsMgr = new Manager(new ProjectsStore(join(cwd, 'config', 'projects')), {
     selfRestart: () => {
       try {
@@ -251,7 +258,13 @@ export async function runServe(args: string[]): Promise<void> {
         // argv 原样复用（含 --port 等自定义参数），换个进程重新执行同一条命令。
         // 单引号转义防路径带空格/特殊字符把命令拆坏。
         const args = process.argv.slice(1).map((a) => `'${a.replace(/'/g, `'\\''`)}'`)
-        const cmd = `sleep 2; exec '${process.execPath}' ${args.join(' ')}`
+        const port = cfg.gateway.port
+        const host = cfg.gateway.host
+        // 轮询等端口释放：lsof 无输出 = 已释放。最多等 30 秒（约 60 次 × 0.5s）。
+        const wait = `i=0; while [ $i -lt 60 ]; do `
+          + `lsof -tiTCP:${port} -sTCP:LISTEN >/dev/null 2>&1 || break; `
+          + `sleep 0.5; i=$((i+1)); done`
+        const cmd = `${wait}; exec '${process.execPath}' ${args.join(' ')}`
         startDetached(cwd, cmd, [], fd)
         return true
       } catch (e) {
@@ -402,6 +415,34 @@ export async function runServe(args: string[]): Promise<void> {
   app.route('/', createAdminUI(distDir))
 
   const server = serve({ fetch: app.fetch, port: cfg.gateway.port, hostname: cfg.gateway.host })
+
+  // 绑定失败必须显式处理，否则 Node 会以「未处理的 'error' 事件」直接抛栈退出：
+  // 用户看到的是 node:events:497 的一坨内部栈（EADDRINUSE），而不是「端口被谁占了、
+  // 该怎么办」。真实故障：自我重启/update.sh/管理台「启动」并发时，旧进程尚未释放
+  // port，新进程撞上 EADDRINUSE——日志里落下 18 次原始栈，且**先打印了「已启动」**
+  // （下面那行在拿不到绑定结果时就执行了），于是「报成功但服务没起来」。
+  // 现在：先等绑定结果，失败就给一句人话 + 非零退出，成功才报「已启动」。
+  const bound = new Promise<boolean>((resolve) => {
+    let settled = false
+    server.on('listening', () => { if (!settled) { settled = true; resolve(true) } })
+    server.on('error', (err: NodeJS.ErrnoException) => {
+      if (settled) return
+      settled = true
+      if (err.code === 'EADDRINUSE') {
+        console.error(
+          `启动失败：端口 ${cfg.gateway.host}:${cfg.gateway.port} 已被占用。\n` +
+            `      多半是上一个网关进程还没退干净（自我重启/update.sh 并发时会撞上）。\n` +
+            `      处理：lsof -tiTCP:${cfg.gateway.port} -sTCP:LISTEN 看是谁，停掉它再启动；\n` +
+            `      或换端口：POLYCODE_PORT=其它端口 或 --port 其它端口。`,
+        )
+      } else {
+        console.error(`启动失败：监听 ${cfg.gateway.host}:${cfg.gateway.port} 出错（${err.code ?? 'unknown'}）：${err.message}`)
+      }
+      resolve(false)
+    })
+  })
+  if (!(await bound)) process.exit(1)
+
   console.log(`polycode-hub 已启动 http://${cfg.gateway.host}:${cfg.gateway.port}/admin/`)
   // 前端产物不入库（web/dist 由构建生成，见 .gitignore），clone 后没构建过就会落到这里：
   // 服务照常起、API 照常通，但 /admin 全 404——不报错的话极难排查（同 update.sh
