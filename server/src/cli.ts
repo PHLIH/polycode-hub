@@ -24,6 +24,7 @@ import type { Finding } from './adminapi/types.ts'
 import { createSidecarApp } from './adminapi/sidecar_app.ts'
 import { createProjectsApp } from './adminapi/projects_app.ts'
 import { Sidecar } from './sidecar/sidecar.ts'
+import { SidecarGuard } from './sidecar/guard.ts'
 import { maskProxyURI, resolveSidecarDownloadFetch } from './sidecar/httpproxy.ts'
 import { Manager } from './projects/manager.ts'
 import { Store as ProjectsStore } from './projects/store.ts'
@@ -238,6 +239,25 @@ export async function runServe(args: string[]): Promise<void> {
   sidecarSvc.workDir = join(cwd, 'config', 'zcode-proxy')
   sidecarSvc.loadPort(sidecarSvc.workDir)
 
+  // sidecar 保活守护：引擎掉线后自动拉起。
+  //
+  // 为什么必须有（真实故障，2026-09-19 取证）：引擎会因外部 SIGTERM 停掉
+  // （管理台停止/改端口/卸载，或别的网关实例的动作——killSidecarSpec 匹配
+  // 本用户所有 sidecar），而此前**没有任何机制把它拉回来**。实测引擎停下后
+  // 连查 70 秒 running 恒为 false，永不恢复；更糟的是默认模型会被别的上游
+  // 静默接走并返回 200，用户连「它死了」都看不出来。
+  //
+  // enabled 判据用「是否已安装」：没装引擎的用户不该被反复尝试拉起而刷日志。
+  const sidecarGuard = new SidecarGuard(sidecarSvc, {
+    enabled: () => {
+      try {
+        return existsSync(sidecarSvc.findBinary(sidecarSvc.workDir))
+      } catch {
+        return false
+      }
+    },
+  })
+
   // 本地项目管理器（与代理无关的独立板块）。
   //
   // selfRestart：让用户能从管理台重启网关自己（网关本身也是项目列表里的一项）。
@@ -427,7 +447,7 @@ export async function runServe(args: string[]): Promise<void> {
     lister: { listProviderModels: (pid) => probe.listProviderModels(pid) },
     modelProber: { probeModels: (pid, models) => probe.probeModels(pid, models) },
     notify: syncStores,
-    sidecar: createSidecarApp(sidecarSvc, providers, syncStores, fetch, egresses),
+    sidecar: createSidecarApp(sidecarSvc, providers, syncStores, fetch, egresses, sidecarGuard),
     projects: createProjectsApp(projectsMgr, { defaultModel: cfg.gateway.defaultModel }),
   })
 
@@ -494,8 +514,13 @@ export async function runServe(args: string[]): Promise<void> {
   // 用 manager 自带的 runSweeper（它 unref 了定时器并返回取消函数），
   // 不在 cli 里另写一份 setInterval——两处实现漂移过一次。
   const stopSweeper = projectsMgr.runSweeper(60_000)
+  // sidecar 保活守护（定时器已 unref）：
+  // 开工先立刻 tick 一次——网关重启后引擎若是死的，不该等满一个周期才动手。
+  void sidecarGuard.tick()
+  const stopGuard = sidecarGuard.run()
   const shutdown = () => {
     stopSweeper() // 先停巡检，再关服务，避免退出期间还在改状态文件
+    stopGuard()   // 停保活：退出过程中不该再拉起引擎
     console.log('已退出')
     void server.close()
     process.exit(0)

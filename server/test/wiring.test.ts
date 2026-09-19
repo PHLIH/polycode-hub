@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Hono } from 'hono'
 import { createSidecarApp } from '../src/adminapi/sidecar_app.ts'
+import { SidecarGuard } from '../src/sidecar/guard.ts'
 import { createProjectsApp } from '../src/adminapi/projects_app.ts'
 import type { Manager } from '../src/projects/manager.ts'
 
@@ -47,6 +48,89 @@ describe('sidecar 适配器（对齐 Go adminapi/sidecar_api.go）', () => {
     expect(b.port).toBe('8080')
     expect(b.endpoint).toBe('http://127.0.0.1:8080')
     expect(b.custom).toBe(false) // endpoint == builtin
+  })
+
+  // 降级显性化（真实故障，2026-09-19）：引擎停掉后，若默认模型同时被别的
+  // Provider 声明同名模型，请求会被静默改走那个上游并返回 200 ——
+  // 实测不带前缀的 glm-5.3-flash 成功且连接完全没碰 8080，用户因此
+  // 无法察觉引擎已死。接口必须把这件事讲出来。
+  describe('引擎不可用时的降级提示', () => {
+    // 已安装（本地有二进制）→ 才算"降级"；未安装是"没启用"，不该报警。
+    function installedHarness(svc = stubSidecar()) {
+      const store = {
+        getByName: () => ({ providerId: 1, name: 'zcode-plan-local', baseUrl: 'http://127.0.0.1:8080' }),
+        put: () => {},
+      }
+      const app = new Hono()
+      app.route('/admin/api/sidecar', createSidecarApp(svc as never, store as never, () => {}))
+      return app
+    }
+
+    test('已安装但未运行 → 给出 degraded 说明（含"静默改走上游"的提醒）', async () => {
+      // sidecarInstalled 的判据是 findBinary 不抛错，所以必须给真的 findBinary
+      // （只放个文件不够）——否则"已安装"不成立，degraded 恒 null。
+      const svc = stubSidecar({ workDir: '/wd', findBinary: () => '/wd/zcode-proxy' })
+      const app = new Hono()
+      app.route('/admin/api/sidecar', createSidecarApp(
+        svc as never,
+        { getByName: () => ({ baseUrl: 'http://127.0.0.1:8080' }), put: () => {} } as never,
+        () => {}))
+      const b = await (await app.request('/admin/api/sidecar')).json() as Record<string, unknown>
+      const d = b.degraded as { text: string } | null
+      expect(d).not.toBeNull()
+      expect(d!.text).toContain('未在运行')
+      // 关键：必须点破"会被静默改走别的上游并返回 200"这件事
+      expect(d!.text).toContain('200')
+      expect(d!.text).toContain('zcode-plan-local')
+    })
+
+    test('引擎在运行 → 不报降级', async () => {
+      const svc = stubSidecar({
+        workDir: '/wd', findBinary: () => '/wd/zcode-proxy', running: async () => true,
+      })
+      const app = new Hono()
+      app.route('/admin/api/sidecar', createSidecarApp(
+        svc as never,
+        { getByName: () => ({ baseUrl: 'http://127.0.0.1:8080' }), put: () => {} } as never,
+        () => {}))
+      const b = await (await app.request('/admin/api/sidecar')).json() as Record<string, unknown>
+      expect(b.degraded).toBeNull()
+    })
+
+    test('未安装（没打算用这条通道）→ 不算降级，不报警', async () => {
+      // findBinary 抛错 = 没装。此时"引擎不在"是常态，不该当成故障提示。
+      const svc = stubSidecar({
+        workDir: '/wd',
+        findBinary: () => { throw new Error('sidecar: 未安装') },
+      })
+      const app = new Hono()
+      app.route('/admin/api/sidecar', createSidecarApp(
+        svc as never,
+        { getByName: () => ({ baseUrl: 'http://127.0.0.1:8080' }), put: () => {} } as never,
+        () => {}))
+      const b = await (await app.request('/admin/api/sidecar')).json() as Record<string, unknown>
+      expect(b.degraded).toBeNull()
+    })
+
+    test('未注入守护器 → guard 为 null（既有调用方不受影响）', async () => {
+      const b = await (await sidecarHarness().request('/admin/api/sidecar')).json() as Record<string, unknown>
+      expect(b.guard).toBeNull()
+    })
+
+    test('注入守护器 → 如实上报保活状态', async () => {
+      const svc = stubSidecar({ running: async () => false })
+      const guard = new SidecarGuard(svc as never, { failThreshold: 5, log: () => {} })
+      const app = new Hono()
+      app.route('/admin/api/sidecar', createSidecarApp(
+        svc as never,
+        { getByName: () => ({ baseUrl: 'http://127.0.0.1:8080' }), put: () => {} } as never,
+        () => {}, fetch, undefined, guard))
+      const b = await (await app.request('/admin/api/sidecar')).json() as Record<string, unknown>
+      const g = b.guard as Record<string, unknown>
+      expect(g).not.toBeNull()
+      // 守护器还没 tick 过 → 未启用态（不是谎报 ok）
+      expect(g.state).toBe('disabled')
+    })
   })
 
   test('GET / → 回显下载代理（复用 egress 配置，脱敏）', async () => {

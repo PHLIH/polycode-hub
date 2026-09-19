@@ -264,6 +264,28 @@ const scHint = computed(() => {
   return '已安装已配置，未运行 —— 点「启动」'
 })
 
+// scGuardTip 把保活守护的状态讲成人话。
+//
+// 为什么单独一条：引擎掉线后「谁在处理」是关键信息，此前页面只有一句
+// 「installed, stopped」，用户不知道是系统正在自动救、还是已经放弃等人工，
+// 也不知道它其实已经反复掉过很多次。三种情况的处置完全不同。
+const scGuardTip = computed(() => {
+  const g = sc.value && sc.value.guard
+  if (!g || sc.value.running) return ''
+  if (g.state === 'recovering') {
+    const n = g.restarts ? `（已尝试 ${g.restarts} 次）` : ''
+    return `保活守护正在自动拉起引擎${n}…`
+  }
+  if (g.state === 'failed') {
+    // 已放弃：把真实原因和「要做什么」一起给出，别让用户对着一个红字猜。
+    return `保活守护已停止自动重试 —— ${g.lastError || '原因见引擎日志'}`
+  }
+  if (g.state === 'ok' && g.restarts > 0) {
+    return `引擎曾被保活守护自动拉起（本进程累计 ${g.restarts} 次）`
+  }
+  return ''
+})
+
 onMounted(() => rescan(false)) // 首次加载走缓存，秒出；点「重新扫描」才实时探测
 onMounted(loadSidecar)
 
@@ -379,6 +401,13 @@ function gotoProviders() {
       </span>
     </div>
     <p class="sub">{{ scHint }}</p>
+    <!-- 保活状态：引擎不在时，必须让人分清「正在自动恢复」「已放弃等人工」，
+         以及「它已经悄悄掉过好几次了」。三种处置完全不同，不能都显示成一句
+         「已停止」。 -->
+    <p v-if="scGuardTip" class="sub sc-guard" :class="'g-' + sc.guard.state">{{ scGuardTip }}</p>
+    <!-- 降级警告：引擎死了但请求被别的上游静默接走（同名模型被多个 Provider 声明），
+         返回 200 看似一切正常。必须显性化，否则用户永远发现不了引擎已死。 -->
+    <p v-if="sc && sc.degraded" class="sub sc-degraded">{{ sc.degraded.text }}</p>
     <div class="sc-actions">
       <!-- 安装中：进度条替代按钮。阶段/百分比/字节/耗时全部来自服务端作业态，
            切页或刷新回来接着显示——以前这里只有一个静止的「安装中…」。 -->
@@ -561,6 +590,21 @@ function gotoProviders() {
 .sc-head h3 { margin: 0; font-size: 14px; font-weight: 600; }
 .sc-state { font-size: 12px; }
 .sc-state.ok { color: var(--ok); }
+/* 保活提示：按状态上色，让「正在自动救」与「已放弃等人工」一眼可辨。
+   变量名用 styles.css 里真实存在的 --warn / --bad（--ok/--dim 同源）。 */
+.sc-guard { margin-top: 2px; }
+.sc-guard.g-recovering { color: var(--warn); }
+.sc-guard.g-failed { color: var(--bad); }
+.sc-guard.g-ok { color: var(--dim); }
+/* 降级警告：引擎死了但请求被别的上游静默接走（返回 200 看似正常）。
+   必须显眼——用户看不到它，就永远发现不了引擎已死。 */
+.sc-degraded {
+  margin-top: 6px; padding: 6px 8px; border-radius: 6px;
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  border-left: 3px solid var(--warn);
+  line-height: 1.5;
+}
 .sc-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
 /* 登录 provider 选择：跟着按钮的视觉走，别在按钮行里冒出一个系统默认灰框 */
 .sc-provider {

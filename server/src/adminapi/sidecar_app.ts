@@ -5,6 +5,7 @@ import { existsSync } from 'node:fs'
 import { Hono, type Context } from 'hono'
 import { SidecarCancelledError, validatePort, type FetchLike, type Sidecar, type SidecarPhase } from '../sidecar/sidecar.ts'
 import { maskProxyURI, resolveSidecarDownloadFetch } from '../sidecar/httpproxy.ts'
+import type { SidecarGuard } from '../sidecar/guard.ts'
 
 // sidecar 只关心「zcode-plan-local」这一个 Provider 的 baseUrl 与 egress 引用，
 // 按对外名查（名字比内部 id 更适合这类固定目标）。
@@ -104,6 +105,9 @@ export function createSidecarApp(
   changed: () => void,
   fetchImpl: typeof fetch = fetch,
   egresses?: SidecarEgressLister,
+  // guard 可选：注入后状态接口如实上报保活状态（是否在自动恢复、是否已放弃）。
+  // 可选而非必需，是为了让既有测试不必构造守护器就能测路由。
+  guard?: SidecarGuard,
 ): Hono {
   const app = new Hono()
   const dir = () => svc.workDir
@@ -267,6 +271,36 @@ export function createSidecarApp(
   }
 
   // GET / → 状态 + 安装/配置信息。
+  // degradedNotice 判断「引擎不可用，请求正在被别的上游接走」并向用户讲清楚。
+  //
+  // 为什么需要它（真实故障，2026-09-19 取证）：
+  //   引擎（127.0.0.1:8080）停掉后，config 的 default_model 仍指向
+  //   senseaudio/glm-5.3-flash —— 而 senseaudio 恰好也声明了同名的
+  //   glm-5.3-flash。于是请求静默切到远程上游并返回 200：
+  //     不带前缀的请求 → HTTP 200（连接指向远程，完全没碰 8080）
+  //     显式 zcode-plan-local/glm-5.3-flash → 上游不可达
+  //   用户因此**无法察觉**引擎已死，只感觉「用着用着不对劲」。
+  //   本函数把这件事变成一句明确的话，交给页面显示。
+  //
+  // 返回 null 表示无降级（引擎在，或压根没装引擎——那不是降级，是没启用）。
+  function degradedNotice(running: boolean, status: string): { since: string; text: string } | null {
+    // 未安装 = 用户没打算用这条通道，不算降级。
+    if (!sidecarInstalled(svc)) return null
+    if (running) return null
+    const p = providers.getByName('zcode-plan-local')
+    const endpoint = p?.baseUrl ?? ''
+    return {
+      // 这里无法得知「何时开始降级」（状态是探出来的，没有起止记录），
+      // 如实留空而不猜一个时间点。
+      since: '',
+      text:
+        `本地引擎未在运行（${status}）：走 zcode-plan-local 的请求会失败。`
+        + `若你的默认模型同时被别的 Provider 声明（config 的 default_model，或模型名重名），`
+        + `网关会静默改走那个上游并正常返回 200 —— 表面上一切正常，实际已经不在用本地引擎。`
+        + (endpoint === '' ? '' : `（本地引擎地址 ${endpoint}）`),
+    }
+  }
+
   app.get('/', async (c) => {
     const p = providers.getByName('zcode-plan-local')
     const endpoint = p?.baseUrl ?? ''
@@ -274,10 +308,21 @@ export function createSidecarApp(
     // 下载会走哪个代理（脱敏）：前端据此显示「下载走 clash（127.0.0.1:7897）」，
     // 让「装了老半天」有个可解释的出处，而不是一个转圈。
     const dl = downloadProxy()
+    const running = await svc.running()
+    const status = await svc.status()
+    const g = guard?.status()
     return c.json({
-      running: await svc.running(),
-      status: await svc.status(),
+      running,
+      status,
       installed: sidecarInstalled(svc),
+      // guard：保活守护的如实状态。为什么必须暴露出来——引擎掉线时
+      // 它只是「不在」，页面看不出「正在自动恢复」还是「已经放弃等人工」，
+      // 更看不出「它已经悄悄掉过好几次了」。这三件事的处置完全不同。
+      guard: g ?? null,
+      // degraded：本次请求正在被别的上游接走（同一个模型名有多个 Provider 声明）。
+      // 这是「sidecar 死了却没人发现」的根源：默认路由静默降级，返回 200，
+      // 用户看不到任何异常。这里把它显性化。
+      degraded: degradedNotice(running, status),
       port: svc.port,
       workDir: dir(),
       credFile: svc.credKey,
