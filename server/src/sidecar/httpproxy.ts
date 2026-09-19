@@ -1,7 +1,11 @@
 // 系统代理解析：网关常由 launchd/systemd 拉起，进程里没有 *_proxy 环境变量，
 // 而下载用全局 fetch 只认环境变量——在这类机器上直连 github.com 会超时，
-// 但浏览器走系统代理是通的。故 darwin 从 scutil --proxy 读系统代理，
-// 其余平台回落环境变量（对齐 Go internal/sidecar/httpproxy.go）。
+// 但浏览器走系统代理是通的。故 darwin 从 scutil --proxy 读、windows 从注册表
+// Internet Settings 读系统代理，其余平台回落环境变量。
+//
+// Windows 这一段是后补的真实缺陷：早先只有 darwin 分支，于是同一台 Clash、
+// 同一个网络，macOS 装得上而 Windows 永远装不上——因为 Windows 上进程环境里
+// 没有 HTTPS_PROXY，代码就判定「直连」了。
 //
 // 注意偏差：Node 全局 fetch 不走代理（既不读 *_proxy 环境变量，也不读
 // 系统代理）。本模块提供「解析代理地址 → 造出走代理的 fetch」的完整链路，
@@ -54,6 +58,74 @@ export function parseScutilProxy(out: string): ProxyURL | null {
   return null
 }
 
+// parseWinProxySetting 解析 Windows 的 Internet Settings 代理配置。
+//
+// 两个值来自注册表 HKCU\...\Internet Settings：
+//   ProxyEnable = 0x1（DWORD）
+//   ProxyServer = "http=127.0.0.1:7897;https=127.0.0.1:7897" 或单值 "127.0.0.1:7897"
+//
+// ProxyServer 的两种形态都要认：分协议形态（键值对，用 `=` 分隔、`;` 连接）
+// 和单值形态（整个串就是一个 host:port）。分协议时优先 https（下载目标恒为
+// https://…），其次 http；socks 单独认出来，交给调用方决定是否回落并告警——
+// 这是「用户在 Clash 里勾了 socks 混合端口、代码却静默直连」的那条差异。
+export function parseWinProxySetting(enable: unknown, server: unknown): ProxyURL | null {
+  const on = String(enable ?? '').trim()
+  // REG_DWORD 经 reg query 出来是 0x1；测试里也会直接给 1。
+  if (on !== '1' && on.toLowerCase() !== '0x1') return null
+  const raw = String(server ?? '').trim()
+  if (raw === '') return null
+  // 分协议形态：出现 `xxx=` 才按键值对解析，否则整串当作 host:port。
+  if (/[a-z]+\s*=/i.test(raw)) {
+    const kv = new Map<string, string>()
+    for (const part of raw.split(';')) {
+      const i = part.indexOf('=')
+      if (i < 0) continue
+      kv.set(part.slice(0, i).trim().toLowerCase(), part.slice(i + 1).trim())
+    }
+    // 优先 https，其次 http（两者都是 undici ProxyAgent 支持的 http 隧道形态）
+    for (const key of ['https', 'http']) {
+      const hp = kv.get(key) ?? ''
+      if (hp !== '') return { scheme: 'http', host: hp }
+    }
+    const socks = kv.get('socks') ?? ''
+    if (socks !== '') return { scheme: 'socks5', host: socks }
+    return null
+  }
+  return { scheme: 'http', host: raw }
+}
+
+// winSystemProxy 读 Windows 的系统代理（登录用户级 Internet Settings）。
+//
+// 为什么必须有这一段：darwin 一直能从 scutil 读到系统代理，Windows 却完全没读——
+// 于是「同一个 Clash，Mac 上装得上、Windows 上永远装不上」。实测（2026-09-19）
+// Windows 上系统代理开着（ProxyEnable=1，ProxyServer=http=127.0.0.1:7897;…），
+// 而代码只看环境变量 HTTPS_PROXY，Node 进程里没有 → 判定「直连」→ github 超时/
+// 被重置。用户看到的就是「Mac 能下，Windows 下不来」。
+//
+// 只读不写；reg.exe 不存在或键缺失一律当作「没配代理」返回 null。
+export function readWinSystemProxy(): ProxyURL | null {
+  if (process.platform !== 'win32') return null
+  try {
+    const out = execFileSync(
+      'reg',
+      ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'],
+      { encoding: 'utf8', timeout: 3000, windowsHide: true },
+    )
+    const get = (name: string): string => {
+      for (const line of out.split('\n')) {
+        const t = line.trim()
+        if (!t.startsWith(name)) continue
+        const cols = t.split(/\s{2,}/)
+        if (cols.length >= 3) return cols[2]!.trim()
+      }
+      return ''
+    }
+    return parseWinProxySetting(get('ProxyEnable'), get('ProxyServer'))
+  } catch {
+    return null
+  }
+}
+
 // envProxyURL 从环境变量取代理（对齐 Go http.ProxyFromEnvironment 的 HTTPS 语义，
 // 下载目标固定是 https://api.github.com，故只看 HTTPS/ALL）。
 function envProxyURL(): ProxyURL | null {
@@ -71,20 +143,28 @@ function envProxyURL(): ProxyURL | null {
 }
 
 // ghProxyURL 访问 GitHub（release 查询与引擎下载）用的代理解析：
-// darwin 系统代理优先（launchd 拉起时环境变量缺失），否则环境变量。
-export function ghProxyURL(now: () => ProxyURL | null = readScutilOnce): ProxyURL | null {
-  if (process.platform === 'darwin') {
-    const p = now()
+// darwin 走 scutil、windows 走注册表（都是「系统代理」，进程里没有环境变量时
+// 唯一能读到真相的地方），其余平台只看环境变量。
+export function ghProxyURL(now?: () => ProxyURL | null): ProxyURL | null {
+  const read = now ?? readSystemProxyOnce
+  if (process.platform === 'darwin' || process.platform === 'win32') {
+    const p = read()
     if (p !== null) return p
   }
   return envProxyURL()
 }
 
-let scutilCache: ProxyURL | null | undefined
-function readScutilOnce(): ProxyURL | null {
-  if (scutilCache !== undefined) return scutilCache
-  scutilCache = readScutil()
-  return scutilCache
+let sysProxyCache: ProxyURL | null | undefined
+function readSystemProxyOnce(): ProxyURL | null {
+  if (sysProxyCache !== undefined) return sysProxyCache
+  sysProxyCache = readSystemProxy()
+  return sysProxyCache
+}
+
+function readSystemProxy(): ProxyURL | null {
+  if (process.platform === 'darwin') return readScutil()
+  if (process.platform === 'win32') return readWinSystemProxy()
+  return null
 }
 
 function readScutil(): ProxyURL | null {
@@ -264,6 +344,14 @@ export function resolveSidecarDownloadFetch(opts: SidecarDownloadResolveOpts = {
       if (sys && sys.scheme === 'http') {
         const uri = proxyURLToURI(sys)
         if (uri) return { proxyURI: uri, source: 'system', fetch: proxiedFetch(uri) }
+      } else if (sys && sys.scheme === 'socks5') {
+        // 不能静默。用户配了 socks5 却拿不到代理，唯一的体外症状是「一直转圈」，
+        // 而代码里没有任何痕迹——这正是「有人装得上、有人永远装不上」最难查的
+        // 一类差异。明确说清楚落了直连，并把补救办法写出来。
+        console.warn(
+          `sidecar: 检测到 socks5 代理（${sys.host}），undici ProxyAgent 不支持 socks5，` +
+          `本次下载**回落直连**。若下载超时，请改用该代理的 http/https 端口 ` +
+          `（如 Clash 的混合端口），或设 HTTPS_PROXY=http://<host:port>。`)
       }
     } catch { /* 读系统代理失败 → 直连 */ }
   }

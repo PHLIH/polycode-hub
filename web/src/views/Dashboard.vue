@@ -3,6 +3,7 @@ import { ref, computed, watch, nextTick, onMounted, onUnmounted, onBeforeUnmount
 import { ElMessage } from 'element-plus'
 import { api } from '../api.js'
 import { shareOf, shareTitle } from '../share'
+import { useHintTip } from '../hintTip'
 import { applyGroups, applyGroupsReport, rowKey } from '../mergeGroups'
 
 // 概览页：用量仪表盘。三块——
@@ -208,74 +209,32 @@ function localDay(d) {
   return `${y}-${m}-${dd}`
 }
 
-// 自绘 tooltip：原生 title 要等 1~2s 浏览器延迟，用户明确嫌慢。
-// 定位策略（关键）：tooltip 永远放在被 hover 那格的【正上方】并水平居中——
-// 绝不覆盖目标格子本身。格子在网格右侧/顶部时按视口收边，必要时整体挪到
-// 格子下方，保证「框不挡格」这条硬约束在任何位置都成立。
-const tip = ref(null) // { day, tokens, requests, output, errors, left, top, side, anchor }
-const tipEl = ref(null) // 提示框 DOM：用于渲染后实测真实尺寸
+// 自绘 tooltip（热力图格子 + 占比条共用）：原生 title 要等约 1 秒才弹，
+// 用户要「实时」。定位/收边/翻转逻辑抽在 web/src/hintTip.ts，两个视图共用一份。
+const { tip, tipEl, tipStyle, tipClass, show: showTipAt, hide: hideTip } = useHintTip()
 const hover = ref({ col: -1, row: -1 })
-const TIP_W = 186   // 与 CSS .heat-tip 的宽度一致（含 padding）
-const GAP = 10      // 框与目标格的间距
 
-// 定位：先按「框在格上方居中」放好，渲染后用实测尺寸校正一次。
-// 之所以不预先算高度——失败行只在有失败时出现，框高会变；写死高度必然
-// 在某个组合下算错并压到格子上。实测一次（nextTick）比猜准得多。
 function showTip(c, e, col, row) {
-  const r = e.currentTarget.getBoundingClientRect()
   hover.value = { col, row }
-  tip.value = {
-    day: c.day, tokens: c.tokens, requests: c.requests,
-    output: c.output, errors: c.errors,
-    left: r.left + r.width / 2 - TIP_W / 2, // 先居中，稍后校正
-    top: r.top - GAP,                       // 先假设框底贴格顶，稍后校正
-    side: 'top',
-    anchor: { left: r.left, right: r.right, top: r.top, bottom: r.bottom }
-  }
+  showTipAt(e.currentTarget.getBoundingClientRect(), c.day, [
+    { label: '总 token', value: fmt(c.tokens) },
+    { label: '请求', value: c.requests },
+    { label: '输出', value: fmt(c.output) },
+    ...(c.errors ? [{ label: '失败', value: c.errors, bad: true }] : [])
+  ])
 }
 
-// 渲染后校正：拿到框的真实宽高再决定最终位置，保证任何情况下都不压住目标格。
-// 关键：校正结果写进独立字段 pos，绝不能写回被 watch 的 tip —— 否则本轮写入
-// 会再次触发本 watcher，微任务队列永不排空，主线程直接饿死（悬停即卡死）。
-const pos = ref(null) // { left, top, side }，仅存校正后的坐标
-watch(tip, async (t) => {
-  if (!t) { pos.value = null; return }
-  await nextTick()
-  const el = tipEl.value
-  if (!el) return
-  const w = el.offsetWidth || TIP_W
-  const h = el.offsetHeight || 96
-  const a = t.anchor
-  const vw = window.innerWidth
-  const vh = window.innerHeight
+// 占比条提示：即时出现，不再用原生 title。
+// 文案仍走 share.ts 的唯口径（占总 token x%），这里只拆成 label/value 交给共用框渲染。
+function showShareTip(text, e) {
+  showTipAt(e.currentTarget.getBoundingClientRect(), '', [
+    { label: '占比', value: text.replace(/^占总 token\s*/, '') }
+  ])
+}
 
-  // 垂直：默认放格子上方；上方放不下就翻到下方
-  const above = a.top - h - GAP >= 8
-  let top = above ? a.top - h - GAP : a.bottom + GAP
-  let side = above ? 'top' : 'below'
-
-  // 水平：以格子中心对齐，再做视口收边
-  let left = a.left + (a.right - a.left) / 2 - w / 2
-  if (left < 8) left = 8
-  if (left + w > vw - 8) left = vw - 8 - w
-
-  // 硬约束复核：纵向若仍与目标格相交（视口极矮），改推到格子侧边
-  if (top < a.bottom && top + h > a.top) {
-    left = a.right + GAP
-    if (left + w > vw - 8) left = Math.max(8, a.left - w - GAP)
-    side = 'right'
-    top = Math.max(8, Math.min(top, vh - h - 8))
-  }
-  pos.value = { left, top, side }
-}, { flush: 'post' })
-
-function hideTip() { tip.value = null; hover.value = { col: -1, row: -1 } }
-// 首帧先用未校正坐标（框已在 tip 里带 left/top），nextTick 后由 pos 覆盖为实测位置。
-const tipStyle = computed(() => {
-  const p = pos.value || tip.value
-  return p ? { left: p.left + 'px', top: p.top + 'px' } : {}
-})
-const tipSide = computed(() => (pos.value || tip.value)?.side || 'top')
+// 提示框关闭时顺带清掉热力图的列/行高亮（hideTip 由 useHintTip 提供，
+// 这里包一层是为了同时复位 hover —— 高亮是热力图独有的，不属于共用提示逻辑）。
+function hideTipAndHover() { hideTip(); hover.value = { col: -1, row: -1 } }
 
 // 分位阈值：用非零值的分位数定 4 档，避免个别大值把其余都压成一档。
 const LEVELS = computed(() => {
@@ -708,7 +667,7 @@ function ttftText(m) {
       <div class="heat-grid">
         <div v-for="(w, wi) in WEEKS" :key="wi" class="heat-week" :class="{ 'col-on': hover.col === wi }">
           <div v-for="(c, ri) in w" :key="c.key" class="heat-cell" :class="'lv' + level(c.value)"
-            @mouseenter="showTip(c, $event, wi, ri)" @mouseleave="hideTip" @focus="showTip(c, $event, wi, ri)" @blur="hideTip"
+            @mouseenter="showTip(c, $event, wi, ri)" @mouseleave="hideTipAndHover" @focus="showTip(c, $event, wi, ri)" @blur="hideTipAndHover"
             tabindex="0" :aria-label="`${c.day}：${fmt(c.tokens)} token / ${c.requests} 次请求`" />
         </div>
       </div>
@@ -723,13 +682,12 @@ function ttftText(m) {
     </div>
   </section>
 
-  <!-- 热力图格子提示：fixed 定位脱离面板裁剪，紧跟目标格即时出现 -->
-  <div v-if="tip" ref="tipEl" class="heat-tip" :class="tipSide" :style="tipStyle">
-    <div class="heat-tip-day num">{{ tip.day }}</div>
-    <div class="heat-tip-row"><span>总 token</span><b class="num">{{ fmt(tip.tokens) }}</b></div>
-    <div class="heat-tip-row"><span>请求</span><b class="num">{{ tip.requests }}</b></div>
-    <div class="heat-tip-row"><span>输出</span><b class="num">{{ fmt(tip.output) }}</b></div>
-    <div v-if="tip.errors" class="heat-tip-row bad"><span>失败</span><b class="num">{{ tip.errors }}</b></div>
+  <!-- 热力图格子 / 占比条共用提示：fixed 定位脱离面板裁剪，紧跟目标即时出现 -->
+  <div v-if="tip" ref="tipEl" class="heat-tip" :class="tipClass" :style="tipStyle">
+    <div v-if="tip.title" class="heat-tip-day num">{{ tip.title }}</div>
+    <div v-for="(r, i) in tip.rows" :key="i" class="heat-tip-row" :class="{ bad: r.bad }">
+      <span>{{ r.label }}</span><b class="num">{{ r.value }}</b>
+    </div>
   </div>
 
   <section class="panel">
@@ -823,7 +781,7 @@ function ttftText(m) {
             <td class="n num strong">{{ fmt(r.totalTokens) }}</td>
             <td class="n num" :class="{ 'err': r.errors > 0 }">{{ r.errors || '' }}</td>
             <td class="n num" :class="{ dim: r.avgTtftMs == null }">{{ ttftText(r) }}</td>
-            <td class="bar-col"><div class="bar"><div class="bar-fill" :style="{ width: (share(r) * 100) + '%' }" /></div></td>
+            <td class="bar-col" @mouseenter="showShareTip(shareTip(r), $event)" @mouseleave="hideTip"><div class="bar"><div class="bar-fill" :style="{ width: (share(r) * 100) + '%' }" /></div></td>
           </tr>
           <tr v-for="sub in (expandedGroups.has('gm-' + r.modelId) ? r._members : [])"
             :key="'gmsub-' + r.modelId + '-' + sub.providerName" class="sub-row">
@@ -843,7 +801,7 @@ function ttftText(m) {
             <td class="n num">{{ fmt(sub.totalTokens) }}</td>
             <td class="n num" :class="{ 'err': sub.errors > 0 }">{{ sub.errors || '' }}</td>
             <td class="n num" :class="{ dim: sub.avgTtftMs == null }">{{ ttftText(sub) }}</td>
-            <td class="bar-col"><div class="bar"><div class="bar-fill" :style="{ width: (share(sub) * 100) + '%' }" /></div></td>
+            <td class="bar-col" @mouseenter="showShareTip(shareTip(sub), $event)" @mouseleave="hideTip"><div class="bar"><div class="bar-fill" :style="{ width: (share(sub) * 100) + '%' }" /></div></td>
           </tr>
         </template>
       </tbody>
@@ -893,7 +851,7 @@ function ttftText(m) {
           <td class="n num strong">{{ fmt(m.totalTokens) }}</td>
           <td class="n num" :class="{ 'err': m.errors > 0 }">{{ m.errors || '' }}</td>
           <td class="n num" :class="{ dim: m.avgTtftMs == null }">{{ ttftText(m) }}</td>
-          <td class="bar-col"><div class="bar" :title="shareTip(m)"><div class="bar-fill" :style="{ width: (share(m) * 100) + '%' }" /></div></td>
+          <td class="bar-col" @mouseenter="showShareTip(shareTip(m), $event)" @mouseleave="hideTip"><div class="bar"><div class="bar-fill" :style="{ width: (share(m) * 100) + '%' }" /></div></td>
         </tr>
         <!-- 展开的组明细：缩进展示原行 -->
         <tr v-if="m._groupId && expandedGroups.has(m._groupId)" v-for="sub in m._members"
@@ -916,7 +874,7 @@ function ttftText(m) {
           <td class="n num">{{ fmt(sub.totalTokens) }}</td>
           <td class="n num" :class="{ 'err': sub.errors > 0 }">{{ sub.errors || '' }}</td>
           <td class="n num" :class="{ dim: sub.avgTtftMs == null }">{{ ttftText(sub) }}</td>
-          <td class="bar-col"><div class="bar" :title="shareTip(sub)"><div class="bar-fill" :style="{ width: (share(sub) * 100) + '%' }" /></div></td>
+          <td class="bar-col" @mouseenter="showShareTip(shareTip(sub), $event)" @mouseleave="hideTip"><div class="bar"><div class="bar-fill" :style="{ width: (share(sub) * 100) + '%' }" /></div></td>
         </tr>
         </template>
       </tbody>
@@ -1043,40 +1001,8 @@ function ttftText(m) {
 .legend { display: flex; align-items: center; gap: 4px; margin-top: 10px; font-size: 11px; }
 .legend-note { margin-left: 10px; }
 
-/* 热力图提示：自绘替代原生 title（即时、可排版）。fixed 定位不被面板裁剪，
-   pointer-events:none 保证它不会把 mouseleave 抢掉导致闪烁。
-   定位由 JS 保证贴在目标格正上方（或下方），永不复压住格子本身。 */
-.heat-tip {
-  --tip-bg: var(--panel-2);
-  position: fixed; z-index: 60; pointer-events: none;
-  width: 186px; box-sizing: border-box; padding: 8px 10px;
-  background: var(--tip-bg); border: 1px solid var(--line); border-radius: 8px;
-  box-shadow: 0 8px 24px rgb(0 0 0 / 50%);
-  font-size: 12px; line-height: 1.7;
-}
-/* 指向目标格的小箭头：明确「这个框说的是哪一格」。
-   基线一律「箭头在框下方、朝下」，再按实际方位覆盖：below=框在格下方
-   （箭头朝上），right=框在格侧边（箭头朝左）。箭头颜色统一取 --tip-bg，
-   与框底色同源，改底色时箭头不会掉队。 */
-.heat-tip::after {
-  content: ''; position: absolute;
-  border: 5px solid transparent;
-  /* 默认：框在格子上方 → 箭头贴框底、朝下 */
-  left: 50%; margin-left: -5px; top: 100%;
-  border-top-color: var(--tip-bg);
-}
-.heat-tip.below::after { /* 框在格子下方 → 箭头贴框顶、朝上 */
-  top: auto; bottom: 100%;
-  border-top-color: transparent; border-bottom-color: var(--tip-bg);
-}
-.heat-tip.right::after { /* 框在格子侧边 → 箭头贴框左、朝左 */
-  left: auto; right: 100%; top: 50%; margin: -5px 0 0 0;
-  border-top-color: transparent; border-right-color: var(--tip-bg);
-}
-.heat-tip-day { font-size: 12px; font-weight: 600; margin-bottom: 4px; }
-.heat-tip-row { display: flex; justify-content: space-between; gap: 14px; color: var(--dim); }
-.heat-tip-row b { color: var(--text); font-weight: 500; }
-.heat-tip-row.bad b { color: var(--bad); }
+/* 热力图/占比条提示框的样式已提到全局 web/src/styles.css（两个视图共用同一个
+   .heat-tip 元素，scoped 样式不跨组件）。这里不再重复定义。 */
 
 /* ---- 归因表 ---- */
 .attr { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -1155,7 +1081,17 @@ function ttftText(m) {
 .src-name { font-weight: 600; font-size: 12px; }
 .model-line { font-size: 11px; color: var(--dim); }
 .bar-col { width: 120px; }
-.bar { height: 6px; background: var(--panel-2, #1a222d); border-radius: 3px; overflow: hidden; }
+/* 占比条：条子只有 6px 高（竖直方向 6px vs 行高 ~26px，命中率仅 23%），
+   鼠标得精准压在那 6px 上才出百分比 —— 用户实测「得移动半天」。
+   所以悬停目标不放在条子上，而挂在 <td>：整格 120px × ~26px 都算命中，
+   竖直容差从 6px 放宽到 26px（4.3 倍），横向也不再要求压在「已填充」那一段上
+   （占比 5% 的行整列照样响应）。td 沿用行自身的 7px 上下 padding，不额外改动。 */
+.attr td.bar-col { padding-right: 8px; }
+.attr th.bar-col { padding-right: 8px; }
+.bar {
+  height: 6px; background: var(--panel-2, #1a222d);
+  border-radius: 3px; overflow: hidden;
+}
 .bar-fill { height: 100%; background: var(--accent); border-radius: 3px; }
 
 /* ---- 时间胶囊（TIME-RANGE-FILTER §3.3）：轻量 popover，非全屏弹窗 ----

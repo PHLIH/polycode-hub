@@ -6,12 +6,14 @@
 import { Hono, type Context } from 'hono'
 import { timingSafeEqual } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { posix } from 'node:path'
 import { writeFile0600 } from './credential_file.ts'
 import { ERR, validProtocol } from '../ir/index.ts'
 import {
   providerValidate, accountHealth, validAccessKind, validRisk, sanitizeReasoningMinTokens,
   credentialResolve, forgetProtocol,
+  workBuddyRealmOfBaseUrl, workBuddyRealmOfToken, workBuddyRealmLabel,
+  WB_CLIENT_VERSION,
   type Account, type CredentialRef, type Model, type Provider,
 } from '../model/index.ts'
 import type { ProbeResult } from '../gateway/probe.ts'
@@ -102,9 +104,15 @@ export type CredentialInputKind = 'key' | 'env'
 // 注意 '..' 必须单独收敛：只保留 [a-zA-Z0-9._-] 时 '.' 是合法字符，id=".." 会拼出
 // "config/credentials/provider-..-key" —— 文件名本身不越界，但让人误读成上级目录，
 // 且某些平台对含 .. 的路径有额外解释。统一把连续点折成单个点。
+//
+// 分隔符固定用正斜杠（posix.join），**不随平台变**：这是写进配置文件的引用值，
+// 会出现在 config/apps.yaml、管理台界面、以及跨平台共享的配置里。用 path.join
+// 在 Windows 上会产出 `config\credentials\x`，与 credentialPathOK 的比对口径
+// （那里已归一为正斜杠，见 discover_api.ts）以及仓库里所有示例配置（全是 `/`）
+// 都不一致。正斜杠在 Windows 上同样能被 Node 正确解析，所以统一 `/` 零代价。
 export function credentialPathFor(kind: string, id: string): string {
   const safe = id.replace(/[^a-zA-Z0-9._-]/g, '-').replace(/\.{2,}/g, '.')
-  return join('config', 'credentials', `${kind}-${safe}-key`)
+  return posix.join('config', 'credentials', `${kind}-${safe}-key`)
 }
 
 // 把「用户填的凭据输入 + 界面声明的语义」规范化成 CredentialRef。
@@ -597,9 +605,13 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     const liveIDs = new Set(
       providers.list().filter((p) => p.state !== 'deleted').map((p) => p.providerId),
     )
+    const byId = new Map(providers.list().map((p) => [p.providerId, p] as const))
     const rows = accounts.list().filter((a) => liveIDs.has(a.providerId)).map((a) => {
       const rt = deps.accountRuntime?.runtime(a.id)
-      if (!rt) return { ...a, health: accountHealth(a, now) }
+      // 版本一致性校验：WorkBuddy 两版的 token 互不通用，账号挂错 Provider 会一直 401
+      // （看起来像账号坏了，其实是域名不对）。这里如实标出来，别让用户去翻配置猜。
+      const realmWarn = workBuddyRealmMismatch(a, byId.get(a.providerId))
+      if (!rt) return { ...a, health: accountHealth(a, now), ...(realmWarn ? { realmWarn } : {}) }
       const merged = { ...a, status: (rt.status || a.status) as Account['status'], fails: rt.fails }
       if (rt.cooldownUntil) merged.cooldownUntil = rt.cooldownUntil
       // 冷却已过期：不显示"冷却中"，直接复位（与 pick 同语义，避免 UI 撒谎）。
@@ -608,10 +620,29 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
         delete merged.cooldownUntil
       }
       // 健康度由后端算好下发：阈值只在 model 层定义一处，前端不必复制常量。
-      return { ...merged, health: accountHealth(merged, now) }
+      return { ...merged, health: accountHealth(merged, now), ...(realmWarn ? { realmWarn } : {}) }
     })
     return ok(c, 200, { accounts: rows })
   })
+
+  // 账号版本与归属 Provider 版本是否不符（WorkBuddy 专用；其余来源返回 undefined）。
+  //
+  // 凭据文件里只有 token，版本要从 JWT iss 反推；Provider 版本看 base_url。
+  // 两者都在且不一致 → 返回一句可直接照做的说明。任一判不出就不报（宁漏，不误报）。
+  function workBuddyRealmMismatch(a: Account, p: Provider | undefined): string | undefined {
+    if (!p) return undefined
+    if (!(a.importSource ?? '').startsWith('workbuddy')) return undefined
+    const provRealm = workBuddyRealmOfBaseUrl(p.baseUrl)
+    if (!provRealm) return undefined
+    const [token, resolved] = credentialResolve(a.credential, (name) =>
+      process.env[name] === undefined ? ['', false] : [process.env[name]!, true])
+    if (!resolved || !token) return undefined
+    const acctRealm = workBuddyRealmOfToken(token)
+    if (!acctRealm || acctRealm === provRealm) return undefined
+    return `此账号是 WorkBuddy ${workBuddyRealmLabel(acctRealm)}，却挂在${workBuddyRealmLabel(provRealm)}`
+      + ` Provider「${p.name}」（${p.baseUrl}）下：两版 token 互不通用，请求会被上游拒绝。`
+      + `请到发现页重新「一键导入」对应版本，并删除这个账号`
+  }
 
   app.post('/admin/api/accounts', async (c) => {
     const raw = await jsonBody(c)
@@ -793,11 +824,14 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
           Authorization: `Bearer ${token}`,
           'X-User-Id': uid,
           'X-Domain': 'copilot.tencent.com',
+          // 签到端点在官方客户端里是**硬编码**身份（见 app.asar getActivityBanner）。
+          // 注意：这与聊天端点的身份**不是同一套**（那边 X-Product = deploymentType）。
+          // 不要因为这里用 WorkBuddy 就以为聊天也该用 —— 2026-09-19 已因此判错并回滚。
           'X-IDE-Type': 'WorkBuddy',
           'X-IDE-Name': 'WorkBuddy',
-          'X-IDE-Version': '5.5.3',
+          'X-IDE-Version': WB_CLIENT_VERSION,
           'X-Product': 'WorkBuddy',
-          'User-Agent': 'WorkBuddy/5.5.3',
+          'User-Agent': `WorkBuddy/${WB_CLIENT_VERSION}`,
         },
         body: '{}',
       })

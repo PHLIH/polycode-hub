@@ -2,6 +2,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api.js'
+import { useSidecar } from '../sidecarJob'
 
 const list = ref([])
 const err = ref('')
@@ -30,6 +31,11 @@ const GROUP = {
 const ATTENTION = new Set(['expired', 'unknown', 'unreachable'])
 const statusText = { ready: '可采用', expired: '已过期', missing: '未发现', unknown: '待确认', unreachable: '不可达' }
 const dotClass = { ready: 'ok', expired: 'warn', unknown: 'warn', unreachable: 'bad', missing: '' }
+
+// 版本徽标：WorkBuddy 国内版 / 海外版各是一个独立发行版，登录态与认证域都不同。
+function realmLabel(realm) {
+  return realm === 'ai' ? '海外版' : realm === 'cn' ? '国内版' : '版本未知'
+}
 
 function groupOf(f) {
   if (f.status === 'ready') return 'ready'
@@ -64,12 +70,16 @@ async function rescan(force = true) {
   }
 }
 // ---- ZCode sidecar（免费 plan 通道的本地引擎）即插即用管理 ----
-const sc = ref(null)
+// 状态与安装进度来自共享模块 web/src/sidecarJob.ts（真相源在服务端）：
+// 这里不再自己存 sc，也不再自己管「安装中」——切页回来进度接着走，
+// 详见该文件顶部注释。refresh 复用原名 loadSidecar，下面多处调用点不用动。
+const {
+  sc, installing: scInstalling, percent: scPercent,
+  phaseText: scPhase, detailText: scProgressDetail,
+  errorText: scError, proxyText: scProxy, start: scStart,
+  refresh: loadSidecar,
+} = useSidecar()
 const scBusy = ref('')
-
-async function loadSidecar() {
-  try { sc.value = await api.sidecarStatus() } catch { sc.value = null }
-}
 
 async function scAction(action, confirmText) {
   if (confirmText && !window.confirm(confirmText)) return
@@ -82,12 +92,9 @@ async function scAction(action, confirmText) {
 }
 
 async function scInstall() {
-  scBusy.value = 'ensure'
-  try {
-    await api.sidecarAction('ensure')
-    ElMessage.success('引擎已安装并就绪')
-    await loadSidecar()
-  } catch (e) { ElMessage.error(e.message) } finally { scBusy.value = '' }
+  // 进度与失败原因都由服务端作业态提供（scPhase / scError），切页不丢；
+  // 这里只负责触发，以及成功后刷新扫描结果。
+  if (await scStart()) await rescan()
 }
 
 async function scUninstall() {
@@ -184,6 +191,7 @@ async function scRestoreBuiltin() {
 const scHint = computed(() => {
   if (!sc.value) return ''
   if (sc.value.running) return '运行中 —— ZCode 免费额度（3 亿 token 池）经此供给网关'
+  if (scInstalling.value) return '正在安装 —— 首次需下载约 66MB，进度见下方进度条'
   if (sc.value.custom) return '自定义引擎模式 —— 网关指向你自己运行的程序；内置引擎未安装不影响使用'
   if (!sc.value.hasKey || !sc.value.installed) return '未安装 —— 点「安装引擎」一键下载并配置，或「自定义引擎地址」指向你自己跑的兼容程序'
   return '已安装已配置，未运行 —— 点「启动」'
@@ -195,9 +203,10 @@ onMounted(loadSidecar)
 // 导入共存登录态进账号池：token 由服务端读取落盘（不经过前端）。
 const importing = ref('')
 async function importAccount(f, a) {
-  // id 取池子里下一个空闲编号（恒为 wb-N 形态；非 workbuddy 源的后端惯例是 ${key}-N，
-  // 见 discover_api.ts shortAccountPrefix，前后端此处口径不一致，改动时注意）。
-  const id = nextAccountId()
+  // id 取池子里下一个空闲编号，前缀与后端 shortAccountPrefix 对齐：
+  // workbuddy（国内版）/ workbuddy-ai（海外版）/ 其余按 key。此前前端恒用 `wb-N`，
+  // 与后端 `${key}-N` 口径不一致，两版账号混在同一个命名空间里也看不出归属。
+  const id = nextAccountId(f.key)
   const credFile = `config/credentials/${id}-jwt`
   importing.value = a.tokenPath
   try {
@@ -239,9 +248,16 @@ function imported(a) {
   return rows.some(x => x.displayName === a.nickname)
 }
 
-function nextAccountId() {
+// 账号 id 前缀：与后端 shortAccountPrefix 同口径（workbuddy / workbuddy-ai / key）。
+// 两版分开编号，账号页一眼能看出这个号属于哪一版。
+function accountPrefix(key) {
+  return key || 'workbuddy'
+}
+
+function nextAccountId(key) {
+  const prefix = accountPrefix(key)
   for (let n = 1; ; n++) {
-    if (!pool.value.some(x => x.id === `wb-${n}`)) return `wb-${n}`
+    if (!pool.value.some(x => x.id === `${prefix}-${n}`)) return `${prefix}-${n}`
   }
 }
 
@@ -297,7 +313,17 @@ function gotoProviders() {
     </div>
     <p class="sub">{{ scHint }}</p>
     <div class="sc-actions">
-      <template v-if="sc && sc.installed">
+      <!-- 安装中：进度条替代按钮。阶段/百分比/字节/耗时全部来自服务端作业态，
+           切页或刷新回来接着显示——以前这里只有一个静止的「安装中…」。 -->
+      <span v-if="scInstalling" class="sc-prog">
+        <span class="sc-prog-head">
+          <span class="sc-prog-phase">{{ scPhase }}</span>
+          <span class="sc-prog-num num">{{ scProgressDetail }}</span>
+        </span>
+        <span class="sc-prog-track"><span class="sc-prog-fill" :class="{ indet: scPercent === null }"
+          :style="scPercent === null ? {} : { width: scPercent + '%' }" /></span>
+      </span>
+      <template v-else-if="sc && sc.installed">
         <button v-if="!sc.running" class="btn" :disabled="scBusy === 'start'"
           @click="scAction('start')">{{ scBusy === 'start' ? '启动中…' : '启动' }}</button>
         <button v-if="sc.running" class="btn ghost" :disabled="scBusy === 'stop'"
@@ -310,8 +336,7 @@ function gotoProviders() {
         <button class="btn ghost danger" :disabled="scBusy === 'uninstall'"
           @click="scUninstall">{{ scBusy === 'uninstall' ? '卸载中…' : '卸载' }}</button>
       </template>
-      <button v-else class="btn" :disabled="scBusy === 'ensure'" @click="scInstall">
-        {{ scBusy === 'ensure' ? '安装中…' : '安装引擎' }}</button>
+      <button v-else class="btn" @click="scInstall">{{ scError ? '重试安装' : '安装引擎' }}</button>
       <!-- 自定义入口不依赖内置引擎：卸载了也要能指向自己跑的程序 -->
       <button class="btn ghost" :disabled="scBusy === 'endpoint'" @click="scCustomEndpoint">
         {{ scBusy === 'endpoint' ? '测试中…' : '自定义引擎地址' }}</button>
@@ -319,6 +344,10 @@ function gotoProviders() {
         @click="scRestoreBuiltin">恢复内置引擎</button>
       <button class="btn ghost" @click="rescan">刷新状态</button>
     </div>
+    <!-- 失败原因常驻（不是会消失的 toast）：切页回来仍看得到，并带出本次走的下载出口 -->
+    <p v-if="scError" class="sc-err">
+      {{ scError }}<span v-if="scProxy" class="dim">　下载代理 {{ scProxy }}</span>
+    </p>
     <p v-if="sc && sc.endpoint" class="field-hint">
       引擎地址：<code>{{ sc.endpoint }}</code>（{{ sc.custom ? '自定义 —— 网关直接指向该地址，内置引擎不受影响' : '内置引擎' }}）
     </p>
@@ -382,6 +411,8 @@ function gotoProviders() {
           <div v-for="(a, i) in f.suggestedAccounts" :key="a.tokenPath" class="co-account">
             <span class="dot" :class="a.alive ? 'ok' : 'warn'"></span>
             <span class="co-name">{{ a.nickname }}</span>
+            <!-- 版本徽标：国内版/海外版 token 互不通用，用户必须看得见自己在导哪一版 -->
+            <span v-if="a.realm" class="realm-badge" :class="a.realm">{{ realmLabel(a.realm) }}</span>
             <span class="dim">{{ a.alive ? `有效期至 ${a.expiresAt}` : '已过期' }}</span>
             <button class="linklike" :disabled="importing === a.tokenPath || !a.alive || imported(a)"
               @click="importAccount(f, a)">
@@ -446,6 +477,17 @@ function gotoProviders() {
 .sc-state { font-size: 12px; }
 .sc-state.ok { color: var(--ok); }
 .sc-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+/* 安装进度条：固定宽度，避免字节数变化时按钮行左右抖动 */
+.sc-prog { display: block; width: 320px; }
+.sc-prog-head { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; line-height: 1.4; }
+.sc-prog-phase { color: var(--accent); }
+.sc-prog-num { color: var(--dim); }
+.sc-prog-track { display: block; height: 4px; margin-top: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
+.sc-prog-fill { display: block; height: 100%; background: var(--accent); transition: width .3s linear; }
+/* 上游/代理丢了 Content-Length 时不编假百分比：整条淡闪表示「在动但不知道到哪」 */
+.sc-prog-fill.indet { width: 100%; opacity: .3; animation: sc-indet 1.4s ease-in-out infinite; }
+@keyframes sc-indet { 0%, 100% { opacity: .18; } 50% { opacity: .45; } }
+.sc-err { font-size: 12px; line-height: 1.6; color: var(--bad); margin: 8px 0 0; }
 .sc-panel code { font-family: var(--mono); background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
 .btn.danger { background: var(--bad, #c0392b); color: #fff; border: 0; }
 .co-accounts { margin-top: 10px; border-top: 1px dashed var(--line); padding-top: 8px; }
@@ -453,6 +495,11 @@ function gotoProviders() {
 .co-account { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 12px; }
 .co-account .dot { margin: 0; }
 .co-name { font-weight: 600; min-width: 140px; }
+.realm-badge {
+  font-size: 11px; padding: 1px 6px; border-radius: 4px; flex: none;
+  border: 1px solid var(--line); color: var(--dim);
+}
+.realm-badge.ai { color: var(--accent); border-color: var(--accent); }
 .co-account .linklike { font-size: 12px; }
 
 /* 自定义引擎接口规格：默认收起，点开是「方法 + 路径 + 用途」三列清单 + JSON 样例。

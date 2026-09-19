@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'vitest'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Hono } from 'hono'
 import { createSidecarApp } from '../src/adminapi/sidecar_app.ts'
 import { createProjectsApp } from '../src/adminapi/projects_app.ts'
@@ -309,36 +312,52 @@ describe('projects 适配器（对齐 Go adminapi/projects_api.go）', () => {
     app.route('/admin/api/projects', createProjectsApp(m as never, {
       openDir: (dir: string) => { opened.push(dir) },
     }))
-    // 缺 dir → 400
-    expect((await app.request('/admin/api/projects/open', {
-      method: 'POST', body: JSON.stringify({}),
-    })).status).toBe(400)
-    // 非法路径（不存在）→ 400，不调用 opener
-    expect((await app.request('/admin/api/projects/open', {
-      method: 'POST', body: JSON.stringify({ dir: '/tmp/polycode-nope-xyz' }),
-    })).status).toBe(400)
-    expect(opened).toEqual([])
-    // 合法目录 → 200 并调用 opener
-    const ok = await app.request('/admin/api/projects/open', {
-      method: 'POST', body: JSON.stringify({ dir: '/tmp' }),
-    })
-    expect(ok.status).toBe(200)
-    expect(opened).toEqual(['/tmp'])
+    // 探针目录用真实临时目录，而不是字面 '/tmp'——后者在 Windows 上不存在，
+    // 会让「合法目录 → 200」这条断言退化成 400（断言本身假设了 POSIX）。
+    const probe = mkdtempSync(join(tmpdir(), 'polycode-open-'))
+    try {
+      // 缺 dir → 400
+      expect((await app.request('/admin/api/projects/open', {
+        method: 'POST', body: JSON.stringify({}),
+      })).status).toBe(400)
+      // 非法路径（不存在）→ 400，不调用 opener
+      expect((await app.request('/admin/api/projects/open', {
+        method: 'POST', body: JSON.stringify({ dir: join(probe, 'polycode-nope-xyz') }),
+      })).status).toBe(400)
+      expect(opened).toEqual([])
+      // 合法目录 → 200 并调用 opener
+      const ok = await app.request('/admin/api/projects/open', {
+        method: 'POST', body: JSON.stringify({ dir: probe }),
+      })
+      expect(ok.status).toBe(200)
+      expect(opened).toEqual([probe])
+    } finally {
+      rmSync(probe, { recursive: true, force: true })
+    }
   })
 
   test('browse：列子目录（空=根/盘符，不存在400，文件非目录400）', async () => {
     const { app } = projectsHarness()
-    // /tmp 存在 → 200，dirs 为数组
-    const ok = await app.request('/admin/api/projects/browse?path=' + encodeURIComponent('/tmp'))
-    expect(ok.status).toBe(200)
-    const body = await ok.json() as { path: string; parent: string; dirs: string[] }
-    expect(body.path).toBe('/tmp')
-    expect(Array.isArray(body.dirs)).toBe(true)
-    // 不存在 → 400
-    expect((await app.request('/admin/api/projects/browse?path=' + encodeURIComponent('/tmp/polycode-nope-xyz'))).status).toBe(400)
-    // 文件非目录 → 400（用本文件自身做探针）
-    const fileRes = await app.request('/admin/api/projects/browse?path=' + encodeURIComponent('/tmp'))
-    expect(fileRes.status).toBe(200)
+    const probe = mkdtempSync(join(tmpdir(), 'polycode-browse-'))
+    try {
+      // 真实存在的目录 → 200，dirs 为数组
+      const ok = await app.request('/admin/api/projects/browse?path=' + encodeURIComponent(probe))
+      expect(ok.status).toBe(200)
+      const body = await ok.json() as { path: string; parent: string; dirs: string[] }
+      expect(body.path).toBe(probe)
+      expect(Array.isArray(body.dirs)).toBe(true)
+      // 不存在 → 400
+      expect((await app.request(
+        '/admin/api/projects/browse?path=' + encodeURIComponent(join(probe, 'polycode-nope-xyz')),
+      )).status).toBe(400)
+      // 文件非目录 → 400（用本文件自身做探针）
+      const fileRes = await app.request(
+        '/admin/api/projects/browse?path=' + encodeURIComponent(probe),
+      )
+      expect(fileRes.status).toBe(200)
+    } finally {
+      rmSync(probe, { recursive: true, force: true })
+    }
   })
 
   test('readmes：BFS 逐层找README（3层封顶/跳过噪音/最多5个/相对路径返回）', async () => {
@@ -458,12 +477,18 @@ describe('projects 适配器（对齐 Go adminapi/projects_api.go）', () => {
       defaultModel: 'opencode/mimo-v2.5-free',
       aiComplete: async (model: string) => { calls.push({ model }); return '{"name":"x","services":[]}' },
     }))
-    const res = await app.request('/admin/api/projects/ai-fill', {
-      method: 'POST',
-      body: JSON.stringify({ dir: '/tmp', readmes: [] }),
-    })
-    expect(res.status).toBe(200)
-    expect(calls[0]!.model).toBe('opencode/mimo-v2.5-free')
+    // dir 必须是真实存在的目录（端点会校验），用临时目录而非 '/tmp'。
+    const probe = mkdtempSync(join(tmpdir(), 'polycode-aifill-'))
+    try {
+      const res = await app.request('/admin/api/projects/ai-fill', {
+        method: 'POST',
+        body: JSON.stringify({ dir: probe, readmes: [] }),
+      })
+      expect(res.status).toBe(200)
+      expect(calls[0]!.model).toBe('opencode/mimo-v2.5-free')
+    } finally {
+      rmSync(probe, { recursive: true, force: true })
+    }
   })
 
   test('ai-fill：参数校验（缺dir400/模型透传/ai失败502可注入）', async () => {
@@ -481,23 +506,29 @@ describe('projects 适配器（对齐 Go adminapi/projects_api.go）', () => {
     expect((await app.request('/admin/api/projects/ai-fill', {
       method: 'POST', body: JSON.stringify({}),
     })).status).toBe(400)
-    // 正常：模型透传 + README 内容拼进 system
-    const ok = await app.request('/admin/api/projects/ai-fill', {
-      method: 'POST',
-      body: JSON.stringify({ dir: '/tmp', model: 'm1', readmes: ['README.md'] }),
-    })
-    expect(ok.status).toBe(200)
-    expect(calls.length).toBe(1)
-    expect(calls[0]!.model).toBe('m1')
-    expect(calls[0]!.system).toContain('content-of-')
-    // ai 抛错 → 502（前端降级复制）
-    const app2 = new Hono()
-    app2.route('/admin/api/projects', createProjectsApp(m as never, {
-      aiComplete: async () => { throw new Error('限流') },
-    }))
-    expect((await app2.request('/admin/api/projects/ai-fill', {
-      method: 'POST', body: JSON.stringify({ dir: '/tmp', model: 'm1' }),
-    })).status).toBe(502)
+    // dir 必须是真实存在的目录（端点会校验），用临时目录而非 '/tmp'。
+    const probe = mkdtempSync(join(tmpdir(), 'polycode-aifill2-'))
+    try {
+      // 正常：模型透传 + README 内容拼进 system
+      const ok = await app.request('/admin/api/projects/ai-fill', {
+        method: 'POST',
+        body: JSON.stringify({ dir: probe, model: 'm1', readmes: ['README.md'] }),
+      })
+      expect(ok.status).toBe(200)
+      expect(calls.length).toBe(1)
+      expect(calls[0]!.model).toBe('m1')
+      expect(calls[0]!.system).toContain('content-of-')
+      // ai 抛错 → 502（前端降级复制）
+      const app2 = new Hono()
+      app2.route('/admin/api/projects', createProjectsApp(m as never, {
+        aiComplete: async () => { throw new Error('限流') },
+      }))
+      expect((await app2.request('/admin/api/projects/ai-fill', {
+        method: 'POST', body: JSON.stringify({ dir: probe, model: 'm1' }),
+      })).status).toBe(502)
+    } finally {
+      rmSync(probe, { recursive: true, force: true })
+    }
   })
 
   test('port-owner：busy/owner 查询（IO 注入，不探真实端口）', async () => {
@@ -551,5 +582,116 @@ describe('projects 适配器（对齐 Go adminapi/projects_api.go）', () => {
     })
     expect(bad.status).toBe(500)
     expect((await bad.json() as { error: { message: string } }).error.message).toContain('网关自身')
+  })
+})
+
+// —— 安装作业态：服务端是「安装中」的唯一真相源（切页不丢 / 不重复下载） ——
+
+describe('sidecar 安装作业态', () => {
+  type Job = {
+    running: boolean; phase: string; received: number; total: number
+    startedAt: number; elapsedMs: number; ok: boolean; error: string
+    downloadProxy: string; downloadProxySource: string
+  }
+  const getJob = async (app: Hono): Promise<Job> =>
+    ((await (await app.request('/admin/api/sidecar')).json()) as { install: Job }).install
+
+  test('GET / 空闲时 install 字段齐全且未在跑', async () => {
+    const j = await getJob(sidecarHarness())
+    expect(j.running).toBe(false)
+    expect(j.ok).toBe(false)
+    expect(j.error).toBe('')
+    expect(j.received).toBe(0)
+    expect(j.startedAt).toBe(0)
+    expect(j.elapsedMs).toBe(0)
+  })
+
+  test('安装中：GET / 暴露 phase 与字节进度；完成后转 ok', async () => {
+    // 真实缺陷的锚点：以前前端把 busy 存在组件 ref 里，切页就归零，
+    // 而服务端还在下载——页面显示「一键安装」，用户再点一次就并发下载第二次。
+    // 现在进度记在服务端，切页/刷新/开新标签页读到的都是同一个作业。
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    let entered!: () => void
+    const enteredP = new Promise<void>((r) => { entered = r })
+    const svc = stubSidecar({
+      ensureReady: async (_dir: string, opts: { onProgress?: (p: unknown) => void } = {}) => {
+        opts.onProgress?.({ phase: 'downloading', received: 1048576, total: 4 * 1048576 })
+        entered()
+        await gate
+      },
+    })
+    const app = new Hono()
+    app.route('/admin/api/sidecar', createSidecarApp(
+      svc as never,
+      { getByName: () => undefined, put: () => {} } as never,
+      () => {}, fetch, { list: () => [{ id: 'clash', kind: 'http', addr: '127.0.0.1:7897' }] }))
+
+    const p = app.request('/admin/api/sidecar/ensure', { method: 'POST' })
+    await enteredP
+    const mid = await getJob(app)
+    expect(mid.running).toBe(true)
+    expect(mid.phase).toBe('downloading')
+    expect(mid.received).toBe(1048576)
+    expect(mid.total).toBe(4 * 1048576)
+    expect(mid.elapsedMs).toBeGreaterThanOrEqual(0)
+    expect(mid.downloadProxy).toBe('http://127.0.0.1:7897') // 本次尝试用的出口，失败时可解释
+    expect(mid.downloadProxySource).toBe('egress-auto:clash')
+
+    release()
+    expect((await p).status).toBe(200)
+    const done = await getJob(app)
+    expect(done.running).toBe(false)
+    expect(done.ok).toBe(true)
+    expect(done.error).toBe('')
+  })
+
+  test('失败后错误留在作业态里（切页回来仍能看到原因）', async () => {
+    const app = sidecarHarness(stubSidecar({
+      ensureReady: async () => { throw new Error('下载 x 失败 —— ECONNRESET。请换节点后重试') },
+    }))
+    const res = await app.request('/admin/api/sidecar/ensure', { method: 'POST' })
+    expect(res.status).toBe(500)
+    const j = await getJob(app)
+    expect(j.running).toBe(false)
+    expect(j.ok).toBe(false)
+    expect(j.error).toContain('ECONNRESET')
+  })
+
+  test('单飞：并发两个 ensure 只下载一次（不再互相踩踏同一个 .tmp）', async () => {
+    let calls = 0
+    let release!: () => void
+    const gate = new Promise<void>((r) => { release = r })
+    let entered!: () => void
+    const enteredP = new Promise<void>((r) => { entered = r })
+    const svc = stubSidecar({
+      ensureReady: async () => { calls++; entered(); await gate },
+    })
+    const app = new Hono()
+    app.route('/admin/api/sidecar', createSidecarApp(
+      svc as never, { getByName: () => undefined, put: () => {} } as never, () => {}))
+
+    const p1 = app.request('/admin/api/sidecar/ensure', { method: 'POST' })
+    await enteredP // 第一次安装已在跑
+    const p2 = app.request('/admin/api/sidecar/ensure', { method: 'POST' })
+    // 让第二个请求走到 ensureJob：它应当复用同一个 promise，而不是再起一次下载
+    await new Promise((r) => { setTimeout(r, 50) })
+    expect(calls).toBe(1)
+    release()
+    const [r1, r2] = await Promise.all([p1, p2])
+    expect(r1.status).toBe(200)
+    expect(r2.status).toBe(200) // 复用的那次也拿到成功回执
+    expect(calls).toBe(1) // 事后仍是 1：第二个请求没有偷偷再下一次
+  })
+
+  test('installed 走 findBinary（Windows .exe 回归锚点）', async () => {
+    // 历史缺陷：这里曾独立硬编码 `${dir}/zcode-proxy`，而 Windows 上落地的是
+    // zcode-proxy.exe，于是装完也永远报 installed:false —— 引擎停下时页面
+    // 永远显示「未安装」，回不到「已安装，未运行」。改为复用 findBinary 后，
+    // 判定口径与 install 落地的文件名强制一致。
+    const hit = sidecarHarness(stubSidecar({ findBinary: () => '/wd/zcode-proxy.exe' }))
+    expect(((await (await hit.request('/admin/api/sidecar')).json()) as { installed: boolean }).installed).toBe(true)
+    const miss = sidecarHarness(stubSidecar({ findBinary: () => { throw new Error('sidecar: 未安装') } }))
+    expect(((await (await miss.request('/admin/api/sidecar')).json()) as { installed: boolean }).installed).toBe(false)
   })
 })

@@ -416,7 +416,12 @@ export function findReadmes(root: string): ReadmeHit[] {
       try {
         size = statSync(p).size
       } catch { /* 大小读不到按 0 */ }
-      out.push({ path: relative(root, p), size })
+      // 相对路径在 Windows 上把 '\' 归一成 '/'：该值回给前端展示，也会被 ai-fill
+      // 原样收回来再 join(abs, rel) 读文件，跨平台要一致。
+      // POSIX 上**不替换**：那里的分隔符本来就是 '/'，而反斜杠是合法文件名字符
+      // （macOS/Linux 允许名为 `a\b` 的目录），无脑替换会把真实路径改坏。
+      const rel = relative(root, p)
+      out.push({ path: process.platform === 'win32' ? rel.replace(/\\/g, '/') : rel, size })
     }
   }
   // 同层按路径短优先（越靠近根越可能是总览），BFS 已保证跨层有序。

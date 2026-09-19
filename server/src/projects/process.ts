@@ -4,7 +4,7 @@
 
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { closeSync, mkdirSync, openSync, readdirSync, writeSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { delimiter, dirname } from 'node:path'
 import net from 'node:net'
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, ms) })
@@ -41,12 +41,18 @@ function fallbackPaths(): string[] {
 }
 
 // augmentedPath 把 fallbackPaths 追加到当前 PATH 之后（去重，保持原顺序优先）。
+//
+// 分隔符必须用 path.delimiter（POSIX ':' / Windows ';'），不能写死 ':'。
+// 写死 ':' 在 Windows 上会把 `C:\a;C:\b` 按冒号切成 ['C','\a;C','\b']——驱动器
+// 盘符里的冒号也被当成分隔符。当前 fallbackPaths() 在 Windows 上返回空数组，
+// 切开再拼回去恰好等于原串，所以**症状被掩盖**；一旦给 Windows 补上工具目录，
+// 就会产出被切碎的 PATH。这里提前按正确口径写。
 export function augmentedPath(base = process.env.PATH || ''): string {
-  const parts = base.split(':').filter((p) => p !== '')
+  const parts = base.split(delimiter).filter((p) => p !== '')
   for (const p of fallbackPaths()) {
     if (!parts.includes(p)) parts.push(p)
   }
-  return parts.join(':')
+  return parts.join(delimiter)
 }
 
 // startDetached 以 shell 执行 cmd（工作目录 dir、追加环境 env），输出进 logFd，
@@ -69,9 +75,18 @@ export function startDetached(dir: string, shellCmd: string, env: string[], logF
     child = spawn(shell, [flag, shellCmd], {
       cwd: dir,
       env: envObj,
-      // detached：posix 新会话（setsid，子进程成为组长，整组可杀）；
-      // windows 新进程组 + 隐藏窗口，脱离父进程生命周期。
-      detached: true,
+      // detached：posix 新会话（setsid，子进程成为组长，整组可杀）。
+      //
+      // Windows 上**必须**关掉它：Node 的 detached 在 Windows 上是给子进程
+      // 「自己的控制台窗口」（CREATE_NEW_CONSOLE），而默认终端被设成 Windows
+      // Terminal 的机器会把新控制台接管走（console handoff），窗口标题就是那条
+      // 命令行；紧接着的 taskkill /T /F 让 handoff 管道提前关闭，WT 便弹
+      // `错误 2147942632 (0x800700e8) (启动 "<命令行>" 时)`——每起一次服务弹一次。
+      // 实测（cmd /c ping -n 30）：detached:true → 新建 conhost + OpenConsole 接管；
+      // detached:false + windowsHide:true → 连控制台都不建，全程无窗口、无弹窗。
+      // Windows 上不需要靠 detached「脱离父进程」：父进程退出不会杀子进程
+      // （Node 不建 Job Object），而 killTree 走 taskkill /PID /T，也不依赖进程组。
+      detached: process.platform !== 'win32',
       stdio: ['ignore', logFd, logFd],
       ...(process.platform === 'win32' ? { windowsHide: true } : {}),
     })
@@ -311,15 +326,22 @@ async function killPid(pid: number, graceMs = 3000): Promise<void> {
 }
 
 // netstatOwner 从 netstat -ano 输出找 LISTENING 行的 pid，再查进程名。
-// tasklist 查不到名字时退化为裸 pid（与 Go 行为一致）。
+//
+// 查名失败时**必须**退化成裸 pid：tasklist 在非 Windows 上不存在（execFileText
+// 返回空串 → 直接退化），而 Windows 上查不到进程时会打印一条**本地化**提示
+// （英文 "INFO: No tasks are running which match..."、中文「信息: 没有运行的
+// 任务匹配指定标准。」），且不一定走非零退出码，所以既不能靠 err 判断，也不能
+// 靠匹配字面量 'INFO:'——中文环境下那条提示会被整句当成进程名回给用户。
+// 判据改为「真正的 CSV 行一定以引号开头」，与语言无关。
 export async function netstatOwner(out: string, port: number): Promise<string> {
   const pid = netstatPid(out, port)
   if (pid === '') return ''
   const csv = await execFileText('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'])
-  if (csv !== '') {
-    const parts = csv.split(`","`)
+  const trimmed = csv.trim()
+  if (trimmed.startsWith('"')) {
+    const parts = trimmed.split(`","`)
     const n = (parts[0] ?? '').replace(/^"/, '')
-    if (n !== '' && n !== 'INFO:') return `${n}(${pid})`
+    if (n !== '') return `${n}(${pid})`
   }
   return pid
 }

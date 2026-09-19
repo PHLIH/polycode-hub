@@ -9,14 +9,15 @@ import { spawn } from 'node:child_process'
 // 报 invalid onRequestStart（实测）。版本自洽后按 Provider 分流出口才成立。
 import { fetch as undiciFetch, ProxyAgent } from 'undici'
 import { getOutbound, kindForStatus, UpstreamError, UPSTREAM,
-  type IrRequest, type Protocol } from '../ir/index.ts'
+  type Block, type IrRequest, type Protocol } from '../ir/index.ts'
 import {
   flushZenPoolToLib, recordZenFailure, recordZenSuccess, refillZenPool, takeNextZenSession,
   zenPoolActiveLen, ZEN_FAIL_THRESHOLD, ZEN_FAIL_WINDOW_MS,
 } from './zen_pool.ts'
 import { autoProtocol, forgetProtocol, rememberProtocol,
   capabilitiesFrom, credentialResolve, dynamicHeadersTimeout,
-  findHeaderKey, isZenBaseUrl, mintZenRequestId, validZenToken, zenHeadersWithFingerprint,
+  findHeaderKey, isWorkBuddyAiBaseUrl, isZenBaseUrl, mintZenRequestId, validZenToken,
+  zenHeadersWithFingerprint,
   parseZenSessionPool, writeZenSessionPool,
   ZEN_REQUEST_HEADER, ZEN_SESSION_HEADER, ZEN_SESSION_POOL_HEADER,
   type Capabilities, type DynamicHeadersSpec, type Provider } from '../model/index.ts'
@@ -139,6 +140,54 @@ export function ensureZenAgentShape(req: IrRequest, baseUrl: string): IrRequest 
     tools: [...(req.tools ?? []), ...missing.map(zenFloorTool)],
     ...(req.toolChoice !== undefined ? {} : { toolChoice: { mode: 'auto' as const } }),
   }
+}
+
+// 发往上游前的**全部体裁保底**，一处收口。
+//
+// 为什么必须收口：上游对「请求体裁」有硬性要求，不满足就直接拒单，
+// 而网关有两条独立的发请求路径——`streamWith`（转发）与 `streamWithTimeout`（探测/测试）。
+// 两条各写一份保底，必然漂移：海外版 system 打头当初只加在 streamWith，
+// 结果「转发能通、点测试报 400 code 11128」，用户看到的是「根本没修好」。
+// 所以保底只在这里定义，两条路径都调它；将来再加新上游的体裁要求也只改这一处。
+//
+// 当前两条保底（各自按 host 生效，互不干扰）：
+//   · zen 免费档：须 agent 体裁（tools 含 read/bash + tool_choice）——见 ensureZenAgentShape
+//   · WorkBuddy 海外版：首条消息须 system prompt——见 ensureWbAiSystemFirst
+export function applyUpstreamFloors(req: IrRequest, baseUrl: string): IrRequest {
+  return ensureWbAiSystemFirst(ensureZenAgentShape(req, baseUrl), baseUrl)
+}
+
+// WorkBuddy **海外版**体裁闸门：messages 首条必须是 system prompt。
+//
+// 2026-09-19 双版本交叉实测：同一个请求体（首条为 user）
+//   海外版 www.workbuddy.ai      → 400 code 11128「first message is not system prompt」
+//   国内版 copilot.tencent.com   → 200 正常出流
+// 即这是海外版独有的前置校验，不能对所有 WorkBuddy 上游一刀切（加了会对国内版
+// 造成无谓的 system 注入）。判定按 host（isWorkBuddyAiBaseUrl）。
+//
+// 落点与 zen 的体裁保底同理：网关全兜，客户端不必知道上游有这条规矩。
+// IR 的 system 由 openai-completions 编解码器落成 messages[0]（见该文件 system 分支），
+// 所以这里只需保证 req.system 非空即可，不必自己去动 messages 数组。
+//
+// 取舍（显式决策）：客户端**已带** system 时一字不改（用户/客户端的提示词是权威，
+// 网关绝不覆盖或拼接）；只有完全没有 system 时才补一句最小中立提示——
+// 不补的话海外版**所有**请求都会 400，可用性优先。补的是无信息量的中性句，
+// 对模型行为的影响可忽略，且这是让请求能通行的最小代价。
+export const WB_AI_FLOOR_SYSTEM = 'You are a helpful assistant.'
+
+export function ensureWbAiSystemFirst(req: IrRequest, baseUrl: string): IrRequest {
+  if (!isWorkBuddyAiBaseUrl(baseUrl)) return req
+  // 已有非空 text 的 system 段 → 不动（同一引用，便于调用方与测试判定“没动过”）。
+  if (hasSystemText(req.system)) return req
+  return { ...req, system: [...(req.system ?? []), { type: 'text', text: WB_AI_FLOOR_SYSTEM }] }
+}
+
+// system 段里是否存在非空文本（空字符串/纯空白视为没有——那种 system 照样触发 11128）。
+function hasSystemText(system: Block[] | undefined): boolean {
+  for (const b of system ?? []) {
+    if (b.type === 'text' && typeof b.text === 'string' && b.text.trim() !== '') return true
+  }
+  return false
 }
 
 // 单行可打印 ASCII 才配做 UA（防 CR/LF 头注入）；超长截断到 512。
@@ -422,9 +471,10 @@ export class Upstream {
     const codec = getOutbound(proto)
     const needsTruncationFallback = proto === 'openai-responses'
     try {
-      // zen 免费档要 agent 体裁才放行（缺 read/bash 工具声明或 tool_choice 即 403，
-      // 与指纹头无关的独立判定）：这里统一补，转发侧无需逐个操心。
-      body = codec.serializeRequest(ensureZenAgentShape(upReq, p.baseUrl))
+      // 体裁保底统一收口在 applyUpstreamFloors（zen 的 agent 体裁 + WB 海外版的
+      // system 打头），转发与探测两条路径必须走同一个函数，否则会漂移出
+      // 「转发能通、测试报错」这种自相矛盾的现象。
+      body = codec.serializeRequest(applyUpstreamFloors(upReq, p.baseUrl))
       path = codec.requestPath()
     } catch (err) {
       if (err instanceof UpstreamError) throw err
@@ -730,9 +780,11 @@ export class Upstream {
     let path: string
     try {
       const codec = getOutbound(proto)
-      // 探测路径同样走体裁保底：探针本就是极简 `hi`，不补则 zen 恒 403，
-      // 会把「体裁不对」误报成「源不可用」（与 streamWith 同语义，见 ensureZenAgentShape）。
-      body = codec.serializeRequest(ensureZenAgentShape(upReq, p.baseUrl))
+      // 探测路径与转发路径走**同一个**体裁保底函数（applyUpstreamFloors）：
+      // 探针是极简 `hi`，缺 zen 的 agent 体裁会恒 403、缺 WB 海外版的 system 会恒
+      // 400 code 11128，都会把「体裁不对」误报成「源不可用」。
+      // 此前这里只补 zen 没补 WB 海外版，用户点「测试」看到的正是 11128。
+      body = codec.serializeRequest(applyUpstreamFloors(upReq, p.baseUrl))
       path = codec.requestPath()
     } catch (err) {
       throw new UpstreamError(0, UPSTREAM.BAD_REQUEST, `序列化上游请求失败: ${(err as Error).message}`)

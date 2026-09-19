@@ -1,9 +1,9 @@
 // sidecar 管理面的后端接线：把 sidecar 包暴露为 /admin/api/sidecar/*（薄适配，
 // 对齐 Go internal/adminapi/sidecar_api.go）。以 Hono 子应用注入 createAdminApi。
 
-import { existsSync, statSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { Hono, type Context } from 'hono'
-import { validatePort, type FetchLike, type Sidecar } from '../sidecar/sidecar.ts'
+import { validatePort, type FetchLike, type Sidecar, type SidecarPhase } from '../sidecar/sidecar.ts'
 import { maskProxyURI, resolveSidecarDownloadFetch } from '../sidecar/httpproxy.ts'
 
 // sidecar 只关心「zcode-plan-local」这一个 Provider 的 baseUrl 与 egress 引用，
@@ -30,14 +30,51 @@ function isLoopbackHost(host: string): boolean {
   return /^(127\.|::1$)/.test(host)
 }
 
+// sidecarInstalled 判定二进制是否已落地。
+//
+// 复用 Sidecar.findBinary 而不是自己拼路径：它按 binName（Windows 带 .exe）
+// 查 workDir → sidecarDir → binDir，与 install 落地的名字同一口径。
+// 历史缺陷：这里曾经独立硬编码 `${dir}/zcode-proxy`，于是在 Windows 上装完
+// 也永远报 installed:false——页面一直显示「未安装 —— 一键下载官方引擎…」，
+// 引擎停下时永远回不到「已安装，未运行」。与 sidecar.ts 里那批 .exe 缺陷同源，
+// 当时漏改了这一处。
 function sidecarInstalled(s: Sidecar): boolean {
-  for (const dir of [s.workDir, s.binDir]) {
-    const p = `${dir}/zcode-proxy`.replace(/\/+/g, '/')
-    try {
-      if (statSync(p).size > 0) return true
-    } catch { /* 不存在 */ }
+  try {
+    s.findBinary(s.workDir)
+    return true
+  } catch {
+    return false
   }
-  return false
+}
+
+// —— 安装作业态：服务端才是「安装中」的唯一真相源 ——
+//
+// 前端原来把 busy 存在组件 ref 里，而 App.vue 用的是没有 keep-alive 的
+// <component :is>，每次切页都卸载重建 → 状态归零。后果有两层：
+//   1. 页面显示「一键安装」，而服务端其实还在下载（普通 fetch 不随组件卸载 abort）；
+//   2. 用户再点一次就发出第二个 POST /ensure，两个 ensureReady 并发下载，
+//      而临时文件路径是固定的 dest+'.tmp'，两个流写同一个文件会互相踩踏。
+// 所以进度与阶段记在这里，GET / 对外暴露，POST /ensure 遇到在跑的任务直接复用。
+interface InstallJob {
+  running: boolean
+  phase: SidecarPhase
+  received: number
+  total: number
+  startedAt: number
+  finishedAt: number
+  ok: boolean
+  error: string
+  proxy: string // 本次尝试实际使用的下载代理（已脱敏）
+  proxySource: string
+  promise: Promise<void> | null
+}
+
+function idleJob(): InstallJob {
+  return {
+    running: false, phase: 'resolving', received: 0, total: 0,
+    startedAt: 0, finishedAt: 0, ok: false, error: '',
+    proxy: '', proxySource: '', promise: null,
+  }
 }
 
 export function createSidecarApp(
@@ -49,6 +86,7 @@ export function createSidecarApp(
 ): Hono {
   const app = new Hono()
   const dir = () => svc.workDir
+  let job: InstallJob = idleJob()
 
   // downloadProxy 决议本次下载用的代理（复用项目 egress 配置，不写死地址）：
   // 优先 zcode-plan-local Provider 的 egress 引用 → 仅一项时自动采用 → 环境变量
@@ -61,6 +99,42 @@ export function createSidecarApp(
       providerEgressId: p?.egress ?? '',
       egressList: egresses?.list() ?? [],
     })
+  }
+
+  // ensureJob 启动（或复用）一次安装作业。
+  // 返回值就是该次安装的 promise：并发的第二个请求拿到同一个 promise，
+  // 因此只会下载一次（响应结构与以前完全一致，只是不再重复起第二次下载）。
+  function ensureJob(dl: ReturnType<typeof downloadProxy>): Promise<void> {
+    if (job.running && job.promise !== null) return job.promise
+    const cur: InstallJob = {
+      running: true, phase: 'resolving', received: 0, total: 0,
+      startedAt: Date.now(), finishedAt: 0, ok: false, error: '',
+      proxy: maskProxyURI(dl.proxyURI), proxySource: dl.source, promise: null,
+    }
+    job = cur
+    const p = (async () => {
+      try {
+        await svc.ensureReady(dir(), {
+          fetch: dl.fetch,
+          onProgress: (pr) => {
+            // 只写当前作业：上一轮的延迟回调万一晚到，不能污染新一轮的进度。
+            if (job !== cur) return
+            cur.phase = pr.phase
+            cur.received = pr.received
+            cur.total = pr.total
+          },
+        })
+        cur.ok = true
+      } catch (e) {
+        cur.error = (e as Error).message
+        throw e
+      } finally {
+        cur.running = false
+        cur.finishedAt = Date.now()
+      }
+    })()
+    cur.promise = p
+    return p
   }
 
   // GET / → 状态 + 安装/配置信息。
@@ -83,6 +157,22 @@ export function createSidecarApp(
       custom: endpoint !== '' && endpoint !== builtin,
       downloadProxy: maskProxyURI(dl.proxyURI),
       downloadProxySource: dl.source,
+      // install 是「当前 / 最近一次」安装的作业态。running=true 时前端画进度条；
+      // 结束后保留 ok/error，切页或刷新回来的用户仍能看到结果与处置建议，
+      // 而不是只错过一个已经消失的 toast。
+      install: {
+        running: job.running,
+        phase: job.phase,
+        received: job.received,
+        total: job.total,
+        startedAt: job.startedAt,
+        elapsedMs: job.startedAt === 0 ? 0
+          : (job.running ? Date.now() : job.finishedAt) - job.startedAt,
+        ok: job.ok,
+        error: job.error,
+        downloadProxy: job.proxy,
+        downloadProxySource: job.proxySource,
+      },
     })
   })
 
@@ -129,8 +219,10 @@ export function createSidecarApp(
         } catch (e) {
           return err(c, 400, (e as Error).message)
         }
+        // 单飞：已有任务在跑就复用同一个 promise，不重复下载（见 ensureJob）。
+        const p = ensureJob(dl)
         try {
-          await svc.ensureReady(dir(), { fetch: dl.fetch })
+          await p
           return c.json({
             ok: true, status: await svc.status(),
             downloadProxy: maskProxyURI(dl.proxyURI), downloadProxySource: dl.source,

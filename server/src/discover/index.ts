@@ -6,7 +6,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { Provider } from '../model/index.ts'
-import { mintZenRequestId } from '../model/index.ts'
+import { mintZenRequestId, wbAuxEndpointIdentityHeaders, workBuddyRealmOfIssuer } from '../model/index.ts'
 import type { Finding } from '../adminapi/types.ts'
 
 // 状态枚举的唯一定义是 adminapi/types.ts 的 DiscoverStatus（Finding.status 用的就是它）。
@@ -19,14 +19,12 @@ import type { Finding } from '../adminapi/types.ts'
 export type { Finding }
 
 // 从客户端本地发现的单个登录态（脱敏，不含 token 本体）。
-export interface DiscoveredAccount {
-  nickname: string // 账号昵称/邮箱
-  uid: string // 短 UID（脱敏）
-  type?: string // personal / enterprise
-  alive: boolean // token 未过期
-  expiresAt?: string // ISO 时间（本地）
-  tokenPath: string // 登录态文件路径（导出凭据用）
-}
+//
+// 唯一定义在 adminapi/types.ts：发现层产出、管理面消费、前端渲染。这里曾经
+// 各留一份，加 realm 字段时立刻漂移（本地这份没跟上，类型报错才发现）。
+// 与上面 Finding 的教训同源——类型只留一处。
+export type { DiscoveredAccount } from '../adminapi/types.ts'
+import type { DiscoveredAccount } from '../adminapi/types.ts'
 
 export type FetchLike = typeof fetch
 
@@ -40,6 +38,82 @@ interface Checked {
 
 // ---- WorkBuddy / CodeBuddy（桌面登录态复用） ----
 
+// ---- WorkBuddy 双版本（国内版 / 海外版） ----
+//
+// 桌面端有两个发行版，**登录态文件与认证域都不同**，token 互不通用：
+//
+//   国内版  workbuddy-desktop.info     realm www.workbuddy.cn   上游 copilot.tencent.com
+//   海外版  workbuddy-desktop-ai.info  realm www.workbuddy.ai   上游 www.workbuddy.ai
+//
+// 两者 JWT 的 iss 分别是 https://www.workbuddy.cn/auth/realms/copilot 与
+// https://www.workbuddy.ai/auth/realms/copilot —— realm 同名但 issuer 不同。
+// 把海外版的 token 打到 copilot.tencent.com 会被前置 APISIX 拦成 HTML 401
+// 「Authorization Required」（看起来像账号失效，其实只是域名不对）。
+//
+// 所以版本必须是一个**显式标识**：发现层要认全两个文件名，并把它一路带到
+// Provider 草稿（baseUrl / X-Domain 由它派生），否则导入哪个版本都打到国内域名。
+export type WbRealm = 'cn' | 'ai'
+
+// 各版本的发行标识：文件名后缀 + 认证域。顺序即「同名冲突时的优先顺序」（国内版在前，
+// 因为无后缀的 workbuddy-desktop.info 在老机器上是主文件）。
+export const WB_REALMS: readonly { realm: WbRealm; suffix: string; label: string; issuer: string; upstream: string }[] = [
+  { realm: 'cn', suffix: '', label: '国内版', issuer: 'www.workbuddy.cn', upstream: 'copilot.tencent.com' },
+  { realm: 'ai', suffix: '-ai', label: '海外版', issuer: 'www.workbuddy.ai', upstream: 'www.workbuddy.ai' },
+] as const
+
+// 某版本的登录态文件名（suffix 为空时就是历史主文件名 workbuddy-desktop.info，
+// 保持向后兼容——老机器上国内版仍叫这个名字）。
+export function wbAuthFileName(realm: WbRealm): string {
+  const r = WB_REALMS.find((x) => x.realm === realm)
+  return `workbuddy-desktop${r?.suffix ?? ''}.info`
+}
+
+// 从登录态文件内容判定版本（两条独立证据，优先级固定）：
+//
+//   ① auth.domain —— 客户端自己写的认证域，最直接（www.workbuddy.ai / www.workbuddy.cn）。
+//   ② JWT 的 iss —— 兜底。旧版本客户端不一定写 domain，但 token 一定带 issuer。
+//
+// 都取不到返回 undefined：**不猜**。猜错会把海外版的号打进国内域名，正是本模块要修的故障。
+export function detectRealmFromAuth(raw: string): WbRealm | undefined {
+  let f: WbAuthFile | null = null
+  try {
+    const p: unknown = JSON.parse(raw)
+    if (typeof p === 'object' && p !== null) f = p as WbAuthFile
+  } catch {
+    return undefined
+  }
+  const domain = f?.auth?.domain
+  if (typeof domain === 'string' && domain.trim() !== '') {
+    const hit = realmFromIssuer(domain)
+    if (hit) return hit
+  }
+  const tok = f?.auth?.accessToken
+  if (typeof tok === 'string' && tok !== '') {
+    const iss = jwtIssuer(tok)
+    if (iss) {
+      const hit = realmFromIssuer(iss)
+      if (hit) return hit
+    }
+  }
+  return undefined
+}
+
+// 认证域/issuer → 版本。**唯一定义在 model/index.ts**（workBuddyRealmOfIssuer），
+// 账号-Provider 一致性校验也要用它，两处各写一份迟早漂移。这里只做转出。
+export const realmFromIssuer = workBuddyRealmOfIssuer
+
+// 解 JWT 的 iss（不验签）；解析不出返回 null。
+export function jwtIssuer(token: string): string | null {
+  const parts = token.split('.')
+  if (parts.length < 2 || !parts[1]) return null
+  try {
+    const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as { iss?: string }
+    return typeof claims.iss === 'string' && claims.iss !== '' ? claims.iss : null
+  } catch {
+    return null
+  }
+}
+
 // auth 文件候选路径（env 覆盖优先，不区分设备）。
 //
 // 路径不是“写死某台机器”：一律用 USERPROFILE / HOME + AppData 拼接，换用户照样命中。
@@ -48,6 +122,10 @@ interface Checked {
 // （此前只扫了 Roaming，Local 的号一律报 missing）。
 // 另认 APPDATA / LOCALAPPDATA / XDG_CONFIG_HOME（重定向文件夹/漫游策略下 join 出来的
 // 默认路径可能是错的，环境变量才是真相源），以及 CODEBUDDY_DESKTOP_AUTH_DIR 兜底。
+//
+// 每个基准目录下要展开**两个版本**的文件名（见 WB_REALMS）：此前只生成
+// workbuddy-desktop.info，海外版的 workbuddy-desktop-ai.info 永远命中不了候选，
+// 只能靠智能兜底递归时被当作「同源的另一个号」扫进来——版本信息就此丢失。
 export function workBuddySearchPaths(
   goos: string, home: string, winProfile: string,
   env: NodeJS.ProcessEnv = process.env,
@@ -55,7 +133,10 @@ export function workBuddySearchPaths(
   const custom = env.CODEBUDDY_DESKTOP_AUTH_FILE
   if (custom) return [custom]
   const extraDir = env.CODEBUDDY_DESKTOP_AUTH_DIR
-  const extra = extraDir ? [join(extraDir, 'workbuddy-desktop.info')] : []
+  const names = WB_REALMS.map((r) => wbAuthFileName(r.realm))
+  // 一个 auth 目录 → 该目录下全部版本的候选文件。
+  const expand = (dir: string): string[] => names.map((n) => join(dir, n))
+  const extra = extraDir ? expand(extraDir) : []
   if (goos === 'windows') {
     const bases: string[] = []
     const pushBase = (b: string | undefined) => { if (b && !bases.includes(b)) bases.push(b) }
@@ -65,9 +146,9 @@ export function workBuddySearchPaths(
     pushBase(env.APPDATA)
     pushBase(join(winProfile, 'AppData', 'Roaming'))
     const out = [
-      ...bases.map((b) => join(b, 'CodeBuddyExtension', 'Data', 'Public', 'auth', 'workbuddy-desktop.info')),
-      join(winProfile, '.workbuddy', 'auth', 'workbuddy-desktop.info'),
-      join(winProfile, '.config', 'workbuddy', 'auth', 'workbuddy-desktop.info'),
+      ...bases.flatMap((b) => expand(join(b, 'CodeBuddyExtension', 'Data', 'Public', 'auth'))),
+      ...expand(join(winProfile, '.workbuddy', 'auth')),
+      ...expand(join(winProfile, '.config', 'workbuddy', 'auth')),
       ...extra,
     ]
     return [...new Set(out)]
@@ -75,21 +156,21 @@ export function workBuddySearchPaths(
   if (goos === 'linux') {
     const xdg = env.XDG_CONFIG_HOME || join(home, '.config')
     return [...new Set([
-      join(xdg, 'CodeBuddyExtension', 'Data', 'Public', 'auth', 'workbuddy-desktop.info'),
+      ...expand(join(xdg, 'CodeBuddyExtension', 'Data', 'Public', 'auth')),
       // XDG 被改掉时仍保留默认位（双保险，不差这一次 stat）。
       ...(xdg !== join(home, '.config')
-        ? [join(home, '.config', 'CodeBuddyExtension', 'Data', 'Public', 'auth', 'workbuddy-desktop.info')]
+        ? expand(join(home, '.config', 'CodeBuddyExtension', 'Data', 'Public', 'auth'))
         : []),
-      join(home, '.workbuddy', 'auth', 'workbuddy-desktop.info'),
-      join(home, '.config', 'workbuddy', 'auth', 'workbuddy-desktop.info'),
+      ...expand(join(home, '.workbuddy', 'auth')),
+      ...expand(join(home, '.config', 'workbuddy', 'auth')),
       ...extra,
     ])]
   }
   // darwin 及其他类 Unix
   return [...new Set([
-    join(home, 'Library', 'Application Support', 'CodeBuddyExtension', 'Data', 'Public', 'auth', 'workbuddy-desktop.info'),
-    join(home, '.workbuddy', 'auth', 'workbuddy-desktop.info'),
-    join(home, '.config', 'workbuddy', 'auth', 'workbuddy-desktop.info'),
+    ...expand(join(home, 'Library', 'Application Support', 'CodeBuddyExtension', 'Data', 'Public', 'auth')),
+    ...expand(join(home, '.workbuddy', 'auth')),
+    ...expand(join(home, '.config', 'workbuddy', 'auth')),
     ...extra,
   ])]
 }
@@ -156,6 +237,10 @@ export function searchWorkBuddyAuthFiles(roots: string[], limit = 200): string[]
         }
         continue
       }
+      // 前缀 + .info 一把抓：既覆盖历史带时间戳的快照
+      // （workbuddy-desktop.2026-09-07T14-03-40.64274.abc.info），
+      // 也覆盖两个发行版的定名文件（workbuddy-desktop.info / workbuddy-desktop-ai.info）。
+      // 版本归属不靠文件名猜，由 detectRealmFromAuth 读文件内容判定。
       if (name.startsWith('workbuddy-desktop') && name.endsWith('.info')) out.push(p)
     }
   }
@@ -196,7 +281,6 @@ interface WbAuthFile {
   auth?: { accessToken?: string; tokenType?: string; domain?: string }
   account?: { uid?: string; nickname?: string; type?: string }
 }
-
 function parseAuthFile(raw: string): WbAuthFile | null {
   try {
     const f = JSON.parse(raw) as WbAuthFile
@@ -233,16 +317,44 @@ function fmtLocal(d: Date): string {
 
 // ---- WorkBuddy 检查 ----
 
-function wbSuggestedProvider(): Provider {
+// 某版本建议的 Provider 草稿。
+//
+// baseUrl / X-Domain 由**版本派生**，不再是常量：把海外版的 token 打到
+// copilot.tencent.com 会被 APISIX 拦成 HTML 401「Authorization Required」，
+// 用户以为是账号失效，实际只是域名不对（2026-09-19 实测确认）。
+//
+// Provider 名也按版本区分（workbuddy / workbuddy-ai）：账号池按 providerId 归属，
+// 两个版本必须落成两个 Provider，否则同一池里混着两套互不通用的 token，
+// 轮询到哪个是哪个，一半的请求注定 401。
+export function wbSuggestedProvider(realm: WbRealm = 'cn'): Provider {
+  const meta = WB_REALMS.find((r) => r.realm === realm) ?? WB_REALMS[0]!
+  const suffix = realm === 'ai' ? '-ai' : ''
   return {
-    providerId: 0, name: 'workbuddy', state: 'active' as const, displayName: 'WorkBuddy（自动发现）',
+    providerId: 0, name: `workbuddy${suffix}`, state: 'active' as const,
+    displayName: `WorkBuddy（自动发现·${meta.label}）`,
     accessKind: 'session-reuse', risk: 'medium',
     riskNote: '复用本机桌面登录态；只走流式；不要并发压测',
     stability: 'beta', api: 'openai-completions',
-    baseUrl: 'https://copilot.tencent.com/v2',
+    baseUrl: `https://${meta.upstream}/v2`,
     credential: { apiKeyEnv: 'WB_TOKEN' },
-    headers: { 'X-Product': 'SaaS', 'X-Domain': 'copilot.tencent.com' },
-    // WorkBuddy 上游对非流式直接回 404 Route Not Found（实测）。
+    // 使用端（上游用量页的「使用端」列）归因头。
+    //
+    // 这组头的**唯一作用**是让上游把请求归因成 WorkBuddy 客户端，从而在用量页
+    // 的「使用端」列显示 `WorkBuddy` 而不是 `-`。用户明确要求这一列有显示。
+    //
+    // ⚠️ 已证实：**这组头不影响计费。** 实测三组对照（同一账号）：
+    //     WorkBuddy 头 + hy4-preview        → credit 8.60（扣）
+    //     WorkBuddy 头 + deepseek-v4.1-flash → credit 0（不扣）
+    //     SaaS 头      + deepseek-v4.1-flash → credit 0（不扣）
+    //   唯一决定扣费的是**模型档位**，与头的值无关。
+    //
+    // ⚠️ 另注：客户端 app.asar 的真实逻辑是 X-Product = deploymentType
+    //   （本机 = "SaaS"，缺省才是 SaaS）。所以严格说这里发的是「为了归因显示」
+    //   而非「与官方客户端逐字一致」的值 —— 这是**刻意的、已知的偏离**，
+    //   因为用户要的是用量页那列有显示，且已验证它不改变计费。
+    //   若将来上游按 X-Product 收紧校验导致 4xx，第一嫌疑就是这里。
+    headers: { ...wbAuxEndpointIdentityHeaders(), 'X-Domain': meta.upstream },
+    // WorkBuddy 上游对非流式直接回 404 Route Not Found（实测）。国内版/海外版皆然。
     // 声明它，非流式调用才能命中 proxy 里那段「只支持流式」的专门提示，
     // 而不是让用户照着「没有声明模型」去核对模型列表（永远查不出所以然）。
     streamOnly: true,
@@ -263,10 +375,13 @@ function wbSuggestedProvider(): Provider {
 
 // 逐个试候选路径，首个有效文件即返回（ok=true 表示找到登录态文件，
 // 可用性看 status：ready 才可用，expired/unknown 仅表示文件存在）。
-export function checkWorkBuddy(paths: string[]): Checked {
+// realm：只检查该版本的候选（未指定 = 不限，取首个命中的）。多版本场景下由
+// checkWorkBuddyWithAccounts 分版本各调一次，避免「先命中的那个版本吃掉全部账号」。
+export function checkWorkBuddy(paths: string[], realm?: WbRealm): Checked {
   const base: Finding = {
-    key: 'workbuddy', harness: 'WorkBuddy / CodeBuddy',
-    suggestedProvider: wbSuggestedProvider(),
+    key: realm === 'ai' ? 'workbuddy-ai' : 'workbuddy',
+    harness: realm === 'ai' ? 'WorkBuddy 海外版 / CodeBuddy' : 'WorkBuddy 国内版 / CodeBuddy',
+    suggestedProvider: wbSuggestedProvider(realm ?? 'cn'),
   }
   for (const path of paths) {
     let raw: string
@@ -277,15 +392,22 @@ export function checkWorkBuddy(paths: string[]): Checked {
     }
     const f = parseAuthFile(raw)
     if (!f || !f.auth?.accessToken) continue
+    // 版本过滤：文件内容认出的版本与要求的版本不符就跳过。
+    // 认不出（旧客户端没写 domain 且 token 不是 JWT）时放行——总比整个漏掉强。
+    const fileRealm = detectRealmFromAuth(raw)
+    if (realm && fileRealm && fileRealm !== realm) continue
     const exp = jwtExpiry(f.auth.accessToken)
     const nick = f.account?.nickname?.trim() || '未知用户'
-    base.detail = `${nick} · ${f.account?.type ?? ''} · ${path}`
+    const realmNote = fileRealm ? WB_REALMS.find((r) => r.realm === fileRealm)!.label : '版本未知'
+    base.detail = `${nick} · ${f.account?.type ?? ''} · ${realmNote} · ${path}`
     base.actions = [
       `export WB_TOKEN=$(python3 -c "import json;print(json.load(open('${path}'))['auth']['accessToken'])")`,
       '然后在发现页点「采用」，或确认 WB_TOKEN 后重试',
     ]
     // 多账号发现：客户端切号会把旧登录态另存为带时间戳的副本，同机多账号天然共存。
+    // 只列**同版本**的账号：跨版本的 token 不通用，混列会诱导用户把它们导进同一个 Provider。
     const accts = discoverWorkBuddyAccounts(dirname(path))
+      .filter((a) => !realm || !a.realm || a.realm === realm)
     if (accts.length > 0) {
       base.suggestedAccounts = accts
       if (accts.length > 1) {
@@ -309,32 +431,58 @@ export function checkWorkBuddy(paths: string[]): Checked {
     base.detail += ` · ${shortID(f.account?.uid ?? '')} · 剩余约 ${Math.round((exp.getTime() - Date.now()) / 3600_000)}h`
     return { finding: base, ok: true }
   }
-  return { finding: { key: 'workbuddy', harness: 'WorkBuddy / CodeBuddy', status: 'missing' }, ok: false }
+  return {
+    finding: {
+      key: realm === 'ai' ? 'workbuddy-ai' : 'workbuddy',
+      harness: realm === 'ai' ? 'WorkBuddy 海外版 / CodeBuddy' : 'WorkBuddy 国内版 / CodeBuddy',
+      status: 'missing',
+    },
+    ok: false,
+  }
 }
 
-// 多账号版：文件候选定位当前登录态，目录候选补扫全部共存登录态。
-// fallbackRoots 非空时启用智能兜底：候选路径 + 目录全 miss 才按文件名递归找
-// （见 searchWorkBuddyAuthFiles）。命中后把真实路径回显，用户能直接照着配环境变量。
-export function checkWorkBuddyWithAccounts(
+// 多版本版：分别按国内版 / 海外版各检查一次，两个版本各自成 finding。
+//
+// 为什么必须分开而不是「一个 finding 列全部账号」：两个版本的 token 认证域不同、
+// 互不通用，账号池又按 providerId 归属——混在一个 finding 里，用户「采用」时的
+// 草稿只能有一个 baseUrl，另一个版本的账号注定全部 401。
+// 分开之后：每个版本一个 finding、一个 Provider 草稿、一份只含同版本账号的账号列表。
+//
+// fallbackRoots 非空时启用智能兜底（候选路径 + 目录全 miss 才按文件名递归找），
+// 见 searchWorkBuddyAuthFiles。命中后把真实路径回显，用户能直接照着配环境变量。
+export function checkWorkBuddyRealms(
   paths: string[], authDirs: string[], fallbackRoots: string[] = [],
+): Checked[] {
+  const out: Checked[] = []
+  for (const meta of WB_REALMS) {
+    out.push(checkWorkBuddyRealm(meta.realm, paths, authDirs, fallbackRoots))
+  }
+  return out
+}
+
+// 单个版本的检查（含智能兜底）。paths/authDirs 是所有版本的候选合集，
+// 这里按版本过滤：路径名后缀能先筛一轮，文件内容再由 checkWorkBuddy 按 realm 复核。
+function checkWorkBuddyRealm(
+  realm: WbRealm, paths: string[], authDirs: string[], fallbackRoots: string[],
 ): Checked {
-  let { finding: f, ok } = checkWorkBuddy(paths)
-  // 智能兜底：候选全 miss（含“文件不存在”与“都是坏文件”）时才递归；找到即当候选重跑。
-  // 注意是「目录候选也没扫出账号」才兜底——目录扫出来说明路径表已经对了。
-  // 另外 expired 也兜一次：主候选可能是个过期旧文件，而真正在用的登录态在
-  // 路径表没覆盖的目录（多账号/换过安装位置），此时直接报 expired 会误导用户去重新登录。
-  const worthFallback = !ok || f.status === 'expired'
-  if (worthFallback && !hasAccounts(authDirs)) {
+  // 优先只看该版本的候选文件；一个都没有（env 覆盖成单文件等情形）时退回全集，
+  // 让 checkWorkBuddy 按文件内容判定——否则自定义路径下会恒报 missing。
+  const fname = wbAuthFileName(realm)
+  const own = paths.filter((p) => p.endsWith(fname))
+  const usePaths = own.length > 0 ? own : paths
+  let { finding: f, ok } = checkWorkBuddy(usePaths, realm)
+
+  // 智能兜底：仅当**该版本**没有任何账号被发现时才递归找。
+  // 注意不能拿「目录候选里有没有账号」当门槛——另一个版本的文件就在同一个目录里，
+  // 那样会让本版本永远不做兜底（目录扫出来的账号都属于对方）。
+  if (!ok && fallbackRoots.length > 0) {
     const found = searchWorkBuddyAuthFiles(fallbackRoots)
+      .filter((p) => p.endsWith(fname) || detectRealmFromFile(p) === realm)
     if (found.length > 0) {
-      const r = checkWorkBuddy(found)
-      // 只在兜底结果确实更好时才采用它：
-      //   原本没有登录态（!ok）→ 兜底找到任何可用文件都算改进；
-      //   原本是 expired     → 只有兜底拿到 ready 才算改进（否则原文案更贴近主候选）。
-      const better = r.ok && (!ok || r.finding.status === 'ready')
-      if (better) {
+      const r = checkWorkBuddy(found, realm)
+      if (r.ok) {
         f = r.finding
-        f.detail = (f.detail ?? '') + ` · 智能兜底定位（配置里没登记的路径）`
+        f.detail = (f.detail ?? '') + ' · 智能兜底定位（配置里没登记的路径）'
         f.actions = [
           `建议把登录态目录加进 CODEBUDDY_DESKTOP_AUTH_DIR，避免每次全盘扫描`,
           ...(f.actions ?? []),
@@ -343,9 +491,11 @@ export function checkWorkBuddyWithAccounts(
       }
     }
   }
+
+  // 账号列表只收同版本：跨版本的 token 不通用，混列会诱导用户导进同一个 Provider。
   if (!ok || !f.suggestedAccounts) {
     for (const d of authDirs) {
-      const accts = discoverWorkBuddyAccounts(d)
+      const accts = discoverWorkBuddyAccounts(d).filter((a) => a.realm === realm)
       if (accts.length > 0) {
         f.suggestedAccounts = accts
         if (accts.length > 1) {
@@ -359,12 +509,20 @@ export function checkWorkBuddyWithAccounts(
   return { finding: f, ok }
 }
 
-// 目录候选里是否已有可读登录态（决定要不要走智能兜底）。
-function hasAccounts(dirs: string[]): boolean {
-  for (const d of dirs) {
-    if (discoverWorkBuddyAccounts(d).length > 0) return true
+// 读文件内容判版本（兜底筛选用；读不了返回 undefined，交由 checkWorkBuddy 复核）。
+function detectRealmFromFile(path: string): WbRealm | undefined {
+  try {
+    return detectRealmFromAuth(readFileSync(path, 'utf8'))
+  } catch {
+    return undefined
   }
-  return false
+}
+
+// 兼容旧签名的单版本入口（默认国内版）：保留给既有调用方与测试。
+export function checkWorkBuddyWithAccounts(
+  paths: string[], authDirs: string[], fallbackRoots: string[] = [],
+): Checked {
+  return checkWorkBuddyRealm('cn', paths, authDirs, fallbackRoots)
 }
 
 // ---- ZCode（仅装机提示，JWT 不落本地可读存储） ----
@@ -777,10 +935,11 @@ interface Acct extends DiscoveredAccount {
   modified: Date // 文件修改时间（同账号取最新）
   exp: Date | null // token 过期时间（去重平手时比较用）
 }
-
 // 扫描 WorkBuddy 登录态目录，返回全部可读的账号登录态。
 // 同一账号（按 UID）取修改时间最新的一份，不同账号各自成条目。
-// dir 为 auth 文件所在目录；目录不存在/不可读时返回空（尽力而为，不报错）。
+// 目录不存在/不可读时返回空（尽力而为，不报错）。
+// 每个条目带 realm（国内版/海外版）：两个版本的文件共存于同一目录，必须分别标识，
+// 否则上层会把两套互不通用的 token 混进同一个 Provider。
 export function discoverWorkBuddyAccounts(dir: string): DiscoveredAccount[] {
   let names: string[]
   try {
@@ -788,7 +947,10 @@ export function discoverWorkBuddyAccounts(dir: string): DiscoveredAccount[] {
   } catch {
     return []
   }
-  const byUID = new Map<string, Acct>()
+  // 去重键必须含 realm：同一个 UID 在两个版本下是两条独立凭据
+  // （实测 uid 不同，但理论上同一自然人两版各注册一次就会撞上），
+  // 按 realm+uid 分区是唯一安全的做法。
+  const byKey = new Map<string, Acct>()
   for (const name of names) {
     if (!name.startsWith('workbuddy-desktop') || !name.endsWith('.info')) continue
     let raw: string
@@ -799,6 +961,7 @@ export function discoverWorkBuddyAccounts(dir: string): DiscoveredAccount[] {
     }
     const f = parseAuthFile(raw)
     if (!f || !f.auth?.accessToken) continue
+    const realm = detectRealmFromAuth(raw)
     const nick = f.account?.nickname?.trim() || '未知用户'
     let uid = f.account?.uid?.trim() ?? ''
     if (!uid) uid = nick // 无 UID 时按昵称去重
@@ -810,7 +973,8 @@ export function discoverWorkBuddyAccounts(dir: string): DiscoveredAccount[] {
     }
     const exp = jwtExpiry(f.auth.accessToken)
     const alive = exp !== null && Date.now() < exp.getTime()
-    const prev = byUID.get(uid)
+    const key = `${realm ?? '?'}:${uid}`
+    const prev = byKey.get(key)
     if (prev) {
       // 同账号去重：取「更新」的一份。mtime 平手（同秒批量写入很常见）时
       // 比 token 过期时间——那是客户端写快照时的真实业务事实。
@@ -822,13 +986,13 @@ export function discoverWorkBuddyAccounts(dir: string): DiscoveredAccount[] {
         continue
       }
     }
-    byUID.set(uid, {
-      nickname: nick, uid: shortID(uid), type: f.account?.type, alive,
+    byKey.set(key, {
+      nickname: nick, uid: shortID(uid), realm, type: f.account?.type, alive,
       tokenPath: join(dir, name), modified: mod, exp,
       expiresAt: exp ? fmtLocal(exp) : undefined,
     })
   }
-  const out = [...byUID.values()]
+  const out = [...byKey.values()]
   out.sort((x, y) => {
     if (x.alive !== y.alive) return x.alive ? -1 : 1 // 活的排前
     return y.modified.getTime() - x.modified.getTime()
@@ -1014,15 +1178,19 @@ export class Scanner {
 
   private async runScan(): Promise<Finding[]> {
     const out: Finding[] = []
-    const { finding: wb, ok } = checkWorkBuddyWithAccounts(
+    // 国内版 / 海外版各一条 finding：认证域不同、账号不通用，必须分开采用。
+    const wbResults = checkWorkBuddyRealms(
       this.cfg.workBuddyPaths ?? [], this.wbDirs, this.cfg.workBuddyFallbackRoots ?? [])
-    if (ok) {
-      out.push(wb)
-    } else {
-      wb.status = 'missing'
-      wb.detail = '未发现桌面登录态'
-      wb.actions = ['登录 WorkBuddy 桌面端后重扫']
-      out.push(wb)
+    for (const { finding: wb, ok } of wbResults) {
+      if (ok) {
+        out.push(wb)
+      } else {
+        const label = wb.key === 'workbuddy-ai' ? '海外版' : '国内版'
+        wb.status = 'missing'
+        wb.detail = `未发现${label}桌面登录态`
+        wb.actions = [`登录 WorkBuddy ${label}桌面端后重扫`]
+        out.push(wb)
+      }
     }
     out.push(checkZCode(this.cfg.zCodeDirs ?? []))
     // 指纹自动识别：从本机 opencode 日志读真实 UA/会话（用户无需手抄任何东西）。

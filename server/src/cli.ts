@@ -17,7 +17,7 @@ import type { Account, Provider } from './model/index.ts'
 import { Store as UsageStore } from './usage/store.ts'
 import {
   SQLiteEgressStore, SQLiteProviderStore, SQLiteAccountStore,
-  seedProvidersIfEmpty, seedAccountsIfEmpty,
+  seedProvidersIfEmpty, seedAccountsIfEmpty, migrateWorkBuddyAttributionHeaders,
 } from './adminapi/store.ts'
 import { createAdminApi } from './adminapi/api.ts'
 import type { Finding } from './adminapi/types.ts'
@@ -189,6 +189,12 @@ export async function runServe(args: string[]): Promise<void> {
   px.setAccountPool(acctPool)
 
   seedProvidersIfEmpty(providers, cfg.providers)
+  // WorkBuddy 使用端归因头迁移（存量修复）：模板只影响新建，已入库的行要在这里补，
+  // 否则管理台改好的头一重启就没了。见 store 里该函数的注释。
+  {
+    const n = migrateWorkBuddyAttributionHeaders(providers)
+    if (n > 0) console.log(`WorkBuddy 归因头迁移：${n} 个 Provider 已补使用端归因头（用量页「使用端」列将显示 WorkBuddy）`)
+  }
   // 账号归属解析：YAML 里写的是 Provider 名，落库要的是数字 providerId。
   // 必须在 provider 入库（拿到自增 id）之后做。
   {
@@ -220,7 +226,10 @@ export async function runServe(args: string[]): Promise<void> {
   const wbProfile = wbGoos === 'windows' ? (process.env.USERPROFILE || wbHome) : wbHome
   const wbModelDirs = workBuddyDataDirs(wbGoos, wbHome, wbProfile)
   const probe = new Probe(sched, up, usageStore, acctPool,
-    (providerName) => providerName === 'workbuddy'
+    // 两个发行版（workbuddy / workbuddy-ai）共用同一份本机模型痕迹：
+    // 痕迹是从客户端数据目录扫出来的「这台机器用过的模型」，不区分版本文件。
+    // 只认 'workbuddy' 会让海外版 Provider 恒无模型目录（勾不到任何模型 → 调用 404）。
+    (providerName) => providerName === 'workbuddy' || providerName === 'workbuddy-ai'
       ? discoverWorkBuddyModelsFrom(wbModelDirs)
       : [])
 
@@ -536,12 +545,24 @@ async function runZCode(args: string[]): Promise<void> {
         fatal(e as Error) // 显式指定的 egress 不存在/不支持：点名报错，不静默换出口
       }
       console.log(`下载走代理: ${maskProxyURI(dl.proxyURI)}（来源 ${dl.source}）`)
+      // 终端也要能看见进度：87MB 在弱网下会被反复掐断，续传时进度必须
+      // 一路往上走。只打「安装中…」的话，用户分不清是在续传还是已经死了。
+      let lastLine = 0
+      const onProgress = (p: { phase: string; received: number; total: number }): void => {
+        const now = Date.now()
+        if (now - lastLine < 2000 && p.phase === 'downloading') return
+        lastLine = now
+        if (p.phase !== 'downloading') { console.log(`  ${p.phase}…`); return }
+        const mb = (n: number): string => (n / 1048576).toFixed(1)
+        const pct = p.total > 0 ? ` ${Math.round((p.received / p.total) * 100)}%` : ''
+        console.log(`  下载中${pct} ${mb(p.received)}/${mb(p.total)} MB（断线会自动续传）`)
+      }
       if (action === 'install') {
-        const p = await sc.install(args.includes('--force'), { fetch: dl.fetch })
+        const p = await sc.install(args.includes('--force'), { fetch: dl.fetch, onProgress })
         console.log('已安装:', p)
         return
       }
-      await sc.ensureReady(sc.workDir, { fetch: dl.fetch })
+      await sc.ensureReady(sc.workDir, { fetch: dl.fetch, onProgress })
       console.log('sidecar 就绪:', await sc.status())
       console.log('网关凭据:', sc.credKey)
       return

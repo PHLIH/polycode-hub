@@ -5,7 +5,7 @@
 
 import { readFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { join, normalize, sep } from 'node:path'
+import { normalize, posix } from 'node:path'
 import { writeFile0600 } from './credential_file.ts'
 import { ERR } from '../ir/index.ts'
 import { providerValidate, type Account, type Provider } from '../model/index.ts'
@@ -39,8 +39,16 @@ function field(o: Record<string, unknown>, k: string): string {
 
 // credentialFile 校验：Clean 后必须仍带 config/credentials/ 前缀
 // （穿越路径、绝对路径、目录本身一律拒绝）。
+//
+// 分隔符必须归一后再比：normalize 在 Windows 上把 `/` 换成 `\`，而前缀若是
+// `'config/credentials' + sep`（= `config/credentials\`），`config\credentials\c`
+// 就永远 startsWith 不上——Windows 上这个函数**恒返回 false**，
+// 于是「导入账号池」单账号端点每次都回 400「必须位于 config/credentials/ 目录下」，
+// 而前端传的正是 `config/credentials/xxx-jwt`（正斜杠）。两条路径的凭据写法就此
+// 一个能进一个不能进。统一按正斜杠比较，两个平台一致。
 export function credentialPathOK(p: string): boolean {
-  return normalize(p).startsWith('config/credentials' + sep)
+  const norm = normalize(p).replace(/\\/g, '/')
+  return norm.startsWith('config/credentials/')
 }
 
 // 读登录态文件并取出 accessToken。
@@ -130,7 +138,7 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     // 与 quick-import 共用同一段逻辑，避免两条路径的凭据处理再次漂移。
     const warnings = applyCredentialDefaults(p)
     const { warnings: importWarnings, imported } =
-      importSuggestedAccounts(key, found.suggestedAccounts, p.providerId)
+      importSuggestedAccounts(key, found.suggestedAccounts, p.providerId, p.name)
     warnings.push(...importWarnings)
     if (imported > 0) changed()
     // 与 quick-import 同样自动补全模型目录（两条路径行为必须一致，
@@ -181,6 +189,9 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
       return errRes(c, 400, ERR.INVALID_REQUEST,
         `还没有接管 ${key} 的 Provider，先「一键导入」采用它，再导账号`)
     }
+    // 版本守卫：登录态版本必须与归属 Provider 一致（跨版本 token 互不通用）。
+    const mismatch = realmMismatch(key, owner, acct0.realm)
+    if (mismatch) return errRes(c, 400, ERR.INVALID_REQUEST, mismatch)
     // 服务端读 token → 写凭据文件（0600）→ 建 account（只存文件引用）。
     // workbuddy 单账号导入同样打来源标记，否则账号页的「签到」（自动登录）按钮
     // 永不显示——该按钮只认 importSource === 'workbuddy'（见 api.ts checkin）。
@@ -253,7 +264,7 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     // ③ 全量导入共存登录态（只导扫描结果里、活着的；按 token 内容去重；
     //    tokenPath 来自本次扫描结果，不收前端路径）。
     const { warnings: importWarnings, imported, skipped } =
-      importSuggestedAccounts(key, found.suggestedAccounts, p.providerId)
+      importSuggestedAccounts(key, found.suggestedAccounts, p.providerId, p.name)
     if (imported > 0) changed()
     warnings.push(...importWarnings)
 
@@ -318,7 +329,7 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
   function applyCredentialDefaults(p: Provider): string[] {
     const warnings: string[] = []
     if (p.credential.apiKeyEnv === 'ZEN_KEY' && !process.env.ZEN_KEY) {
-      const cred = join('config', 'credentials', 'zen-key')
+      const cred = posix.join('config', 'credentials', 'zen-key')
       try {
         writeFile0600(cred, 'public')
         p.credential = { apiKeyFile: cred }
@@ -334,14 +345,26 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
 
   // 把本次扫描到的共存登录态导入账号池（adopt 与 quick-import 共用）。
   // 只导活着的；tokenPath 一律取自扫描结果，不收前端传入的路径。
+  // ownerName：目标 Provider 名，用于版本守卫（账号版本必须与 Provider 版本一致）。
   function importSuggestedAccounts(
     key: string, suggested: DiscoveredAccount[] | undefined, ownerId: number,
+    ownerName = '',
   ): { warnings: string[]; imported: number; skipped: number } {
     const warnings: string[] = []
     let imported = 0
     let skipped = 0
     for (const acc of suggested ?? []) {
       if (!acc.alive) continue
+      // 版本守卫：账号版本与目标 Provider 不符时跳过并说明，绝不让它入池。
+      // 入池后再发现就已经晚了——它会被轮询到，请求才 401（见 realmMismatch 注释）。
+      if (ownerName !== '' && acc.realm) {
+        const wantName = wbProviderNameOf(acc.realm)
+        if (key.startsWith('workbuddy') && ownerName !== wantName) {
+          const label = acc.realm === 'ai' ? '海外版' : '国内版'
+          warnings.push(`${acc.nickname}：跳过（登录态是${label}，与 Provider「${ownerName}」版本不符，不能入池）`)
+          continue
+        }
+      }
       let sess: { token: string; uid?: string }
       try {
         sess = readSession(acc.tokenPath)
@@ -366,7 +389,7 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
             refreshed = true
           } catch { /* 写失败就保留原凭据 */ }
         } else if (!same.credential.apiKeyEnv) {
-          const f = join('config', 'credentials', `${same.id}-jwt`)
+          const f = posix.join('config', 'credentials', `${same.id}-jwt`)
           try {
             writeFile0600(f, tok)
             same.credential = { apiKeyFile: f }
@@ -389,7 +412,7 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
           break
         }
       }
-      const credFile = join('config', 'credentials', `${id}-jwt`)
+      const credFile = posix.join('config', 'credentials', `${id}-jwt`)
       try {
         writeFile0600(credFile, tok)
       } catch (e) {
@@ -409,12 +432,38 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
   }
 
   // harness key → 已接管它的 Provider（未删除）。discover 的 key 是 harness 名
-  // （workbuddy / opencode-zen），而账号归属要的是 Provider.providerId。
+  // （workbuddy / workbuddy-ai / opencode-zen），而账号归属要的是 Provider.providerId。
   function providerOfFinding(key: string, suggested?: Provider): Provider | undefined {
     const byName = suggested ? providers.getByName(suggested.name) : undefined
     if (byName && byName.state !== 'deleted') return byName
     const hit = providers.getByName(key)
     return hit && hit.state !== 'deleted' ? hit : undefined
+  }
+
+  // WorkBuddy 版本的 Provider 名（国内版 = workbuddy，海外版 = workbuddy-ai）。
+  // 只认这两个定名，不做前缀模糊匹配——`workbuddy-ai` 会被 `workbuddy` 前缀吞掉。
+  function wbProviderNameOf(realm: 'cn' | 'ai'): string {
+    return realm === 'ai' ? 'workbuddy-ai' : 'workbuddy'
+  }
+
+  // 版本一致性守卫：账号所属版本必须与目标 Provider 的版本一致。
+  //
+  // 为什么必须有这道闸：两个版本的 token 认证域不同、互不通用。把海外版的号导进
+  // 国内版 Provider（或反之），账号会以「可用」状态入池、参与轮询，然后每个请求都被
+  // 上游前置网关拦成 401——账号看起来是好的，故障却在转发时才暴露，极难归因
+  // （2026-09-19 实测：海外 token → copilot.tencent.com 回 HTML 401）。宁可导入时拒绝。
+  //
+  // 返回错误文案；通过校验返回 undefined。
+  function realmMismatch(key: string, owner: Provider, realm?: 'cn' | 'ai'): string | undefined {
+    if (!key.startsWith('workbuddy')) return undefined // 非 WorkBuddy 源不适用
+    if (!realm) return undefined // 版本未知（老客户端）：无从校验，放行
+    const want = wbProviderNameOf(realm)
+    if (owner.name === want) return undefined
+    const wantLabel = realm === 'ai' ? '海外版' : '国内版'
+    const gotLabel = owner.name === 'workbuddy-ai' ? '海外版' : '国内版'
+    return `版本不符：该登录态是${wantLabel}（认证域 ${realm === 'ai' ? 'www.workbuddy.ai' : 'copilot.tencent.com'}），`
+      + `而 Provider「${owner.name}」是${gotLabel}。`
+      + `两版 token 互不通用，请先在发现页「一键导入」采用${wantLabel} Provider（${want}）后再导账号`
   }
 
   // 同 Provider 账号池里是否已有这个 token（按凭据文件内容比对；读不了视为不重复）。
@@ -478,7 +527,14 @@ function cloneProvider(p: Provider): Provider {
   return { ...p, models: p.models.map((m) => ({ ...m })), credential: { ...p.credential } }
 }
 
-// 账号池 ID 前缀（沿用既有 workbuddy-N 惯例）。
+// 账号池 ID 前缀（沿用既有 workbuddy-N 惯例；海外版用 workbuddy-ai-N 与国内版分开）。
+//
+// 两侧必须分开编号，不只是好看：账号池按 providerId 归属，但 `findSameIdentity` 用
+// importSource 做判重分区键——如果两版的 importSource 都叫 'workbuddy'，同一个人
+// 在国内版与海外版各有一个号时（UID 命名空间不同、token 也不同），会把它们认成
+// 同一个身份，第二个号导入时被当作「已存在」直接改挂 Provider，海外号就这么丢了。
+// 所以 importSource / key 已经天然区分（workbuddy vs workbuddy-ai），这里让 ID 前缀
+// 跟上同一口径，用户在账号页一眼能看出这个号属于哪一版。
 function shortAccountPrefix(key: string): string {
   return key === 'workbuddy' ? 'workbuddy' : key
 }

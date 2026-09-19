@@ -83,9 +83,19 @@ accounts: []
 
 # WorkBuddy 接入示例（OpenAI 兼容上游；转换层复用通用编解码器，无专用代码；
 # 2026-09-12 已用本机桌面登录态实测打通 hy3-preview）：
+#
+# ⚠ 国内版与海外版是**两条独立通道**，认证域与 token 互不通用，不要混在一个 Provider 里：
+#     国内版：登录态 workbuddy-desktop.info     上游 copilot.tencent.com
+#     海外版：登录态 workbuddy-desktop-ai.info  上游 www.workbuddy.ai
+#   把海外版的 token 打到 copilot.tencent.com 会被前置网关拦成 HTML 401
+#   「Authorization Required」——看起来像账号失效，其实只是域名不对（2026-09-19 实测）。
+#   海外版另有约束：请求首条消息必须是 system prompt，否则回 400 code 11128；
+#   经网关转发时已自动兜住（见 router/upstream.ts ensureWbAiSystemFirst）。
+#   Discover 页会把两版分列成两项，各自「一键导入」成独立 Provider，无需手写下面这段。
+#
 # providers:
 #   - id: "workbuddy-direct"
-#     display_name: "WorkBuddy直连"
+#     display_name: "WorkBuddy直连（国内版）"
 #     access_kind: "session-reuse"   # 复用桌面登录态（风险中，见 NOTICE.md 登记）
 #     risk: "medium"
 #     risk_note: "复用本机 workbuddy-desktop.info 的 accessToken；只走流式（上游不支持非流）；不要并发压测"
@@ -101,6 +111,28 @@ accounts: []
 #     priority: 1
 #     models:
 #       - id: "hy3-preview"          # 免费；另有 deepseek-v3/kimi-k3-1/glm-5.2 等
+#         input: [text]
+#         enabled: true
+#
+#   # 海外版：把上面那份的 base_url / X-Domain 换成 www.workbuddy.ai 即可（两个字段必须同时改，
+#   # X-Domain 与 base_url 的 host 不一致会被上游拒）。
+#   - id: "workbuddy-ai-direct"
+#     display_name: "WorkBuddy直连（海外版）"
+#     access_kind: "session-reuse"
+#     risk: "medium"
+#     risk_note: "复用本机 workbuddy-desktop-ai.info 的 accessToken；只走流式；不要并发压测"
+#     stability: "beta"
+#     api: "openai-completions"
+#     base_url: "https://www.workbuddy.ai/v2"
+#     credential:
+#       api_key_env: "WB_TOKEN_AI"   # 海外版的 token 与国内版不同，单独一个变量
+#     headers:
+#       X-Product: "SaaS"
+#       X-Domain: "www.workbuddy.ai"
+#     enabled: false
+#     priority: 1
+#     models:
+#       - id: "hy3"
 #         input: [text]
 #         enabled: true
 

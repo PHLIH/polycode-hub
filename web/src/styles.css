@@ -111,6 +111,49 @@ html.dark {
 .el-input__inner { color: var(--text); }
 .el-select__placeholder, .el-input__inner::placeholder { color: var(--dim); }
 
+/* ---- 自绘即时提示框（web/src/hintTip.ts 的配套样式）----
+   替代原生 title：浏览器要等约 1 秒才弹，用户要「实时」。
+   放在全局而不是各视图的 scoped 里：Dashboard 与 Accounts 都渲染同一个
+   <div class="heat-tip">，scoped 样式不跨组件，各写一份必然漂移。
+
+   pointer-events:none 是关键 —— 否则框一出现就抢走 mouseleave，
+   目标格收不到离开事件，提示框会闪个不停。
+   定位由 JS 保证：默认贴目标正上方居中，放不下翻到下方/侧边，永不复压目标。 */
+.heat-tip {
+  --tip-bg: var(--panel-2);
+  position: fixed; z-index: 60; pointer-events: none;
+  width: 186px; box-sizing: border-box; padding: 8px 10px;
+  background: var(--tip-bg); border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 50%);
+  font-size: 12px; line-height: 1.7;
+}
+/* 单行提示（占比条）：不锁 186px，按内容收缩——一行字被拉成一大块很难看。
+   只在没有 title（= 非热力图多行框）时生效，热力图那种框宽度保持不变。 */
+.heat-tip.tip-wide { width: auto; white-space: nowrap; }
+/* 指向目标的小箭头：明确「这个框说的是哪一个」。
+   基线一律「箭头在框下方、朝下」，再按实际方位覆盖：below=框在目标下方
+   （箭头朝上），right=框在目标侧边（箭头朝左）。箭头颜色统一取 --tip-bg，
+   与框底色同源，改底色时箭头不会掉队。 */
+.heat-tip::after {
+  content: ''; position: absolute;
+  border: 5px solid transparent;
+  /* 默认：框在目标上方 → 箭头贴框底、朝下 */
+  left: 50%; margin-left: -5px; top: 100%;
+  border-top-color: var(--tip-bg);
+}
+.heat-tip.below::after { /* 框在目标下方 → 箭头贴框顶、朝上 */
+  top: auto; bottom: 100%;
+  border-top-color: transparent; border-bottom-color: var(--tip-bg);
+}
+.heat-tip.right::after { /* 框在目标侧边 → 箭头贴框左、朝左 */
+  left: auto; right: 100%; top: 50%; margin: -5px 0 0 0;
+  border-top-color: transparent; border-right-color: var(--tip-bg);
+}
+.heat-tip-day { font-size: 12px; font-weight: 600; margin-bottom: 4px; }
+.heat-tip-row { display: flex; justify-content: space-between; gap: 14px; color: var(--dim); }
+.heat-tip-row b { color: var(--text); font-weight: 500; }
+.heat-tip-row.bad b { color: var(--bad); }
+
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }

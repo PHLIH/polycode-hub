@@ -8,6 +8,7 @@ import { createRequire } from 'node:module'
 // node:sqlite 经 createRequire 加载（vite-node 不认识该内置模块，见 usage/store.ts）。
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite')
 import type { Account, Model, Provider } from '../model/index.ts'
+import { wbAuxEndpointIdentityHeaders, workBuddyRealmOfBaseUrl } from '../model/index.ts'
 
 export interface ProviderStore {
   list(): Provider[]
@@ -380,6 +381,35 @@ export class SQLiteAccountStore implements AccountStore {
 export function seedProvidersIfEmpty(s: ProviderStore, seed: Provider[]): void {
   if (s.list().length > 0) return
   for (const p of seed) s.put(p)
+}
+
+// 迁移：把已入库的 WorkBuddy Provider 的「使用端归因头」补齐。
+//
+// 为什么需要：seedProvidersIfEmpty 只在**空库**时播种，DB 一旦有行就是唯一真相源。
+// 所以改了 Provider 草稿模板，**对已存在的行毫无影响** —— 重启会把管理台里
+// 手工改过的头打回原样。这是实测踩到的：PATCH 改好后一重启就丢了。
+//
+// 判定按 baseUrl 的 host（workBuddyRealmOfBaseUrl 唯一定义），不看 Provider 名。
+// 只补归因头，**不覆盖其它自定义头**；X-Domain 按版本派生。幂等。
+//
+// ⚠️ 这组头**不影响计费**（见 discover.wbSuggestedProvider 处的三组对照实测）。
+// 它只让上游用量页的「使用端」列显示 WorkBuddy 而非 `-`。
+export function migrateWorkBuddyAttributionHeaders(s: ProviderStore): number {
+  let fixed = 0
+  for (const p of s.list()) {
+    if (p.state === 'deleted') continue
+    const realm = workBuddyRealmOfBaseUrl(p.baseUrl)
+    if (!realm) continue
+    const domain = realm === 'ai' ? 'www.workbuddy.ai' : 'copilot.tencent.com'
+    const want = { ...wbAuxEndpointIdentityHeaders(), 'X-Domain': domain }
+    const cur = p.headers ?? {}
+    // 已全部就位 → 跳过（幂等，避免每次启动写库）。
+    if (Object.entries(want).every(([k, v]) => cur[k] === v)) continue
+    p.headers = { ...cur, ...want }
+    s.put(p)
+    fixed++
+  }
+  return fixed
 }
 
 export function seedAccountsIfEmpty(s: AccountStore, seed: Account[]): void {

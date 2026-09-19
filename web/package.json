@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "element-plus": "^2.8.0",
+    "polycode-hub": "file:..",
     "vue": "^3.4.0"
   },
   "devDependencies": {

@@ -136,15 +136,31 @@
 
 ## 8. 自动发现：本机 harness（仅 3 项）
 
-`Scanner.scan` 恒返回 3 项（`discover/index.ts:457-475`），报告永不含密钥原文（`:3`）：
+`Scanner.scan` 恒返回 4 项（国内版 / 海外版 WorkBuddy + ZCode + Zen），报告永不含密钥原文：
 
 | key | 机制 |
 |---|---|
-| `workbuddy` | 读桌面登录态文件候选路径（三平台路径表 `workBuddySearchPaths:46-70`，`CODEBUDDY_DESKTOP_AUTH_FILE` 可覆盖）：取 `auth.accessToken`，解 JWT exp 判 ready / expired / unknown（`checkWorkBuddy:151-198`）；多账号按目录扫 `workbuddy-desktop*.info` 全部共存登录态，按 UID 去重取最新（`discoverWorkBuddyAccounts:309-362`）。模型无列表接口，正则扫 `traces/**/*.json` 的 `"models"` 字段。 |
-| `zcode` | 仅 `statSync` 安装目录存在即 unknown（`checkZCode:222-239`，`zCodeSearchDirs:87-91`）；登录态无法本地判定，指引走 OAuth。 |
-| `opencode-zen` | 连通探针 `GET {base}/v1/models` 带 `Bearer public`（`checkZen:264-297`），200 即 ready；默认 `https://opencode.ai/zen`。 |
+| `workbuddy` | **WorkBuddy 国内版**。读桌面登录态文件候选路径（三平台路径表 `workBuddySearchPaths`，每目录展开两个版本的文件名，`CODEBUDDY_DESKTOP_AUTH_FILE` 可覆盖）：取 `auth.accessToken`，解 JWT exp 判 ready / expired / unknown（`checkWorkBuddy`）；多账号按目录扫 `workbuddy-desktop*.info` 全部共存登录态，按 **realm+UID** 去重取最新（`discoverWorkBuddyAccounts`）。模型无列表接口，正则扫 `traces/**/*.json` 的 `"models"` 字段。 |
+| `workbuddy-ai` | **WorkBuddy 海外版**。与国内版**同源代码、分开成条**：两版认证域与 token 互不通用（见下「双版本」），必须各自采用成独立 Provider。 |
+| `zcode` | 仅 `statSync` 安装目录存在即 unknown（`checkZCode`，`zCodeSearchDirs`）；登录态无法本地判定，指引走 OAuth。 |
+| `opencode-zen` | 连通探针 `GET {base}/v1/models` 带 `Bearer public`（`checkZen`），200 即 ready；默认 `https://opencode.ai/zen`。 |
 
-一键导入的 Provider 草稿：WorkBuddy（`wb-auto`，openai-completions，`copilot.tencent.com/v2`，`headers X-Product/X-Domain`，模型 `hy3-preview`）与 Zen（`zen-auto`，openai-completions，`zen/v1`，会话头 `x-opencode-session`/`x-opencode-request`（+ 兼容旧 `x-session-id`/`x-session-affinity`），模型 `mimo-v2.5-free` / `nemotron-3-ultra-free`）——见 `discover/index.ts:136-148,243-261`。注意：① `x-opencode-*` 四件套是官方客户端本来就发的（2026-09-18 真机取证；旧“毒头”结论已推翻，见 `router/upstream.ts applyZenFingerprint`），上游 2026-09 起要求 `x-opencode-session`，网关按取证原样发送，会话过期由指纹刷新自动续（`discover/zen_refresh.ts`：转发失败自愈重试 + 启动刷新 + 管理台手动刷新；本地无新鲜会话如实返回重登指引）；② UA 网关不内置版本号（通用项目不写死个人环境版本）：opencode 做客户端时透传它的真 UA，其他客户端配 Provider 静态头或 `ZEN_UA` 环境变量，优先级 静态 > 透传 > `ZEN_UA`，全无则如实不发。
+### WorkBuddy 双版本（国内版 / 海外版，2026-09-19 真机实测）
+
+桌面端两个发行版的**登录态文件、认证域、上游都不同，token 互不通用**：
+
+| 版本 | 登录态文件 | realm（JWT `iss` / `auth.domain`） | 上游 | 额外约束 |
+|---|---|---|---|---|
+| 国内版 | `workbuddy-desktop.info` | `www.workbuddy.cn` | `copilot.tencent.com/v2` | 无 |
+| 海外版 | `workbuddy-desktop-ai.info` | `www.workbuddy.ai` | `www.workbuddy.ai/v2` | **首条消息必须是 system prompt** |
+
+- **realm 判定**（`detectRealmFromAuth`）：优先读 `auth.domain`，回落 JWT `iss`；两者都认不出时返回 `undefined`——**绝不默认成国内版**（默认成 cn 正是把海外号打错域的根因）。
+- **认证域由 realm 派生**（`wbSuggestedProvider(realm)`）：`baseUrl` / `X-Domain` 按版本生成，Provider 名分开（`workbuddy` / `workbuddy-ai`）。把海外版 token 打到 `copilot.tencent.com` 会被前置 APISIX 拦成 HTML 401「Authorization Required」——看起来像账号失效，实际只是域名不对。
+- **账号池按版本隔离**：`importSource` 是判重分区键（`workbuddy` vs `workbuddy-ai`），两版的号互不认、各自编号（`workbuddy-N` / `workbuddy-ai-N`）。导入时 `realmMismatch` 守卫拒绝跨版本入池（入池后才发现就晚了——它会被轮询到，请求才 401）。
+- **海外版 system 打头**：由 `ensureWbAiSystemFirst` 在转发侧兜住（缺则补一句最小中立 system；客户端已有则一字不改）。国内版无此约束，**不得**对它注入——判定按 host（`isWorkBuddyAiBaseUrl`）。
+- **签到仅国内版**：`POST /accounts/:id/checkin` 打的是 `copilot.tencent.com/billing/meter/daily-checkin`，只认 `importSource === 'workbuddy'`，海外版账号不显示该按钮。
+
+一键导入的 Provider 草稿：WorkBuddy **按版本两份**（国内版 `workbuddy` → `copilot.tencent.com/v2`；海外版 `workbuddy-ai` → `www.workbuddy.ai/v2`，均为 openai-completions，`headers X-Product/X-Domain` 随版本派生，模型目录留空由导入时扫描补全）与 Zen（`zen-auto`，openai-completions，`zen/v1`，会话头 `x-opencode-session`/`x-opencode-request`（+ 兼容旧 `x-session-id`/`x-session-affinity`），模型 `mimo-v2.5-free` / `nemotron-3-ultra-free`）——见 `discover/index.ts wbSuggestedProvider`。注意：① `x-opencode-*` 四件套是官方客户端本来就发的（2026-09-18 真机取证；旧“毒头”结论已推翻，见 `router/upstream.ts applyZenFingerprint`），上游 2026-09 起要求 `x-opencode-session`，网关按取证原样发送，会话过期由指纹刷新自动续（`discover/zen_refresh.ts`：转发失败自愈重试 + 启动刷新 + 管理台手动刷新；本地无新鲜会话如实返回重登指引）；② UA 网关不内置版本号（通用项目不写死个人环境版本）：opencode 做客户端时透传它的真 UA，其他客户端配 Provider 静态头或 `ZEN_UA` 环境变量，优先级 静态 > 透传 > `ZEN_UA`，全无则如实不发。
 
 ### 免费档限流口径：按**会话**而非 IP（2026-09-18 实测修正）
 
@@ -182,9 +198,18 @@ SQLite 持久化（`usage/store.ts`，schema v2，`user_version` 前向迁移，
 合规边界：上游工具无 LICENSE（默认保留所有权利），本项目不分发、不捆绑、不复制其代码——只做“下载官方 release → 生成安全配置 → 进程管理”（`sidecar/sidecar.ts:1-6`）。
 
 - `Sidecar` 句柄（`sidecar.ts:111-127`）：二进制缺省 `~/.polycode-hub/bin`，数据 `~/.zcode-proxy`，网关侧凭据引用 `config/credentials/zcode-proxy-key`（`cli.ts:137`），端口缺省 8080，工作目录 `config/zcode-proxy`（`cli.ts:138`）。
-- 真实功能：`install [--force]`（下载 GitHub release `TriDefender/zcode-api`，按平台选资产名，已存在跳过，`:132-160`）；`setupConfig`（写 127.0.0.1 + 24 字节 hex 随机 `sk-local-` key + start-plan，凭据 0600 落盘，`:167-188`）；`setPort/loadPort`（改/恢复 config.yaml port 行，端口 1024-65535，`:196-218`）；`start`（分离进程，日志 `logs/sidecar.log`，45s 探活，`:222-238`）；`stop`（按进程名 kill，`:256-270`）；`running`（打 `127.0.0.1:port/health` 带 key，`:274-288`）；`status`（running/installed/stopped/not installed）；`login`（仅交互提示并 spawn 二进制 `auth login zai`，不代持，`:315-331`）；`ensureReady`（装→配→起，下载重试 3 次）；`uninstall`（删二进制+key+config，运行时拒绝）。
+- 真实功能：`install [--force]`（下载 GitHub release `TriDefender/zcode-api`，按平台选资产名，已存在跳过，`:132-160`）；`setupConfig`（写 127.0.0.1 + 24 字节 hex 随机 `sk-local-` key + start-plan，凭据 0600 落盘，`:167-188`）；`setPort/loadPort`（改/恢复 config.yaml port 行，端口 1024-65535，`:196-218`）；`start`（分离进程，日志 `logs/sidecar.log`，45s 探活，`:222-238`）；`stop`（按进程名 kill，`:256-270`）；`running`（打 `127.0.0.1:port/health` 带 key，`:274-288`）；`status`（running/installed/stopped/not installed）；`login`（仅交互提示并 spawn 二进制 `auth login zai`，不代持，`:315-331`）；`ensureReady`（装→配→起，下载断点续传+重试上限 60 次）；`uninstall`（删二进制+key+config，运行时拒绝）。
 - HTTP 仅 `POST /:action=start|stop|setup|uninstall|ensure|port|endpoint` + `GET /` 状态（`sidecar_app.ts:44-64`）；`install / login` 走 CLI 不进 HTTP（`:60-61,169-171` 明示）；`endpoint` 只改 Provider baseUrl 且仅回环 host（`:133-168`）。
-- **下载代理（复用项目 egress 配置，不写死地址）**：release 查询与二进制下载都走 `resolveSidecarDownloadFetch`（`sidecar/httpproxy.ts`）决议出的 fetch，优先级：`--proxy` 显式值 → 显式 `--egress <id>` / `?egress=<id>`（不存在或不支持**点名抛错**，不静默换出口）→ Provider `zcode-plan-local` 的 `egress` 引用（脏引用 lenient 跳过）→ egress 表**仅一项时自动采用**（多个不猜，避免送错出口）→ `HTTPS_PROXY`/`ALL_PROXY` 环境变量 → darwin 系统代理（`scutil --proxy`）→ 直连。只认 http/https（ProxyAgent 不支持 socks5，Clash 混合端口用其 http 端口）。
+- **下载代理（复用项目 egress 配置，不写死地址）**：release 查询与二进制下载都走 `resolveSidecarDownloadFetch`（`sidecar/httpproxy.ts`）决议出的 fetch，优先级：`--proxy` 显式值 → 显式 `--egress <id>` / `?egress=<id>`（不存在或不支持**点名抛错**，不静默换出口）→ Provider `zcode-plan-local` 的 `egress` 引用（脏引用 lenient 跳过）→ egress 表**仅一项时自动采用**（多个不猜，避免送错出口）→ `HTTPS_PROXY`/`ALL_PROXY` 环境变量 → **系统代理** → 直连。只认 http/https（ProxyAgent 不支持 socks5，Clash 混合端口用其 http 端口；命中 socks5 时**明确告警**并说明回落直连，不静默）。
+  - 系统代理：darwin 读 `scutil --proxy`；**windows 读注册表 `HKCU\…\Internet Settings` 的 `ProxyEnable`+`ProxyServer`**（`readWinSystemProxy` / `parseWinProxySetting`，认 `http=…;https=…;socks=…` 分协议形态与单值 `host:port` 两种写法，https 优先）。
+  - Windows 这段是后补的**真实缺陷**：早先只有 darwin 分支，而 Windows 进程环境里通常没有 `HTTPS_PROXY`，于是代码判定「直连」——同一台 Clash、同一个网络下表现为「macOS 装得上、Windows 永远装不上」。实测（2026-09-19）本机 `ProxyEnable=1`、`ProxyServer=http=127.0.0.1:7897;https=127.0.0.1:7897;socks=127.0.0.1:7897`，旧代码完全没用上。
+- **下载断点续传（`install` 内）**：87MB 的 Windows 产物实测在弱网/代理下约 20 秒就被 `ECONNRESET` 掐断一次。旧实现每次重试都从 0 重下，进度条永远爬不到头。
+  - 已收到的字节**边收边写 `<dest>.part`**，断线后带 `Range: bytes=<已收>-` 续传（实测 GitHub release 资产支持 Range：206 + `accept-ranges: bytes`）。
+  - 服务端若不认 Range 而回 200，必须**截断重写**——追加会把两遍数据拼成错位文件。
+  - 重试上限 60 次仅作防死循环兜底；4xx（资产被删 404 / 被限流 403）**立即失败不重试**。
+  - `Content-Range` 参与总数换算：续传时 `Content-Length` 只是剩余长度，拿它当总数会画出「快满了其实才一半」的假百分比。
+  - 摘要不符、`allowUntrusted=false`、`uninstall` 三处都会清掉 `.part`，避免下次从一段来路不明的数据中间接着写。
+  - `ensureReady` 不再自套「重试 3 次」的外层循环：那层循环会让每次重进 `install` 都丢掉续传成果，正是「永远装不完」的由来。
   - 管理面 `GET /` 与 `ensure` 回执都带 `downloadProxy`（**脱敏**，密码位打码）/`downloadProxySource`；`ensure` 失败时把「走了哪个代理 + 来源」写进错误信息——首次要下 ~66MB，直连卡住时不能再只给一个转圈的「安装中…」。
   - 代理实现复用已有依赖 `undici` 的 `ProxyAgent`（与转发面同源，不新增依赖）；CLI 侧不再用 `setGlobalDispatcher` 全局污染（那是进程级副作用，改为按次注入 fetch）。
   - 实测（2026-09-18，本机 egress `clash`=127.0.0.1:7897）：release `v4.6.7` / `zcode-proxy-darwin-arm64` 63.4MB 经代理下载成功，约 1.0 MB/s。修复前管理台 `ensure` 走全局 fetch 直连，同一网络下必然长时间卡住。

@@ -214,6 +214,10 @@ describe('SQLite 存储（admin.db 两表 + 内存实现）', () => {
     expect(acct.providerId).toBe(pid) // 关键：解析成了真实 id，而不是 -1
     expect(acct.providerId).toBeGreaterThan(0)
     expect((acct as unknown as Record<string, unknown>).sourceId).toBeUndefined() // 老字段已清
+    // 必须关掉：SQLite 句柄不释放的话，afterAll 的 rmSync 在 Windows 上会
+    // EBUSY（Windows 不允许删除仍被打开的文件；POSIX 可以，所以这里只有
+    // Windows 会暴露）。8 个用例全过、整个文件却判失败，就是这种收尾泄漏。
+    ps.close(); as.close()
   })
 })
 

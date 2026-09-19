@@ -376,6 +376,123 @@ export function isZenBaseUrl(baseUrl: string): boolean {
   }
 }
 
+// 是否 WorkBuddy **海外版**上游（www.workbuddy.ai）。
+//
+// 海外版与国内版（copilot.tencent.com）是两套独立后端，除了认证域不同，
+// 请求约束也不同：海外版要求 messages 首条必须是 system prompt，
+// 否则回 400 code 11128「first message is not system prompt」；
+// 国内版无此要求（2026-09-19 实测双版本交叉验证）。
+// 所以这条适配只能按 host 判定，不能对所有 WorkBuddy 上游一刀切。
+export function isWorkBuddyAiBaseUrl(baseUrl: string): boolean {
+  try {
+    const h = new URL(baseUrl).hostname.toLowerCase()
+    return h === 'workbuddy.ai' || h.endsWith('.workbuddy.ai')
+  } catch {
+    return false
+  }
+}
+
+// 上游 base_url → WorkBuddy 版本。非 WorkBuddy 上游返回 undefined。
+// 与发现层的 realmFromIssuer 同口径（域后缀判定），供账号-Provider 一致性校验复用。
+export function workBuddyRealmOfBaseUrl(baseUrl: string): 'cn' | 'ai' | undefined {
+  let h: string
+  try {
+    h = new URL(baseUrl).hostname.toLowerCase()
+  } catch {
+    return undefined
+  }
+  if (h === 'workbuddy.ai' || h.endsWith('.workbuddy.ai')) return 'ai'
+  if (h === 'copilot.tencent.com' || h.endsWith('.workbuddy.cn')) return 'cn'
+  return undefined
+}
+
+// 认证域 / issuer 字符串 → WorkBuddy 版本（**唯一定义**，发现层与账号校验都指这里）。
+//
+// 按域后缀匹配，同时容得下裸域与完整 issuer URL
+// （www.workbuddy.ai 与 https://www.workbuddy.ai/auth/realms/copilot 都命中 ai）。
+// 只认已知域，认不出返回 undefined —— **绝不默认成国内版**：
+// 默认成 cn 正是把海外版 token 打进腾讯域名、被 APISIX 拦成 HTML 401 的根因。
+export function workBuddyRealmOfIssuer(s: string): 'cn' | 'ai' | undefined {
+  const v = s.trim().toLowerCase()
+  if (v === '') return undefined
+  if (v.includes('workbuddy.ai')) return 'ai'
+  if (v.includes('workbuddy.cn') || v.includes('copilot.tencent.com')) return 'cn'
+  return undefined
+}
+
+// JWT 的 iss → WorkBuddy 版本（不验签；解析不出返回 undefined）。
+// 账号侧一致性校验用：凭据文件里只有 token，版本要从 issuer 反推。
+export function workBuddyRealmOfToken(token: string): 'cn' | 'ai' | undefined {
+  const parts = token.split('.')
+  if (parts.length < 2 || !parts[1]) return undefined
+  try {
+    const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as { iss?: string }
+    return typeof claims.iss === 'string' ? workBuddyRealmOfIssuer(claims.iss) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+// 版本的中文名（文案统一出处，避免各处各写一份）。
+export function workBuddyRealmLabel(realm: 'cn' | 'ai' | undefined): string {
+  return realm === 'ai' ? '海外版' : realm === 'cn' ? '国内版' : '版本未知'
+}
+
+// ---- WorkBuddy 官方客户端身份头 ----
+//
+// ⚠️ 2026-09-19 重大更正（此前的判断是错的，务必读完再改）：
+//
+// 本模块一度把 X-Product 判成「必须是 WorkBuddy，SaaS 是写错的」，并据此改了
+// Provider 草稿、存量行与启动迁移。**那个结论是错的，已回滚。**
+//
+// 从客户端 app.asar 里挖出的真实逻辑（ProductEndpointHttpInterceptor）：
+//
+//   if (!config.headers["X-Product"])
+//     config.headers.PRODUCT = productManager.getCurrentConfiguration()?.deploymentType
+//                              ?? productManager.configuration.getValue()?.deploymentType
+//                              ?? DeploymentType.SaaS;
+//
+// 即 **X-Product = deploymentType（部署类型），取值 'SaaS' | 'Cloud-Hosted' |
+// 'Self-Hosted'，缺省才是 'SaaS'**。本机实测 deploymentType = "SaaS"
+// （客户端日志 [CodeRatioReporter] {"hasConfigization":true,"deploymentType":"SaaS"}）。
+// 所以对这个账号，聊天端点正确的 X-Product **就是 SaaS** —— 网关原来的值是对的。
+//
+// 为什么会判错：签到端点（api.ts 的 daily-checkin）与 banner 端点用的是**硬编码**
+// 的 "X-Product": "WorkBuddy"（见 app.asar getActivityBanner）。那是**另一套端点**
+// 的身份，与聊天路径不是同一套。把签到头的值套到聊天路径上，属于把两个端点的
+// 身份混为一谈。
+//
+// 结论：**X-Product 不在这里硬编码**。它是账号/部署维度的值，硬编码成任何常量
+// （SaaS 或 WorkBuddy）都只对某一类部署成立。网关保持原样（两个头）反而正确。
+//
+// 那「官方客户端不扣费、网关扣费」的差异到底在哪？**尚未查明。** 已排除：
+//   · 端点不同 —— 客户端日志实测同样打 https://www.workbuddy.ai/v2/chat/completions
+//   · X-Product 值 —— 客户端的值就是 SaaS，与网关一致
+// 未排除：请求体形态（客户端 agent=cli 的回合体裁）、TLS/证书指纹、
+// 或计费根本与请求形态无关（按 plan 判定，见 14018 → "获取 Credits"）。
+// **在拿到客户端真实请求头之前不要再猜。**
+
+// WorkBuddy 客户端版本（辅助端点如 banner/签到用的硬编码身份的一部分）。
+// 仅用于需要「模拟辅助端点身份」的场景，**不要**用它构造聊天请求头。
+export const WB_CLIENT_VERSION = '5.5.3'
+
+// 辅助端点的硬编码身份头（签到 / banner 一类）。
+//
+// 只适用于这些端点：它们在客户端里是**手写死值** "X-Product": "WorkBuddy"。
+// **聊天/推理端点不要用这个函数** —— 那边的 X-Product 是 deploymentType，
+// 见上方说明。
+export function wbAuxEndpointIdentityHeaders(uid?: string): Record<string, string> {
+  const h: Record<string, string> = {
+    'X-IDE-Type': 'WorkBuddy',
+    'X-IDE-Name': 'WorkBuddy',
+    'X-IDE-Version': WB_CLIENT_VERSION,
+    'X-Product': 'WorkBuddy',
+    'User-Agent': `WorkBuddy/${WB_CLIENT_VERSION}`,
+  }
+  if (uid !== undefined && uid !== '') h['X-User-Id'] = uid
+  return h
+}
+
 // 大小写不敏感的头查找（fetch 头名不敏感，但这里操作的是普通对象）。
 export function findHeaderKey(h: Record<string, string>, name: string): string | undefined {
   const want = name.toLowerCase()

@@ -105,6 +105,11 @@ export interface DiscoveredAccount {
   alive: boolean
   expiresAt?: string
   tokenPath: string
+  // WorkBuddy 发行版：cn = 国内版（www.workbuddy.cn / copilot.tencent.com），
+  // ai = 海外版（www.workbuddy.ai）。两版的 token 认证域不同、互不通用，
+  // 账号必须按它归属到对应 Provider，混池会让一半请求注定 401。
+  // 非 WorkBuddy 来源（zen 等）为 undefined。
+  realm?: 'cn' | 'ai'
 }
 
 // 一条发现结果（JSON 可序列化，无密钥）。这是全仓唯一定义——发现层产出、

@@ -3,9 +3,10 @@
 
 import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from 'vitest'
 import { workbuddyTokenHash } from '../src/adminapi/discover_api.ts'
-import { mkdtempSync, existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { expectMode } from './helpers/posix-mode.ts'
 import { Hono } from 'hono'
 import { createAdminApi } from '../src/adminapi/index.ts'
 import { MemoryAccountStore, MemoryEgressStore, MemoryProviderStore } from '../src/adminapi/store.ts'
@@ -581,6 +582,67 @@ describe('providers CRUD（对齐 Go TestProviderCRUD/PatchReadonly/Validation�
     }
   })
 
+  // WorkBuddy 双版本（2026-09-19 实测）：两版 token 互不通用，账号挂错 Provider
+  // 会一直 401（看起来像账号坏了，其实是认证域不对）。这里把不符如实标出来，
+  // 让用户不必翻配置猜；判不出就不报（宁漏不误报）。
+  test('账号版本与 Provider 版本不符 → realmWarn 点名；相符则不报', async () => {
+    const dir = isolateCwd()
+    mkdirSync(join(dir, 'config', 'credentials'), { recursive: true })
+    // 海外版 token（iss = www.workbuddy.ai）与国内版 token（iss = www.workbuddy.cn）
+    const jwt = (iss: string) => {
+      const b64 = Buffer.from(JSON.stringify({ iss })).toString('base64url')
+      return `eyJhbGciOiJub25lIn0.${b64}.sig`
+    }
+    const aiFile = join('config', 'credentials', 'ai-jwt')
+    const cnFile = join('config', 'credentials', 'cn-jwt')
+    writeFileSync(join(dir, aiFile), jwt('https://www.workbuddy.ai/auth/realms/copilot'))
+    writeFileSync(join(dir, cnFile), jwt('https://www.workbuddy.cn/auth/realms/copilot'))
+
+    // Provider 是**国内版**（copilot.tencent.com）
+    const cnProv = mkProviderFixed({
+      name: 'workbuddy', baseUrl: 'https://copilot.tencent.com/v2',
+    })
+    const call = caller(build({
+      providers: [cnProv],
+      accounts: [
+        // 海外号挂在国内版 Provider 下 → 必须报
+        { id: 'bad', providerId: cnProv.providerId, credential: { apiKeyFile: aiFile },
+          status: 'available', fails: 0, importSource: 'workbuddy' },
+        // 国内号挂在国内版 Provider 下 → 正常，不报
+        { id: 'good', providerId: cnProv.providerId, credential: { apiKeyFile: cnFile },
+          status: 'available', fails: 0, importSource: 'workbuddy' },
+      ],
+    }))
+    const rows = await call('GET', '/admin/api/accounts', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ accounts: (Account & { realmWarn?: string })[] }>)
+    const bad = rows.accounts.find((a) => a.id === 'bad')!
+    const good = rows.accounts.find((a) => a.id === 'good')!
+    expect(bad.realmWarn).toBeTruthy()
+    expect(bad.realmWarn).toContain('海外版')
+    expect(bad.realmWarn).toContain('国内版')
+    expect(good.realmWarn).toBeUndefined()
+  })
+
+  test('realmWarn 只对 WorkBuddy 来源生效（非该来源不误报）', async () => {
+    const dir = isolateCwd()
+    mkdirSync(join(dir, 'config', 'credentials'), { recursive: true })
+    const b64 = Buffer.from(JSON.stringify({ iss: 'https://www.workbuddy.ai/auth/realms/copilot' }))
+      .toString('base64url')
+    const f = join('config', 'credentials', 'zen-jwt')
+    writeFileSync(join(dir, f), `h.${b64}.s`)
+    const p1 = mkProviderFixed({ name: 'opencode', baseUrl: 'https://opencode.ai/zen/v1' })
+    const call = caller(build({
+      providers: [p1],
+      accounts: [
+        { id: 'z', providerId: p1.providerId, credential: { apiKeyFile: f },
+          status: 'available', fails: 0, importSource: 'opencode-zen' },
+      ],
+    }))
+    const rows = await call('GET', '/admin/api/accounts', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ accounts: (Account & { realmWarn?: string })[] }>)
+    expect(rows.accounts[0]!.realmWarn).toBeUndefined()
+  })
+
   test('accountIds 白名单已删除：PATCH 出现即 400（只读）', async () => {
     const p1 = mkProviderFixed({ name: 'p1x' })
     const call = caller(build({
@@ -618,7 +680,7 @@ describe('providers CRUD（对齐 Go TestProviderCRUD/PatchReadonly/Validation�
     // Key 真落到了文件里，且 0600
     const file = join(dir, 'config', 'credentials', 'provider-atria-key')
     expect(readFileSync(file, 'utf8')).toBe(pasted)
-    expect(statSync(file).mode & 0o777).toBe(0o600)
+    expectMode(file, 0o600)
   })
 
   test('credentialKind=env：环境变量名原语义，不落文件', async () => {
@@ -1429,7 +1491,7 @@ describe('discover 端点（DiscoverSource 打桩，对齐 Go discover_test.go�
     const credFile = accts.accounts[0]!.credential.apiKeyFile!
     const credPath = join(process.cwd(), credFile)
     expect(readFileSync(credPath, 'utf8')).toBe(alive.token)
-    expect(statSync(credPath).mode & 0o777).toBe(0o600)
+    expectMode(credPath, 0o600)
   })
 
   // 回归锚点：adopt 里 providers.put(p) 必须在 importSuggestedAccounts 之前。
@@ -1582,7 +1644,7 @@ describe('discover/import-account（对齐 Go import_account_test.go）', () => 
     expect(acct.credential.apiKeyFile).toBe('config/credentials/wb-jwt-x')
     const credPath = join(process.cwd(), 'config', 'credentials', 'wb-jwt-x')
     expect(readFileSync(credPath, 'utf8')).toBe(token)
-    expect(statSync(credPath).mode & 0o777).toBe(0o600)
+    expectMode(credPath, 0o600)
     // 单账号导入同样打来源标记：账号页「签到」（自动登录）按钮只认它，
     // 不打标 = 导进来也点不了签到（此前只有 quick-import 打标）。
     expect(acct.importSource).toBe('workbuddy')
@@ -1671,7 +1733,7 @@ describe('discover/quick-import（对齐 Go quickimport_test.go）', () => {
     expect(out.skipped).toBe(0)
     for (const id of ['workbuddy-1', 'workbuddy-2']) {
       const credFile = join(process.cwd(), 'config', 'credentials', `${id}-jwt`)
-      expect(statSync(credFile).mode & 0o777).toBe(0o600)
+      expectMode(credFile, 0o600)
     }
 
     // 幂等

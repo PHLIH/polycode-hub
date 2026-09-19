@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import {
   checkWorkBuddy, checkWorkBuddyWithAccounts, checkZCode, checkZen, discoverWorkBuddyAccounts,
   discoverWorkBuddyModels, workBuddyAuthDirs, workBuddySearchPaths, searchWorkBuddyAuthFiles,
+  detectRealmFromAuth,
   parseFingerprintFromLog, openCodeDataDirs,
   Scanner, defaultConfig, type ScanConfig,
 } from '../src/discover/index.ts'
@@ -109,7 +110,9 @@ describe('search paths', () => {
 
   test('darwin 目录候选覆盖真实 CodeBuddyExtension auth 目录', () => {
     const dirs = workBuddyAuthDirs('darwin', '/home/u', '/home/u')
-    expect(dirs).toContain('/home/u/Library/Application Support/CodeBuddyExtension/Data/Public/auth')
+    // join 的分隔符随宿主平台变（本机跑测试是 win32），断言按「层级」匹配。
+    const norm = dirs.map((d) => d.replace(/\\/g, '/'))
+    expect(norm).toContain('/home/u/Library/Application Support/CodeBuddyExtension/Data/Public/auth')
   })
 
   // 真实缺陷（2026-09-17）：Windows 只扫了 AppData\Roaming，而桌面端登录态实际落在
@@ -158,6 +161,155 @@ describe('search paths', () => {
     } finally {
       vi.unstubAllEnvs()
     }
+  })
+})
+
+// ---- WorkBuddy 双版本（国内版 / 海外版） ----
+//
+// 2026-09-19 实测确认的真机事实：桌面端两个发行版的登录态文件、认证域、上游都不相同，
+// token 互不通用。把海外版的 token 打到 copilot.tencent.com 会被 APISIX 拦成
+// HTML 401「Authorization Required」——看起来像账号失效，实际只是域名不对。
+// 因此版本必须被发现层显式识别，并一路带到 Provider 草稿。
+describe('WorkBuddy 双版本识别', () => {
+  // 组装带真实 iss 的 JWT：realm 判定的第二证据是 issuer（第一是 auth.domain）。
+  function jwtWithIss(iss: string, exp: Date): string {
+    const b64 = Buffer.from(JSON.stringify({
+      exp: Math.floor(exp.getTime() / 1000), iss, sub: 'u1',
+    })).toString('base64url')
+    return `eyJhbGciOiJub25lIn0.${b64}.sig`
+  }
+
+  async function writeRealmFile(
+    dir: string, name: string, realm: 'cn' | 'ai',
+    account: Record<string, unknown>, exp = new Date(Date.now() + 86400_000),
+  ): Promise<string> {
+    const domain = realm === 'ai' ? 'www.workbuddy.ai' : 'www.workbuddy.cn'
+    const raw = JSON.stringify({
+      auth: {
+        accessToken: jwtWithIss(`https://${domain}/auth/realms/copilot`, exp),
+        tokenType: 'Bearer', domain,
+      },
+      account,
+    })
+    const path = join(dir, name)
+    await writeFile(path, raw, 'utf8')
+    return path
+  }
+
+  test('detectRealmFromAuth：认 auth.domain（最直接证据）', async () => {
+    const raw = JSON.stringify({ auth: { accessToken: 'x', domain: 'www.workbuddy.ai' } })
+    expect(detectRealmFromAuth(raw)).toBe('ai')
+    expect(detectRealmFromAuth(JSON.stringify(
+      { auth: { accessToken: 'x', domain: 'www.workbuddy.cn' } }))).toBe('cn')
+  })
+
+  test('detectRealmFromAuth：domain 缺失时回落到 JWT iss', async () => {
+    const ai = JSON.stringify({ auth: { accessToken: jwtWithIss('https://www.workbuddy.ai/auth/realms/copilot', new Date()) } })
+    expect(detectRealmFromAuth(ai)).toBe('ai')
+    const cn = JSON.stringify({ auth: { accessToken: jwtWithIss('https://www.workbuddy.cn/auth/realms/copilot', new Date()) } })
+    expect(detectRealmFromAuth(cn)).toBe('cn')
+  })
+
+  test('detectRealmFromAuth：认不出返回 undefined，绝不默认成国内版', () => {
+    // 默认成 cn 正是当初把海外号打错域的原因——宁可报「版本未知」也不猜。
+    expect(detectRealmFromAuth('{bad')).toBeUndefined()
+    expect(detectRealmFromAuth(JSON.stringify(
+      { auth: { accessToken: 'not-a-jwt', domain: 'example.com' } }))).toBeUndefined()
+    expect(detectRealmFromAuth(JSON.stringify({ auth: { accessToken: jwtWithIss('https://other.example/auth', new Date()) } }))).toBeUndefined()
+  })
+
+  test('两个版本各生成一条 finding，key 与 Provider 草稿都不撞车', async () => {
+    const dir = await tempDir()
+    // 模拟真机：两个版本同目录共存（workbuddy-desktop.info + workbuddy-desktop-ai.info）
+    await writeRealmFile(dir, 'workbuddy-desktop.info', 'cn',
+      { uid: 'uid-cn', nickname: '肥糯米嫩', type: 'personal' })
+    await writeRealmFile(dir, 'workbuddy-desktop-ai.info', 'ai',
+      { uid: 'uid-ai', nickname: 'liz816339@gmail.com', type: 'personal' })
+
+    const findings = await new Scanner({
+      workBuddyPaths: [
+        join(dir, 'workbuddy-desktop.info'),
+        join(dir, 'workbuddy-desktop-ai.info'),
+      ],
+      workBuddyAuthDirs: [dir],
+      zCodeDirs: [join(dir, 'nope')],
+      zenBaseURL: 'http://127.0.0.1:9',
+      zenTimeoutMs: 500,
+    }).scan()
+    const cn = findings.find((f) => f.key === 'workbuddy')
+    const ai = findings.find((f) => f.key === 'workbuddy-ai')
+    expect(cn?.status).toBe('ready')
+    expect(ai?.status).toBe('ready')
+
+    // 认证域由版本派生：这是本次修复的核心——海外版不能再打到腾讯国内域名。
+    expect(cn?.suggestedProvider?.baseUrl).toBe('https://copilot.tencent.com/v2')
+    expect(cn?.suggestedProvider?.headers?.['X-Domain']).toBe('copilot.tencent.com')
+    expect(ai?.suggestedProvider?.baseUrl).toBe('https://www.workbuddy.ai/v2')
+    expect(ai?.suggestedProvider?.headers?.['X-Domain']).toBe('www.workbuddy.ai')
+
+    // Provider 名必须不同：账号池按 providerId 归属，同名会合并成一个池。
+    expect(cn?.suggestedProvider?.name).toBe('workbuddy')
+    expect(ai?.suggestedProvider?.name).toBe('workbuddy-ai')
+    expect(providerValidate(ai!.suggestedProvider as Provider)).toBeUndefined()
+  })
+
+  test('账号列表按版本隔离：海外版 finding 不列出国内版账号', async () => {
+    const dir = await tempDir()
+    await writeRealmFile(dir, 'workbuddy-desktop.info', 'cn',
+      { uid: 'uid-cn', nickname: '肥糯米嫩', type: 'personal' })
+    await writeRealmFile(dir, 'workbuddy-desktop-ai.info', 'ai',
+      { uid: 'uid-ai', nickname: 'liz816339@gmail.com', type: 'personal' })
+
+    const findings = await new Scanner({
+      workBuddyPaths: [
+        join(dir, 'workbuddy-desktop.info'),
+        join(dir, 'workbuddy-desktop-ai.info'),
+      ],
+      workBuddyAuthDirs: [dir],
+      zCodeDirs: [join(dir, 'nope')],
+      zenBaseURL: 'http://127.0.0.1:9',
+      zenTimeoutMs: 500,
+    }).scan()
+
+    const cnAccts = findings.find((f) => f.key === 'workbuddy')?.suggestedAccounts ?? []
+    const aiAccts = findings.find((f) => f.key === 'workbuddy-ai')?.suggestedAccounts ?? []
+    // 混列会诱导用户把两套互不通用的 token 导进同一个 Provider。
+    expect(cnAccts.map((a) => a.nickname)).toEqual(['肥糯米嫩'])
+    expect(aiAccts.map((a) => a.nickname)).toEqual(['liz816339@gmail.com'])
+    expect(cnAccts[0]?.realm).toBe('cn')
+    expect(aiAccts[0]?.realm).toBe('ai')
+  })
+
+  test('扫描路径同时覆盖两个版本的文件名', () => {
+    for (const goos of ['darwin', 'linux', 'windows']) {
+      const paths = workBuddySearchPaths(goos, '/home/u', 'C:\\Users\\u')
+      expect(paths.some((p) => p.endsWith('workbuddy-desktop.info'))).toBe(true)
+      // 此前只生成国内版文件名，海外版永远命中不了候选。
+      expect(paths.some((p) => p.endsWith('workbuddy-desktop-ai.info'))).toBe(true)
+    }
+  })
+
+  test('同 UID 跨版本不去重（两版是两条独立凭据）', async () => {
+    const dir = await tempDir()
+    await writeRealmFile(dir, 'workbuddy-desktop.info', 'cn',
+      { uid: 'same-uid', nickname: '同一人国内', type: 'personal' })
+    await writeRealmFile(dir, 'workbuddy-desktop-ai.info', 'ai',
+      { uid: 'same-uid', nickname: '同一人海外', type: 'personal' })
+    const accts = discoverWorkBuddyAccounts(dir)
+    expect(accts).toHaveLength(2)
+    expect(new Set(accts.map((a) => a.realm))).toEqual(new Set(['cn', 'ai']))
+  })
+
+  test('版本未知的历史文件仍可发现（不因判不出版本而漏掉）', async () => {
+    const dir = await tempDir()
+    // 旧客户端：没写 domain，token 也不是 JWT → realm 判不出。
+    await writeFile(join(dir, 'workbuddy-desktop.info'), JSON.stringify({
+      auth: { accessToken: 'opaque-token' },
+      account: { uid: 'uid-old', nickname: '老客户端' },
+    }), 'utf8')
+    const accts = discoverWorkBuddyAccounts(dir)
+    expect(accts).toHaveLength(1)
+    expect(accts[0]?.realm).toBeUndefined()
   })
 })
 
@@ -422,10 +574,11 @@ describe('opencode 指纹自动识别', () => {
   })
 
   test('opencode 数据目录按平台给候选（含 XDG 覆盖）', () => {
-    expect(openCodeDataDirs('linux', '/home/u', '', {})).toContain('/home/u/.local/share/opencode')
-    expect(openCodeDataDirs('linux', '/home/u', '', { XDG_DATA_HOME: '/xdg' })).toContain('/xdg/opencode')
-    const win = openCodeDataDirs('windows', 'C:\\Users\\u', 'C:\\Users\\u', {})
-      .map((d) => d.replace(/\\/g, '/'))
+    // join 的分隔符随宿主平台变（本机跑测试是 win32），断言按「层级」匹配。
+    const norm = (ds: string[]) => ds.map((d) => d.replace(/\\/g, '/'))
+    expect(norm(openCodeDataDirs('linux', '/home/u', '', {}))).toContain('/home/u/.local/share/opencode')
+    expect(norm(openCodeDataDirs('linux', '/home/u', '', { XDG_DATA_HOME: '/xdg' }))).toContain('/xdg/opencode')
+    const win = norm(openCodeDataDirs('windows', 'C:\\Users\\u', 'C:\\Users\\u', {}))
     expect(win.some((d) => d.includes('AppData/Local/opencode'))).toBe(true)
   })
 
@@ -462,7 +615,7 @@ describe('discoverWorkBuddyAccounts', () => {
     expect(main?.alive).toBe(true)
     expect(side?.alive).toBe(true) // 副号应取更新的快照
     expect(side?.tokenPath).toContain('09-07')
-    expect(side?.uid.length).toBeLessThanOrEqual(9) // 短 UID 脱敏
+    expect(side?.uid?.length).toBeLessThanOrEqual(9) // 短 UID 脱敏
   })
 
   test('空目录 → 空', async () => {
@@ -526,8 +679,12 @@ describe('Scanner 聚合', () => {
     const byKey = new Map((await new Scanner(cfg).scan()).map((f) => [f.key, f]))
     const wb = byKey.get('workbuddy') as NonNullable<ReturnType<typeof byKey.get>>
     expect(wb.status).toBe('missing')
-    expect(wb.detail).toContain('未发现桌面登录态')
-    expect(wb.actions).toContain('登录 WorkBuddy 桌面端后重扫')
+    // 国内版/海外版分开报，文案各自点名版本（用户才知道该登录哪个客户端）。
+    expect(wb.detail).toContain('未发现国内版桌面登录态')
+    expect(wb.actions).toContain('登录 WorkBuddy 国内版桌面端后重扫')
+    const wbAi = byKey.get('workbuddy-ai') as NonNullable<ReturnType<typeof byKey.get>>
+    expect(wbAi.status).toBe('missing')
+    expect(wbAi.detail).toContain('未发现海外版桌面登录态')
   })
 
   test('zen 探针走注入的 fetch，成功即 ready', async () => {

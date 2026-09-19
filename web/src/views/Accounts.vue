@@ -3,6 +3,7 @@ import { ref, computed, onMounted, reactive, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api.js'
 import { shareOf, shareTitle } from '../share'
+import { useHintTip } from '../hintTip'
 
 const list = ref([])
 const providers = ref([]) // 测试按钮的模型下拉源（账号只认同源 Provider 的模型）
@@ -121,11 +122,34 @@ function modelShareTip(a, m) {
   return shareTitle(h ? h.models : [], m)
 }
 
+// 占比条提示：自绘即时提示（原生 title 要等约 1 秒，用户要「实时」）。
+// 定位逻辑与概览归因表共用一份（web/src/hintTip.ts），不在这里复制第二套。
+const { tip, tipEl, tipStyle, tipClass, show: showTipAt, hide: hideTip } = useHintTip()
+
+function showShareTip(text, e) {
+  showTipAt(e.currentTarget.getBoundingClientRect(), '', [
+    { label: '占比', value: text.replace(/^占总 token\s*/, '') }
+  ])
+}
+
 const STATUS = {
   available: { label: '可用', cls: 'ok' },
   cooldown: { label: '冷却', cls: 'warn' },
   exhausted: { label: '耗尽', cls: 'bad' },
   disabled: { label: '禁用', cls: '' }
+}
+
+// WorkBuddy 版本徽标：importSource 是导入时打的来源标记
+// （workbuddy = 国内版，workbuddy-ai = 海外版，见 discover_api.ts）。
+// 非 WorkBuddy 来源返回 null（不显示徽标）。
+function realmOf(a) {
+  if (a.importSource === 'workbuddy') {
+    return { label: '国内版', cls: 'cn', title: '国内版：认证域 copilot.tencent.com' }
+  }
+  if (a.importSource === 'workbuddy-ai') {
+    return { label: '海外版', cls: 'ai', title: '海外版：认证域 www.workbuddy.ai（与国内版 token 不通用）' }
+  }
+  return null
 }
 
 // 状态标识：健康度由后端算好下发（阈值只在后端一处定义，前端不复制常量）。
@@ -442,10 +466,17 @@ async function setWeight(a, v) {
         <span class="dot" :class="healthOf(a).cls" :title="healthOf(a).title"></span>
         <span class="acct-id num">{{ a.id }}</span>
         <span class="acct-name">{{ a.displayName || '—' }}</span>
+        <!-- 版本徽标：WorkBuddy 国内版/海外版认证域不同、token 互不通用，
+             账号池里必须一眼能分清（否则排查「为什么这个号一直 401」要翻配置）。 -->
+        <span v-if="realmOf(a)" class="realm-badge" :class="realmOf(a).cls"
+          :title="realmOf(a).title">{{ realmOf(a).label }}</span>
         <span class="acct-cred num dim" :title="a.credential && a.credential.apiKeyEnv ? 'API Key 环境变量' : ''">
           {{ (a.credential && a.credential.apiKeyEnv) || '—' }}
         </span>
         <span class="acct-health" :class="healthOf(a).cls" :title="healthOf(a).title">{{ healthOf(a).label }}</span>
+        <!-- 版本不符告警：账号是海外版却挂在国内版 Provider 下（或反之）。
+             两版 token 互不通用，这种号每次请求都会被上游拒；不说清楚用户只能翻配置猜。 -->
+        <span v-if="a.realmWarn" class="realm-warn" :title="a.realmWarn">版本不符</span>
         <span class="acct-metric num" :title="rangeLabel + '该账号处理的请求数（含失败）'">{{ healthText(a) }}</span>
         <span class="acct-metric num" :class="errRateClass(a)" :title="rangeLabel + '失败次数与失败率'">{{ errRateText(a) }}</span>
         <span class="acct-status">{{ (STATUS[a.status] || {}).label || a.status }}</span>
@@ -508,7 +539,7 @@ async function setWeight(a, v) {
                 <td class="n num">{{ fmtN(m.outputTokens) }}</td>
                 <td class="n num strong">{{ fmtN(m.totalTokens) }}</td>
                 <td class="n num" :class="{ 'err': m.errors > 0 }">{{ m.errors || '' }}</td>
-                <td class="bar-col"><div class="bar" :title="modelShareTip(a, m)"><div class="bar-fill" :style="{ width: (modelShare(a, m) * 100) + '%' }" /></div></td>
+                <td class="bar-col" @mouseenter="showShareTip(modelShareTip(a, m), $event)" @mouseleave="hideTip"><div class="bar"><div class="bar-fill" :style="{ width: (modelShare(a, m) * 100) + '%' }" /></div></td>
               </tr>
             </tbody>
           </table>
@@ -572,6 +603,13 @@ async function setWeight(a, v) {
       <button class="btn" @click="save">保存</button>
     </template>
   </el-dialog>
+
+  <!-- 占比条即时提示：fixed 定位，不被账号卡片/表格裁剪 -->
+  <div v-if="tip" ref="tipEl" class="heat-tip" :class="tipClass" :style="tipStyle">
+    <div v-for="(r, i) in tip.rows" :key="i" class="heat-tip-row" :class="{ bad: r.bad }">
+      <span>{{ r.label }}</span><b class="num">{{ r.value }}</b>
+    </div>
+  </div>
 </template>
 
 <style scoped>
@@ -676,6 +714,15 @@ async function setWeight(a, v) {
 .chev.open { transform: rotate(90deg); }
 .acct-id { font-weight: 600; }
 .acct-name { color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.realm-badge {
+  font-size: 11px; padding: 1px 6px; border-radius: 4px; flex: none;
+  border: 1px solid var(--line); color: var(--dim);
+}
+.realm-badge.ai { color: var(--accent); border-color: var(--accent); }
+.realm-warn {
+  font-size: 11px; padding: 1px 6px; border-radius: 4px; flex: none; cursor: help;
+  color: var(--bad); border: 1px solid var(--bad);
+}
 .acct-cred { font-size: 12px; }
 .acct-metric { color: var(--dim); font-size: 12px; }
 .acct-metric.bad { color: var(--bad); }
@@ -716,10 +763,15 @@ async function setWeight(a, v) {
 .mattr .err { color: var(--bad); }
 .mattr .model-name { font-family: var(--mono); }
 .mattr .bar-col { width: 120px; }
+/* 同 Dashboard 占比条：悬停目标是整格不是 6px 的条子本身（见 Dashboard.vue 注释）。
+   mattr td 本来就是 7px 上下 padding（行高 ~27px），沿用即可，不额外改。 */
+.mattr td.bar-col { padding-right: 8px; }
 .mattr .bar { height: 6px; background: var(--panel-2, #1a222d); border-radius: 3px; overflow: hidden; }
 .mattr .bar-fill { height: 100%; background: var(--accent); border-radius: 3px; }
 /* 失败原因分布（byKind）：一行小标签，回答"这个号为什么挂" */
-.bykind { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 8px; font-size: 12px; }
+.bykind {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 8px; font-size: 12px;
+}
 .bykind-item {
   padding: 1px 7px; border-radius: 4px; border: 1px solid var(--line);
   color: var(--text); font-variant-numeric: tabular-nums;

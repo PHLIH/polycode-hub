@@ -2,6 +2,7 @@
 import { ref, computed, onMounted, reactive } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api.js'
+import { useSidecar } from '../sidecarJob'
 import ProviderCard from './ProviderCard.vue'
 
 const list = ref([])
@@ -155,27 +156,29 @@ async function loadFindings() {
 }
 onMounted(loadFindings)
 
-// ZCode 本地引擎（sidecar）也进一键面板：没装→一键安装，装了→一键启动
-const sc = ref(null)
-async function loadSidecar() {
-  try { sc.value = await api.sidecarStatus() } catch { sc.value = null }
-}
-onMounted(loadSidecar)
+// ZCode 本地引擎（sidecar）也进一键面板：没装→一键安装，装了→一键启动。
+// 状态与进度来自共享模块 web/src/sidecarJob.ts（真相源在服务端）：
+// 切页/刷新/新标签页都不会把「安装中」丢掉，也不会重复触发一次下载。
+const {
+  sc, running: scRunning, installing: scInstalling, busy: scBusy, stale: scStale,
+  percent: scPercent, phaseText: scPhase, detailText: scProgressDetail,
+  errorText: scError, proxyText: scProxy, start: scStart,
+} = useSidecar()
 
 const scDetail = computed(() => {
-  if (!sc.value) return '状态获取失败'
+  // 切页瞬间 sc 还是 null（尚未拉到），此时说「获取失败」是假警报。
+  if (!sc.value) return scStale.value ? '状态获取失败' : '正在读取引擎状态…'
   if (sc.value.running) return `运行于 127.0.0.1:${sc.value.port}，免费 plan 通道经此供给`
+  // 安装中：详情位让给进度条，别让「未安装 —— …」和进度各说各话
+  if (scInstalling.value) return '正在准备免费 plan 通道的本地引擎'
   if (sc.value.installed) return '已安装，未运行'
   return '未安装 —— 一键下载官方引擎并生成安全配置（免费 plan 通道）'
 })
 
 async function scQuickReady() {
-  qiBusy.value = 'sidecar'
-  try {
-    await api.sidecarAction('ensure') // 装（若缺）→ 配（若缺）→ 起（若停）
-    ElMessage.success('ZCode 本地引擎已就绪')
-    await Promise.all([loadSidecar(), loadFindings()])
-  } catch (e) { ElMessage.error(e.message) } finally { qiBusy.value = '' }
+  // 失败刻意不弹 toast：原因由 scError 常驻显示（切页回来还在）。
+  // 否则用户看到「安装中」突然变回「一键安装」，完全不知道发生过什么。
+  if (await scStart()) await Promise.all([load(), loadFindings()])
 }
 
 async function quickImport(f) {
@@ -581,14 +584,30 @@ async function adoptModels() {
     <p v-if="!findings.length" class="dim qi-none">本机没有发现可导入的 harness（装过并登录过的才会出现在这里）。</p>
     <div v-else class="qi-list">
       <div class="qi-row">
-        <span class="dot" :class="sc && sc.running ? 'ok' : ''" />
+        <span class="dot" :class="sc && sc.running ? 'ok' : (scInstalling ? '' : 'warn')" />
         <span class="qi-name">ZCode 本地引擎</span>
         <span class="dim qi-detail">{{ scDetail }}</span>
         <span class="qi-action">
           <span v-if="sc && sc.running" class="status-chip ok"><span class="dot ok" />运行中</span>
-          <button v-else class="btn" :disabled="qiBusy === 'sidecar'" @click="scQuickReady">
-            {{ qiBusy === 'sidecar' ? '安装中…（首次需下载）' : (sc && sc.installed ? '一键启动' : '一键安装') }}</button>
+          <!-- 安装中：按钮位换成进度条。阶段/百分比/字节/耗时都来自服务端作业态，
+               切页或刷新回来接着显示，不再是一个静止的「安装中…（首次需下载）」。 -->
+          <span v-else-if="scInstalling" class="qi-prog">
+            <span class="qi-prog-head">
+              <span class="qi-prog-phase">{{ scPhase }}</span>
+              <span class="qi-prog-num num">{{ scProgressDetail }}</span>
+            </span>
+            <span class="qi-prog-track"><span class="qi-prog-fill" :class="{ indet: scPercent === null }"
+              :style="scPercent === null ? {} : { width: scPercent + '%' }" /></span>
+          </span>
+          <button v-else class="btn" :disabled="scBusy" @click="scQuickReady">
+            {{ sc && sc.installed ? '一键启动' : (scError ? '重试' : '一键安装') }}</button>
         </span>
+      </div>
+      <!-- 失败原因常驻在行下（不是会消失的 toast）：切页回来仍看得到，
+           并带出这次实际走的下载出口——「走了哪个代理」是排障第一问。 -->
+      <div v-if="scError" class="qi-err">
+        <span class="qi-err-msg">{{ scError }}</span>
+        <span v-if="scProxy" class="dim">下载代理 {{ scProxy }}</span>
       </div>
       <div v-for="f in findings" :key="f.key" class="qi-row">
         <span class="dot" :class="f.adoptedProviderId ? 'ok' : (f.status === 'ready' ? '' : 'warn')" />
@@ -862,6 +881,19 @@ async function adoptModels() {
 .qi-detail { font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .qi-action { flex: none; display: flex; align-items: center; gap: 8px; }
 .qi-hint { font-size: 12px; }
+/* 安装进度：宽度固定，避免行内元素随字节数变化左右抖动 */
+.qi-prog { display: block; width: 250px; }
+.qi-prog-head { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; line-height: 1.4; }
+.qi-prog-phase { color: var(--accent); }
+.qi-prog-num { color: var(--dim); }
+.qi-prog-track { display: block; height: 4px; margin-top: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
+.qi-prog-fill { display: block; height: 100%; background: var(--accent); transition: width .3s linear; }
+/* 上游/代理丢了 Content-Length 时不编假百分比：整条淡闪表示「在动但不知道到哪」 */
+.qi-prog-fill.indet { width: 100%; opacity: .3; animation: qi-indet 1.4s ease-in-out infinite; }
+@keyframes qi-indet { 0%, 100% { opacity: .18; } 50% { opacity: .45; } }
+/* 失败原因常驻：与行同宽，缩进对齐状态点 */
+.qi-err { display: flex; flex-wrap: wrap; gap: 4px 10px; padding: 0 0 8px 18px; font-size: 12px; line-height: 1.6; }
+.qi-err-msg { color: var(--bad); }
 .status-chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--dim); }
 .status-chip .dot { margin-right: 0; }
 .field-hint { color: var(--dim); font-size: 11px; line-height: 1.5; padding-top: 2px; }

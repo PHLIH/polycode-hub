@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { createServer, type Server } from 'node:http'
 import { AddressInfo } from 'node:net'
-import { Upstream, joinURL, probeOrder, shouldTryNextProtocol, shouldForgetProtocol, shouldTryOtherProtocol, resolveProtocol, egressProxyURI, buildRequestURL, classifyUpstreamError, applyZenFingerprint, sanitizeUA, summarizeUpstreamBody, ensureZenAgentShape, ZEN_FLOOR_TOOL_NAMES } from '../src/router/upstream.ts'
+import { Upstream, joinURL, probeOrder, shouldTryNextProtocol, shouldForgetProtocol, shouldTryOtherProtocol, resolveProtocol, egressProxyURI, buildRequestURL, classifyUpstreamError, applyZenFingerprint, sanitizeUA, summarizeUpstreamBody, ensureZenAgentShape, ZEN_FLOOR_TOOL_NAMES, ensureWbAiSystemFirst, WB_AI_FLOOR_SYSTEM, applyUpstreamFloors } from '../src/router/upstream.ts'
 import { UpstreamError } from '../src/ir/index.ts'
 import { forgetProtocol, rememberProtocol } from '../src/model/index.ts'
 import type { Provider } from '../src/model/index.ts'
@@ -702,6 +702,123 @@ describe('zen 指纹校准 applyZenFingerprint', () => {
     applyZenFingerprint(h, { id: 'ses_live123', affinity: 'ses_live123' })
     expect(h['x-opencode-session']).toBe('ses_static')
     expect(h['x-session-affinity']).toBe('ses_static')
+  })
+})
+
+describe('WorkBuddy 海外版体裁闸门 ensureWbAiSystemFirst（2026-09-19 双版本实测）', () => {
+  // 取证：同一请求体（首条 user），
+  //   海外版 www.workbuddy.ai    → 400 code 11128「first message is not system prompt」
+  //   国内版 copilot.tencent.com → 200
+  // 所以这条适配必须按 host 生效，不能对所有 WorkBuddy 上游一刀切。
+  const AI = 'https://www.workbuddy.ai/v2'
+  const CN = 'https://copilot.tencent.com/v2'
+  const bare = (): IrRequest => ({
+    model: 'hy3', stream: true,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+  })
+
+  test('非海外版上游原样返回（同一引用）', () => {
+    const r = bare()
+    expect(ensureWbAiSystemFirst(r, 'https://api.deepseek.com')).toBe(r)
+    // 国内版无此约束，不得注入（否则是无谓的 system 改写）。
+    expect(ensureWbAiSystemFirst(r, CN)).toBe(r)
+  })
+
+  test('海外版无 system → 补一条最小中立 system，且不改入参', () => {
+    const r = bare()
+    const out = ensureWbAiSystemFirst(r, AI)
+    expect(out).not.toBe(r)
+    expect(r.system).toBeUndefined() // 入参不动
+    expect(out.system).toEqual([{ type: 'text', text: WB_AI_FLOOR_SYSTEM }])
+  })
+
+  test('海外版已有非空 system → 同一引用（客户端提示词一字不改）', () => {
+    const r = bare()
+    r.system = [{ type: 'text', text: '你是资深工程师。' }]
+    expect(ensureWbAiSystemFirst(r, AI)).toBe(r)
+  })
+
+  test('空/纯空白 system 视为没有（照样触发 11128，必须补）', () => {
+    for (const text of ['', '   ', '\n']) {
+      const r = bare()
+      r.system = [{ type: 'text', text }]
+      const out = ensureWbAiSystemFirst(r, AI)
+      expect(out).not.toBe(r)
+      expect(out.system?.length).toBe(2)
+      expect(out.system?.[1]).toEqual({ type: 'text', text: WB_AI_FLOOR_SYSTEM })
+    }
+  })
+
+  test('system 段里全是非 text 块 → 视为没有，补上', () => {
+    const r = bare()
+    r.system = [{ type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'x' } } as never]
+    const out = ensureWbAiSystemFirst(r, AI)
+    expect(out).not.toBe(r)
+    expect(out.system?.some((b) => b.type === 'text')).toBe(true)
+  })
+
+  test('落线形状：补完后 openai-completions 出站首条确为 system', () => {
+    // 这是本适配的真正目的——IR 的 system 会被编解码器落成 messages[0]，
+    // 所以只需保证 req.system 非空。这里端到端验一次落线结果，防止编解码器改动后失守。
+    const out = ensureWbAiSystemFirst(bare(), AI)
+    const codec = getOutbound('openai-completions')
+    const wire = JSON.parse(new TextDecoder().decode(codec.serializeRequest(out))) as {
+      messages: { role: string }[]
+    }
+    expect(wire.messages[0]?.role).toBe('system')
+  })
+})
+
+// 回归锚点（用户实测报回）：海外版 system 打头当初只加在转发路径（streamWith），
+// 探测/测试路径（streamWithTimeout）漏了 —— 于是「转发能通、点测试报 400 code 11128」，
+// 用户看到的是「根本没修好」。两条路径必须走同一个保底函数，这里把它钉死。
+describe('applyUpstreamFloors：转发与探测两条路径共用同一套体裁保底', () => {
+  const AI = 'https://www.workbuddy.ai/v2'
+  const ZEN = 'https://opencode.ai/zen/v1'
+
+  test('海外版：只带 user 的请求经保底后首条变 system', () => {
+    const req: IrRequest = {
+      model: 'hy3', stream: true,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    }
+    const out = applyUpstreamFloors(req, AI)
+    expect(out.system?.length).toBeGreaterThan(0)
+    expect(out).not.toBe(req)
+  })
+
+  test('zen：同一函数也补 agent 体裁（两条保底互不干扰）', () => {
+    const req: IrRequest = {
+      model: 'mimo-v2.5-free', stream: true,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    }
+    const out = applyUpstreamFloors(req, ZEN)
+    expect(out.tools?.map((t) => t.name)).toEqual([...ZEN_FLOOR_TOOL_NAMES])
+    expect(out.toolChoice).toEqual({ mode: 'auto' })
+    // zen 不适用 WB 海外版那条：不该被塞 system
+    expect(out.system).toBeUndefined()
+  })
+
+  test('国内版：两条保底都不适用，原样返回', () => {
+    const req: IrRequest = {
+      model: 'hy3', stream: true,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    }
+    expect(applyUpstreamFloors(req, 'https://copilot.tencent.com/v2')).toBe(req)
+  })
+
+  // 关键：探针请求的形状（probe.probeOne 造的就是这个）必须被兜住。
+  // 探针带 maxTokens:16 且只有一条 user —— 正是海外版会拒的形状。
+  test('探针形状（maxTokens:16 + 单条 user）在海外版下被补上 system', () => {
+    const probeReq: IrRequest = {
+      model: 'hy3', stream: true, maxTokens: 16,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    }
+    const codec = getOutbound('openai-completions')
+    const wire = JSON.parse(new TextDecoder().decode(
+      codec.serializeRequest(applyUpstreamFloors(probeReq, AI)))) as {
+      messages: { role: string }[]
+    }
+    expect(wire.messages[0]?.role).toBe('system')
   })
 })
 

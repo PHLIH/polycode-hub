@@ -87,7 +87,9 @@ providers:
 1. **Discover 页 → 一键导入**：自动发现本机装过并登录过的 harness（WorkBuddy / OpenCode Zen 等），点一下就完成「采用 Provider + 账号入池 + 模型目录自动扫描」。导入完直接用 `name/modelId` 调用即可。
    > 模型目录是**扫出来的，不是猜的**——网关不会替你预填模型名。自动扫描拿不到时（上游无列表接口且本机无使用痕迹）会给出提示，请到 Providers 页点「扫描可用性」或手动添加；按未声明的模型名调用会 404。
    > WorkBuddy 类上游**只支持流式**：非流式调用（`stream:false`）会被拒绝并提示开启流式。
-2. **ZCode 免费额度**：面板里点「一键安装 / 一键启动」拉起本地 sidecar（首次要从 GitHub 下 ~66MB 二进制，**自动复用项目配置的出口代理**，面板会显示实际走哪个代理）。要 OAuth 登录时到命令行跑 `npx tsx server/src/cli.ts zcode login`（JWT 只打印一次，不保存）。
+   > **WorkBuddy 国内版与海外版是两条独立通道**（Discover 页分列两项）：两者登录态文件、认证域、token 互不通用——国内版走 `copilot.tencent.com`，海外版走 `www.workbuddy.ai`，各采用成独立 Provider（`workbuddy` / `workbuddy-ai`），账号也不会混进同一个池。装了两版就按需分别导入；跨版本导账号会被拒绝并说明原因。
+   > 海外版额外要求请求首条消息是 system prompt（否则上游回 `400 code 11128`）：网关已自动兜住（客户端没带就补一句最小中立 system，带了则一字不改），无需在客户端里特意加。
+2. **ZCode 免费额度**：面板里点「一键安装 / 一键启动」拉起本地 sidecar（Windows 产物 87MB，**自动复用项目配置的出口代理**——macOS 读系统代理、Windows 读注册表 `Internet Settings`，面板会显示实际走哪个代理）。下载**支持断点续传**：弱网下断线不会从头再来，进度条只增不减。要 OAuth 登录时到命令行跑 `npx tsx server/src/cli.ts zcode login`（JWT 只打印一次，不保存）。
 3. **Providers 页 → 模型**：拉上游模型列表 → 「扫描可用性」自动识别每个模型的协议并记住 → 勾选采用。**勾选 = 对外暴露**：只有勾中的模型会出现在 `/v1/models`（id 为 `name/modelId` 限定名）、参与路由、进入测试下拉。
 4. **Providers 页 → 测试**：打一次最小真实请求，确认打通。
 
@@ -162,7 +164,7 @@ npx tsx server/src/cli.ts <子命令>     # 或用 bin shim：node bin/polycode-
 | `scan` | 只扫描本机可导入的 harness，不启动服务（`--json` 输出 JSON） |
 | `adopt [--id ID] <finding-key>` | 命令行采用某个 harness（如 `workbuddy` / `opencode-zen`） |
 | `zcode login` | ZCode OAuth 登录（浏览器授权，一次即可） |
-| `zcode sidecar <动作>` | 本地引擎管理：`install` / `setup` / `start` / `stop` / `status` / `login` / `ensure`（缺省 `ensure`）。下载自动复用项目配置的出口代理（`--proxy <url>` 或 `--egress <id>` 可显式指定） |
+| `zcode sidecar <动作>` | 本地引擎管理：`install` / `setup` / `start` / `stop` / `status` / `login` / `ensure`（缺省 `ensure`）。下载自动复用项目配置的出口代理（`--proxy <url>` 或 `--egress <id>` 可显式指定），支持断点续传 |
 
 ---
 

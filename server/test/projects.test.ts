@@ -27,6 +27,39 @@ import {
 const makeTemp = (prefix: string): string => mkdtempSync(join(tmpdir(), prefix))
 const sleep = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, ms) })
 
+// —— 平台常量：POSIX 侧的写法一字不动，只在 Windows 上换实现 ——
+//
+// IS_WIN 用在两类地方：
+//  1. 夹具命令（LONG_RUNNING / EXITS_NOW）；
+//  2. 用例自己 spawn「外部进程」时的 detached 开关（下面统一写 `detached: !IS_WIN`）。
+//     理由同 server/src/projects/process.ts 的 startDetached：Windows 上 detached
+//     会给子进程新建控制台，被 Windows Terminal 接管（console handoff）后立刻
+//     taskkill /T /F，handoff 管道提前关闭，WT 就弹
+//     `错误 2147942632 (0x800700e8) (启动 "<命令行>" 时)`。
+const IS_WIN = process.platform === 'win32'
+
+// LONG_RUNNING 是「长驻假服务」的命令：POSIX 就是 sleep 30。
+//
+// Windows 上不能这么写，两个理由：
+//  1. `sleep` 不是 Windows 命令——只有 Git 的 usr/bin 恰好落在 PATH 上时才碰巧能跑。
+//     干净机器上 cmd 会报「不是内部或外部命令」，服务立刻退出，相关用例必挂。
+//  2. 更糟的是现场症状：控制台子进程被 Windows 11 的「默认终端 = Windows Terminal」
+//     接管（console handoff），用例随即 taskkill /T /F 秒杀，handoff 管道被提前关闭，
+//     Windows Terminal 就弹 `错误 2147942632 (0x800700e8) (启动 "sleep  30" 时)`，
+//     跑一次全量套件弹一串（≈1 次/秒）。
+//
+// 也别用 `"<node.exe>" -e "setTimeout(()=>{},30000)"` 这种写法：命令是整串交给
+// `cmd /c` 的，而 cmd 在引号多于两个时会**剥掉首尾各一个引号**（/S 未开时的老规则），
+// `"exe" -e "script"` 于是被切坏、cmd 立刻退出——表现为「服务启动成功但进程已退出」。
+// ping 是 Windows 的惯用长睡（无引号、无特殊字符、系统自带、约 30 秒）。
+const LONG_RUNNING = IS_WIN
+  ? 'ping -n 30 127.0.0.1'
+  : 'sleep 30'
+
+// EXITS_NOW 是「立刻退出的假服务」：原写法 `true` 同样是 POSIX 专有命令，
+// Windows 用 cmd 内建的 echo（不依赖 PATH，也不需要额外进程）。
+const EXITS_NOW = IS_WIN ? 'echo hi' : 'true'
+
 // 占住 127.0.0.1 随机端口
 async function listenRandom(): Promise<{ server: ReturnType<typeof createServer>; port: number }> {
   const server = createServer()
@@ -58,7 +91,10 @@ async function waitPort(port: number): Promise<void> {
 
 // 造一个确定已死的 pid
 async function deadPid(): Promise<number> {
-  const c = spawn('true')
+  // 原写法 spawn('true') 依赖 POSIX 的 true 可执行文件：Windows 上找不到时会走
+  // spawn error 路径（Node 不保证再补发 close），用例有挂死风险。
+  // 改成当前 node 跑空脚本——两边都在、都立刻退出。
+  const c = spawn(process.execPath, ['-e', ''])
   await new Promise<void>((resolve) => { c.on('close', () => resolve()) })
   return c.pid ?? 0
 }
@@ -166,7 +202,7 @@ describe('startDetached / killTree', () => {
     const dir = makeTemp('polycode-plife-')
     try {
       const fd = openSync(join(dir, 'out.log'), 'a')
-      const pid = startDetached(dir, 'sleep 30', [], fd)
+      const pid = startDetached(dir, LONG_RUNNING, [], fd)
       expect(pid).toBeGreaterThan(0)
       expect(pidAlive(pid)).toBe(true)
       await killTree(pid)
@@ -181,13 +217,28 @@ describe('startDetached / killTree', () => {
     const dir = makeTemp('polycode-penv-')
     try {
       const fd = openSync(join(dir, 'out.log'), 'a')
-      const pid = startDetached(dir, 'pwd > out2.log; echo $FOO >> out2.log', ['FOO=bar42'], fd)
+      // shell 语法本身依平台而异（sh 的 `;`/`$VAR` vs cmd 的 `&`/`%VAR%`），
+      // 但「cwd 生效 + env 注入」这两条语义是跨平台的，两边都要验——
+      // 写死 sh 语法会让这条用例在 Windows 上必然超时。
+      const isWin = process.platform === 'win32'
+      const shellCmd = isWin
+        ? 'cd > out2.log & echo %FOO% >> out2.log'
+        : 'pwd > out2.log; echo $FOO >> out2.log'
+      const pid = startDetached(dir, shellCmd, ['FOO=bar42'], fd)
       await vi.waitUntil(() => {
         try { return readFileSync(join(dir, 'out2.log'), 'utf8').length > 0 } catch { return false }
       }, { timeout: 5000, interval: 50 })
-      // macOS 的 tmp 在 /private/var 下
+      // 两行输出：第一行 cwd，第二行注入的 env。
+      // 逐行 trim：cmd 的 `echo X >> f` 会把 `>>` 前的空格一并写进去（尾随空格），
+      // 而 sh 的 `echo $FOO` 不会——两边都 trim 后语义一致。
+      // macOS 的 tmp 在 /private/var 下，故用 realpathSync 归一；
+      // Windows 的路径大小写可能与 realpath 返回的不一致，按不敏感比。
       const real = realpathSync(dir)
-      expect(readFileSync(join(dir, 'out2.log'), 'utf8')).toBe(real + '\nbar42\n')
+      const lines = readFileSync(join(dir, 'out2.log'), 'utf8')
+        .split(/\r?\n/).map((l) => l.trim()).filter((l) => l !== '')
+      const gotDir = lines[0] ?? ''
+      expect(isWin ? gotDir.toLowerCase() : gotDir).toBe(isWin ? real.toLowerCase() : real)
+      expect(lines[1]).toBe('bar42')
       await killTree(pid)
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -210,22 +261,35 @@ describe('startDetached / killTree', () => {
   // /usr/bin:/bin），npm/node/dsh 全部找不到，用户被迫在命令里手写
   // `export PATH=/Users/xxx/node/bin:$PATH; npm run dev`。augmentedPath 必须
   // 把标准安装位置补回来，且不抢占用户已有顺序。
-  test('augmentedPath 补全工具目录且不抢占原有顺序', () => {
+  //
+  // 仅 POSIX：fallbackPaths() 在 Windows 上**故意返回空数组**（Windows 的工具
+  // 目录不写死，且 PATH 分隔符是 ';'），所以「补进常见安装位置」这条语义在
+  // Windows 上不成立。平台相关的 PATH 分隔符行为另由下面的用例覆盖。
+  test.skipIf(process.platform === 'win32')('augmentedPath 补全工具目录且不抢占原有顺序', () => {
     const p = augmentedPath('/usr/bin:/bin')
     const parts = p.split(':')
     // 原有条目顺序不变、仍在最前
     expect(parts.slice(0, 2)).toEqual(['/usr/bin', '/bin'])
     // 常见安装位置被补进来
     expect(parts.length).toBeGreaterThan(2)
-    if (process.platform !== 'win32') {
-      expect(parts).toContain('/opt/homebrew/bin')
-      expect(parts).toContain('/usr/local/bin')
-      const home = process.env.HOME
-      if (home) expect(parts).toContain(`${home}/.local/bin`)
-    }
+    expect(parts).toContain('/opt/homebrew/bin')
+    expect(parts).toContain('/usr/local/bin')
+    const home = process.env.HOME
+    if (home) expect(parts).toContain(`${home}/.local/bin`)
     // 去重：重复调用/重复给同一目录不产生重复项
     expect(new Set(parts).size).toBe(parts.length)
     expect(augmentedPath(p)).toBe(p)
+  })
+
+  // PATH 分隔符必须跟随平台（POSIX ':' / Windows ';'）：写死 ':' 会在 Windows
+  // 上把 `C:\a;C:\b` 按盘符冒号切碎。这条在 Windows 上才有意义（POSIX 的
+  // ':' 本来就是对的），故只在 Windows 跑。
+  test.skipIf(process.platform !== 'win32')('augmentedPath 用平台 PATH 分隔符（Windows 分号）', () => {
+    const base = 'C:\\Windows\\system32;C:\\Windows'
+    const got = augmentedPath(base)
+    // 原条目一个不少、顺序不变（被盘符冒号切碎的话这里就对不上）
+    expect(got.split(';')).toEqual(['C:\\Windows\\system32', 'C:\\Windows'])
+    expect(augmentedPath(got)).toBe(got)
   })
 
   // 回归：dir 留空不再报「未配置工作目录」，回落到进程 cwd。
@@ -234,20 +298,32 @@ describe('startDetached / killTree', () => {
     const dir = makeTemp('polycode-pcwd-')
     try {
       const store = new Store(dir)
+      // 输出 cwd 的命令依平台而异（sh 的 pwd / cmd 的 cd）——写死 pwd 会在
+      // Windows 上因命令不存在而永远等不到日志（超时）。
+      const isWin = process.platform === 'win32'
       const p: Project = {
         id: newID(), name: 'cwd-proj',
         // dir 故意留空 + cmd 输出 cwd 到日志
-        services: [{ name: 'svc', dir: '', cmd: 'pwd', port: 0 }],
+        services: [{ name: 'svc', dir: '', cmd: isWin ? 'cd' : 'pwd', port: 0 }],
       }
       store.save([p])
       const m = new Manager(store)
       const conflict = await m.startService(p.id, 'svc', 0)
       expect(conflict).toBeNull()
       const log = store.logPath(p.id, 'svc')
-      await vi.waitUntil(() => {
-        try { return readFileSync(log, 'utf8').includes('/') } catch { return false }
-      }, { timeout: 5000, interval: 50 })
-      expect(readFileSync(log, 'utf8')).toContain(process.cwd())
+      // 等到日志里出现 cwd 再断言：日志开头就有一行「—— <ts> 启动 ——」分隔符，
+      // 若只判「非空」会立刻通过，拿不到命令的输出（断言随之必挂）。
+      const hasCwd = (): boolean => {
+        try {
+          const c = readFileSync(log, 'utf8')
+          return isWin ? c.toLowerCase().includes(process.cwd().toLowerCase()) : c.includes(process.cwd())
+        } catch { return false }
+      }
+      await vi.waitUntil(hasCwd, { timeout: 5000, interval: 50 })
+      // 日志里除启动分隔行外，应含进程 cwd（Windows 路径大小写可能不同，不敏感比）
+      const content = readFileSync(log, 'utf8')
+      expect(isWin ? content.toLowerCase() : content)
+        .toContain(isWin ? process.cwd().toLowerCase() : process.cwd())
       await m.stopService(p.id, 'svc')
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -385,7 +461,7 @@ afterAll(async () => {
 describe('Manager 服务启停', () => {
   test('StartService → Running → StopService 清状态', async () => {
     const m = newTestManager()
-    const id = addProject(m, { name: 'sleeper', dir: makeTemp('polycode-pmgrd-'), cmd: 'sleep 30', port: 0 })
+    const id = addProject(m, { name: 'sleeper', dir: makeTemp('polycode-pmgrd-'), cmd: LONG_RUNNING, port: 0 })
     expect(await m.startService(id, 'sleeper', 0)).toBeNull()
     const v = await m.view(id, 'sleeper')
     expect(v?.running).toBe(true)
@@ -399,7 +475,7 @@ describe('Manager 服务启停', () => {
 
   test('重复启动报「已在运行」', async () => {
     const m = newTestManager()
-    const id = addProject(m, { name: 's', dir: makeTemp('polycode-pmgrd2-'), cmd: 'sleep 30', port: 0 })
+    const id = addProject(m, { name: 's', dir: makeTemp('polycode-pmgrd2-'), cmd: LONG_RUNNING, port: 0 })
     await m.startService(id, 's', 0)
     await expect(m.startService(id, 's', 0)).rejects.toThrow(/已在运行/)
     await m.stopService(id, 's')
@@ -410,7 +486,7 @@ describe('Manager 服务启停', () => {
     const { server, port: taken } = await listenRandom()
     try {
       const id = addProject(m, {
-        name: 'env-svc', dir: makeTemp('polycode-pmgrd3-'), cmd: 'sleep 30', port: taken, portEnv: 'TEST_PORT',
+        name: 'env-svc', dir: makeTemp('polycode-pmgrd3-'), cmd: LONG_RUNNING, port: taken, portEnv: 'TEST_PORT',
       })
       const err = await m.startService(id, 'env-svc', 0)
       expect(isConflictError(err)).toBe(true)
@@ -436,7 +512,7 @@ describe('Manager 服务启停', () => {
     const m = newTestManager()
     const { server, port: taken } = await listenRandom()
     try {
-      const id = addProject(m, { name: 'fixed', dir: makeTemp('polycode-pmgrd4-'), cmd: 'sleep 30', port: taken })
+      const id = addProject(m, { name: 'fixed', dir: makeTemp('polycode-pmgrd4-'), cmd: LONG_RUNNING, port: taken })
       const err = await m.startService(id, 'fixed', 0)
       expect(isConflictError(err)).toBe(true)
       if (isConflictError(err)) expect(err.remappable).toBe(false)
@@ -447,7 +523,7 @@ describe('Manager 服务启停', () => {
 
   test('RestartService 换 pid', async () => {
     const m = newTestManager()
-    const id = addProject(m, { name: 's', dir: makeTemp('polycode-pmgrd5-'), cmd: 'sleep 30', port: 0 })
+    const id = addProject(m, { name: 's', dir: makeTemp('polycode-pmgrd5-'), cmd: LONG_RUNNING, port: 0 })
     await m.startService(id, 's', 0)
     const oldPid = (await m.view(id, 's'))?.pid
     expect(await m.restartService(id, 's')).toBeNull()
@@ -460,7 +536,7 @@ describe('Manager 服务启停', () => {
   test('Sweep：超时自动停（pid 清零留便签）', async () => {
     const m = newTestManager()
     const id = addProject(m, {
-      name: 'exp', dir: makeTemp('polycode-pmgrd6-'), cmd: 'sleep 30', port: 0, maxRuntimeHours: 1,
+      name: 'exp', dir: makeTemp('polycode-pmgrd6-'), cmd: LONG_RUNNING, port: 0, maxRuntimeHours: 1,
     })
     await m.startService(id, 'exp', 0)
     const key = id + '/exp'
@@ -477,7 +553,7 @@ describe('Manager 服务启停', () => {
 
   test('Sweep：死进程清 pid 留退出说明', async () => {
     const m = newTestManager()
-    const id = addProject(m, { name: 'dead', dir: makeTemp('polycode-pmgrd7-'), cmd: 'true', port: 0 })
+    const id = addProject(m, { name: 'dead', dir: makeTemp('polycode-pmgrd7-'), cmd: EXITS_NOW, port: 0 })
     await m.startService(id, 'dead', 0)
     const key = id + '/dead'
     const pid = m.state.get(key)?.pid ?? 0
@@ -490,7 +566,7 @@ describe('Manager 服务启停', () => {
 
   test('Reminders：未设上限但连跑超阈值进提醒', async () => {
     const m = newTestManager()
-    const id = addProject(m, { name: 'longrun', dir: makeTemp('polycode-pmgrd8-'), cmd: 'sleep 30', port: 0 })
+    const id = addProject(m, { name: 'longrun', dir: makeTemp('polycode-pmgrd8-'), cmd: LONG_RUNNING, port: 0 })
     await m.startService(id, 'longrun', 0)
     expect(await m.reminders(24 * 3600e3)).toEqual([])
     const key = id + '/longrun'
@@ -508,8 +584,8 @@ describe('Manager 服务启停', () => {
     try {
       const p: Project = {
         id: newID(), name: '多服务', services: [
-          { name: 'a', dir: makeTemp('polycode-pmgrd9a-'), cmd: 'sleep 30', port: 0 },
-          { name: 'b', dir: makeTemp('polycode-pmgrd9b-'), cmd: 'sleep 30', port: taken },
+          { name: 'a', dir: makeTemp('polycode-pmgrd9a-'), cmd: LONG_RUNNING, port: 0 },
+          { name: 'b', dir: makeTemp('polycode-pmgrd9b-'), cmd: LONG_RUNNING, port: taken },
         ],
       }
       m.store.save([p])
@@ -539,11 +615,11 @@ describe('Manager 服务启停', () => {
 
   test('工作目录缺失时报错；日志落盘带启动分隔', async () => {
     const m = newTestManager()
-    const id = addProject(m, { name: 'nodir', dir: join(makeTemp('polycode-pmgrd10-'), 'nope'), cmd: 'true', port: 0 })
+    const id = addProject(m, { name: 'nodir', dir: join(makeTemp('polycode-pmgrd10-'), 'nope'), cmd: EXITS_NOW, port: 0 })
     await expect(m.startService(id, 'nodir', 0)).rejects.toThrow(/工作目录不可用/)
     // 正常启动写日志分隔
     const dir = makeTemp('polycode-pmgrd11-')
-    const id2 = addProject(m, { name: 'logged', dir, cmd: 'true', port: 0 })
+    const id2 = addProject(m, { name: 'logged', dir, cmd: EXITS_NOW, port: 0 })
     await m.startService(id2, 'logged', 0)
     const log = readFileSync(m.store.logPath(id2, 'logged'), 'utf8')
     expect(log).toContain(' 启动 ——')
@@ -560,7 +636,7 @@ describe('外部占用端口：状态如实反映，不是一句「未启动」'
     const { server, port } = await listenRandom()
     try {
       const m = newTestManager()
-      const id = addProject(m, { name: 'ext', dir: makeTemp('polycode-ext-'), cmd: 'sleep 30', port })
+      const id = addProject(m, { name: 'ext', dir: makeTemp('polycode-ext-'), cmd: LONG_RUNNING, port })
       const v = await m.view(id, 'ext')
       // 关键：不是 running（管理器没启动它，无法停止/重启）
       expect(v?.running).toBe(false)
@@ -576,7 +652,7 @@ describe('外部占用端口：状态如实反映，不是一句「未启动」'
     await new Promise<void>((r) => { server.close(() => r()) })
     await sleep(50) // 等端口释放
     const m = newTestManager()
-    const id = addProject(m, { name: 'idle', dir: makeTemp('polycode-idle-'), cmd: 'sleep 30', port })
+    const id = addProject(m, { name: 'idle', dir: makeTemp('polycode-idle-'), cmd: LONG_RUNNING, port })
     const v = await m.view(id, 'idle')
     expect(v?.running).toBe(false)
     expect(v?.portBusyByOther).toBe(false)
@@ -584,7 +660,7 @@ describe('外部占用端口：状态如实反映，不是一句「未启动」'
 
   test('自己启动的服务不标为外部占用', async () => {
     const m = newTestManager()
-    const id = addProject(m, { name: 'own', dir: makeTemp('polycode-own-'), cmd: 'sleep 30', port: 0 })
+    const id = addProject(m, { name: 'own', dir: makeTemp('polycode-own-'), cmd: LONG_RUNNING, port: 0 })
     await m.startService(id, 'own', 0)
     const v = await m.view(id, 'own')
     expect(v?.running).toBe(true)
@@ -594,7 +670,7 @@ describe('外部占用端口：状态如实反映，不是一句「未启动」'
 
   test('port=0 的服务不探端口（没有端口可探）', async () => {
     const m = newTestManager()
-    const id = addProject(m, { name: 'nop', dir: makeTemp('polycode-nop-'), cmd: 'sleep 30', port: 0 })
+    const id = addProject(m, { name: 'nop', dir: makeTemp('polycode-nop-'), cmd: LONG_RUNNING, port: 0 })
     const v = await m.view(id, 'nop')
     expect(v?.portBusyByOther).toBe(false)
   })
@@ -602,13 +678,17 @@ describe('外部占用端口：状态如实反映，不是一句「未启动」'
   // 回归：update.sh / 手动 npm start 用 nohup 起的服务不写 state，于是管理台既停不掉
   // 它（没有 pid）也起不来（端口被占），而占端口的恰恰是它自己——用户看到
   // 「端口被自己占用不能停」。现在按「进程 cwd == 服务 dir」认领，恢复可管理。
-  test('外部命令拉起的服务：按 cwd 认领为 running，且能停掉', async () => {
+  //
+  // 仅 POSIX：认领判据要读**别的进程的 cwd**，而 processCwd 在 Windows 上恒返回
+  // 空串（没有 lsof 那种能力，读 PEB 需要原生代码）。所以 Windows 上配了 dir 的
+  // 服务走不到这条 cwd 分支，只能靠下面的命令行特征回退。
+  test.skipIf(process.platform === 'win32')('外部命令拉起的服务：按 cwd 认领为 running，且能停掉', async () => {
     const dir = makeTemp('polycode-claim-')
     const port = await freePortForTest()
     // 用子进程起一个"服务"：cwd 就是配置里的 dir（这是认领的判据）
     const child = spawn(process.execPath, [
       '-e', `require('http').createServer((_,r)=>r.end('ok')).listen(${port})`,
-    ], { cwd: dir, detached: true, stdio: 'ignore' })
+    ], { cwd: dir, detached: !IS_WIN, stdio: 'ignore' })
     child.unref()
     await waitPort(port)
 
@@ -635,10 +715,34 @@ describe('外部占用端口：状态如实反映，不是一句「未启动」'
     }
   }, 15_000)
 
+  // 跨平台回退：没有可用 dir 时（dir 留空），认领改按**命令行特征**判断——
+  // 这条路径在 Windows 上是唯一可用的认领手段（processCwd 不可用），
+  // 且 processCmdline 两边都实现了（POSIX ps / Windows PowerShell CIM）。
+  test('dir 留空时按命令行特征认领（Windows 唯一可用的认领路径）', async () => {
+    const port = await freePortForTest()
+    // 子进程命令行里带上服务名特征（认领回退判据靠 serviceSignatures 命中）
+    const child = spawn(process.execPath, [
+      '-e', `require('http').createServer((_,r)=>r.end('ok')).listen(${port})`,
+      'adopted-svc',
+    ], { detached: !IS_WIN, stdio: 'ignore' })
+    child.unref()
+    await waitPort(port)
+    try {
+      const m = newTestManager()
+      const id = addProject(m, { name: 'adopted-svc', dir: '', cmd: 'node', port })
+      const v = await m.view(id, 'adopted-svc')
+      expect(v?.adopted).toBe(true)
+      expect(v?.running).toBe(true)
+      expect(v?.pid).toBe(child.pid)
+    } finally {
+      try { process.kill(child.pid!, 'SIGKILL') } catch { /* 已死 */ }
+    }
+  }, 15_000)
+
   // 回归：管理台自己就跑在网关进程里，而网关正是项目列表里的一项。
   // 认领它（用户才能看到"运行中"而不是莫名其妙的"端口被占用"），
   // 但绝不能允许从这里停掉它——杀自己会让请求挂死，且网关无守护进程、不会自动重启。
-  test('认领「自己」但不允许停止自己（防自杀）', async () => {
+  test.skipIf(process.platform === 'win32')('认领「自己」但不允许停止自己（防自杀）', async () => {
     const dir = makeTemp('polycode-self-')
     // 用一个真实子进程占端口，但把「管理器自己」替换成它来验证拦截分支：
     // 直接构造 process.pid 命中的场景不可行（测试进程不监听该端口），
@@ -646,7 +750,7 @@ describe('外部占用端口：状态如实反映，不是一句「未启动」'
     const port = await freePortForTest()
     const child = spawn(process.execPath, [
       '-e', `require('http').createServer((_,r)=>r.end('ok')).listen(${port})`,
-    ], { cwd: dir, detached: true, stdio: 'ignore' })
+    ], { cwd: dir, detached: !IS_WIN, stdio: 'ignore' })
     child.unref()
     await waitPort(port)
     try {
@@ -673,7 +777,7 @@ describe('外部占用端口：状态如实反映，不是一句「未启动」'
     let restarts = 0
     // victim 扮演"网关自己"：用独立子进程的 pid，killTree 杀它不会影响测试进程。
     // selfPid 注入成它 → 既能走 self 分支，又不会真的自杀。
-    const victim = spawn(process.execPath, ['-e', 'setTimeout(()=>{},60000)'], { detached: true, stdio: 'ignore' })
+    const victim = spawn(process.execPath, ['-e', 'setTimeout(()=>{},60000)'], { detached: !IS_WIN, stdio: 'ignore' })
     victim.unref()
     const m = new Manager(new Store(makeTemp('polycode-selfmgr-')), {
       selfRestart: () => { restarts++; return true },
@@ -698,7 +802,7 @@ describe('外部占用端口：状态如实反映，不是一句「未启动」'
     const dir = makeTemp('polycode-self3-')
     const port = await freePortForTest()
     let restarts = 0
-    const victim = spawn(process.execPath, ['-e', 'setTimeout(()=>{},60000)'], { detached: true, stdio: 'ignore' })
+    const victim = spawn(process.execPath, ['-e', 'setTimeout(()=>{},60000)'], { detached: !IS_WIN, stdio: 'ignore' })
     victim.unref()
     const m = new Manager(new Store(makeTemp('polycode-selfmgr3-')), {
       selfRestart: () => { restarts++; return true },
@@ -722,7 +826,7 @@ describe('外部占用端口：状态如实反映，不是一句「未启动」'
   test('无法自动重启时如实报错，不假装成功', async () => {
     const dir = makeTemp('polycode-self4-')
     const port = await freePortForTest()
-    const victim = spawn(process.execPath, ['-e', 'setTimeout(()=>{},60000)'], { detached: true, stdio: 'ignore' })
+    const victim = spawn(process.execPath, ['-e', 'setTimeout(()=>{},60000)'], { detached: !IS_WIN, stdio: 'ignore' })
     victim.unref()
     const m = new Manager(new Store(makeTemp('polycode-selfmgr4-')), {
       selfRestart: () => false, // 部署方式不支持自动重启
@@ -744,7 +848,7 @@ describe('外部占用端口：状态如实反映，不是一句「未启动」'
     const port = await freePortForTest()
     const child = spawn(process.execPath, [
       '-e', `require('http').createServer((_,r)=>r.end('ok')).listen(${port})`,
-    ], { cwd: otherDir, detached: true, stdio: 'ignore' })
+    ], { cwd: otherDir, detached: !IS_WIN, stdio: 'ignore' })
     child.unref()
     await waitPort(port)
     try {

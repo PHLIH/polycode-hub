@@ -16,6 +16,10 @@ import {
   forgetProtocol,
   autoProtocol,
   rememberProtocol,
+  workBuddyRealmOfBaseUrl,
+  workBuddyRealmOfIssuer,
+  workBuddyRealmOfToken,
+  workBuddyRealmLabel,
   FAILS_WARN_AT,
   type Account,
   type AccessKind,
@@ -234,6 +238,53 @@ describe('协议自动识别事实缓存（进程内）', () => {
     rememberProtocol('', 'm', 'openai-completions')
     rememberProtocol('provB', '', 'openai-completions')
     expect(autoProtocol('provB', '')).toBeUndefined()
+  })
+})
+
+// WorkBuddy 双版本（国内版 / 海外版）：认证域与 token 互不通用，版本判定是
+// 「发现 → 导入 → 代理」三处共用的地基，判定错了就会把海外号打进腾讯域名。
+describe('WorkBuddy 版本判定（2026-09-19 双版本实测）', () => {
+  test('base_url → 版本', () => {
+    expect(workBuddyRealmOfBaseUrl('https://copilot.tencent.com/v2')).toBe('cn')
+    expect(workBuddyRealmOfBaseUrl('https://www.workbuddy.ai/v2')).toBe('ai')
+    expect(workBuddyRealmOfBaseUrl('https://www.workbuddy.cn/v2')).toBe('cn')
+    // 非 WorkBuddy 上游不参与判定（别把 zen/deepseek 也认成某个版本）。
+    expect(workBuddyRealmOfBaseUrl('https://api.deepseek.com')).toBeUndefined()
+    expect(workBuddyRealmOfBaseUrl('https://opencode.ai/zen/v1')).toBeUndefined()
+    expect(workBuddyRealmOfBaseUrl('not a url')).toBeUndefined()
+  })
+
+  test('issuer / 认证域字符串 → 版本（裸域与完整 URL 都认）', () => {
+    expect(workBuddyRealmOfIssuer('www.workbuddy.ai')).toBe('ai')
+    expect(workBuddyRealmOfIssuer('https://www.workbuddy.ai/auth/realms/copilot')).toBe('ai')
+    expect(workBuddyRealmOfIssuer('www.workbuddy.cn')).toBe('cn')
+    expect(workBuddyRealmOfIssuer('https://www.workbuddy.cn/auth/realms/copilot')).toBe('cn')
+    // 大小写不敏感
+    expect(workBuddyRealmOfIssuer('WWW.WorkBuddy.AI')).toBe('ai')
+  })
+
+  test('认不出 → undefined，绝不默认成国内版', () => {
+    // 默认成 cn 正是把海外 token 打进腾讯域名、被 APISIX 拦成 HTML 401 的根因。
+    expect(workBuddyRealmOfIssuer('')).toBeUndefined()
+    expect(workBuddyRealmOfIssuer('example.com')).toBeUndefined()
+    expect(workBuddyRealmOfIssuer('https://other.example/auth')).toBeUndefined()
+  })
+
+  test('JWT iss → 版本（不验签；坏 token 返回 undefined）', () => {
+    const jwt = (iss: string) => {
+      const b64 = Buffer.from(JSON.stringify({ iss })).toString('base64url')
+      return `eyJhbGciOiJub25lIn0.${b64}.sig`
+    }
+    expect(workBuddyRealmOfToken(jwt('https://www.workbuddy.ai/auth/realms/copilot'))).toBe('ai')
+    expect(workBuddyRealmOfToken(jwt('https://www.workbuddy.cn/auth/realms/copilot'))).toBe('cn')
+    expect(workBuddyRealmOfToken('not-a-jwt')).toBeUndefined()
+    expect(workBuddyRealmOfToken(jwt('https://other.example/auth'))).toBeUndefined()
+  })
+
+  test('版本中文名（文案统一出处）', () => {
+    expect(workBuddyRealmLabel('ai')).toBe('海外版')
+    expect(workBuddyRealmLabel('cn')).toBe('国内版')
+    expect(workBuddyRealmLabel(undefined)).toBe('版本未知')
   })
 })
 

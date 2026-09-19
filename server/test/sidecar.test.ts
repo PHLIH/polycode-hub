@@ -2,22 +2,28 @@
 // 测试绝不依赖真实网络下载：Install 用注入 fetch 替身；生命周期用本地假二进制。
 
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createServer, type AddressInfo } from 'node:net'
 import { execFileSync } from 'node:child_process'
+import { expectMode } from './helpers/posix-mode.ts'
 import {
   Sidecar,
   assetName,
+  localName,
   normalizeGOOS,
   checkDownloadURL,
+  describeFetchError,
   killSidecarSpec,
   latestRelease,
   sha256Hex,
   validatePort,
 } from '../src/sidecar/sidecar.ts'
-import { parseScutilProxy, normalizeProxyURI, maskProxyURI, egressDefToProxyURI, resolveSidecarDownloadFetch } from '../src/sidecar/httpproxy.ts'
+import type { SidecarProgress } from '../src/sidecar/sidecar.ts'
+import { partPath } from '../src/sidecar/sidecar.ts'
+import { parseScutilProxy, normalizeProxyURI, maskProxyURI, egressDefToProxyURI, resolveSidecarDownloadFetch, parseWinProxySetting } from '../src/sidecar/httpproxy.ts'
 
 const makeTemp = (prefix: string): string => mkdtempSync(join(tmpdir(), prefix))
 
@@ -67,7 +73,9 @@ describe('assetName 平台映射', () => {
           ? new Response(JSON.stringify(body), { status: 200 })
           : new Response(bin, { status: 200 })
       const dest = await s.install(false, { fetch: f, goos: 'win32', arch: 'x64' })
-      expect(dest).toBe(join(dir, 'bin', 'zcode-proxy'))
+      // 落地名必须带 .exe：这里曾经断言的是 'zcode-proxy'（无后缀），
+      // 等于把这个缺陷写进了测试——装出来的文件 spawn 起不来、taskkill 也杀不掉。
+      expect(dest).toBe(join(dir, 'bin', 'zcode-proxy.exe'))
       expect(readFileSync(dest, 'utf8')).toBe('FAKEBIN')
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -91,7 +99,9 @@ describe('SetupConfig 安全配置', () => {
       expect(cfg).toContain(key)
       const cred = readFileSync(s.credKey, 'utf8')
       expect(cred).toBe(key)
-      expect(statSync(s.credKey).mode & 0o777).toBe(0o600)
+      // 权限位断言在 Windows 上无意义（NTFS 上 chmod 不生效，恒为 0o666）——
+      // helper 内部已按平台跳过，见 helpers/posix-mode.ts。
+      expectMode(s.credKey, 0o600)
       // 两次生成 key 必须不同（随机性）
       const s2 = new Sidecar(join(dir, 'c2'))
       const key2 = s2.setupConfig(join(dir, 'sidecar2'))
@@ -182,6 +192,47 @@ describe('parseScutilProxy scutil 输出解析', () => {
     expect(parseScutilProxy('  HTTPSEnable : 0\n  HTTPEnable : 0\n')).toBeNull()
   })
 })
+
+// —— Windows 系统代理：同一台 Clash、同一个网络，macOS 一直能从 scutil 读到
+// 系统代理，Windows 却完全没读 → 「Mac 能下、Windows 永远下不来」的那条差异。
+
+describe('Windows 系统代理解析 parseWinProxySetting', () => {
+  test('分协议形态取 https（下载目标恒为 https）', () => {
+    // 实测形态（2026-09-19 本机注册表）
+    const p = parseWinProxySetting('0x1', 'http=127.0.0.1:7897;https=127.0.0.1:7897;socks=127.0.0.1:7897')
+    expect(p).toEqual({ scheme: 'http', host: '127.0.0.1:7897' })
+  })
+
+  test('只有 http 时用 http', () => {
+    expect(parseWinProxySetting('0x1', 'http=127.0.0.1:8080'))
+      .toEqual({ scheme: 'http', host: '127.0.0.1:8080' })
+  })
+
+  test('单值形态（整串就是一个 host:port）', () => {
+    expect(parseWinProxySetting('0x1', '127.0.0.1:7890'))
+      .toEqual({ scheme: 'http', host: '127.0.0.1:7890' })
+  })
+
+  test('只有 socks 时识别成 socks5（交给调用方决定回落并告警）', () => {
+    expect(parseWinProxySetting('0x1', 'socks=127.0.0.1:1080'))
+      .toEqual({ scheme: 'socks5', host: '127.0.0.1:1080' })
+  })
+
+  test('ProxyEnable 为 0 / 非 1 → 视为没配代理', () => {
+    expect(parseWinProxySetting('0x0', 'http=127.0.0.1:7897')).toBeNull()
+    expect(parseWinProxySetting('1', 'http=127.0.0.1:7897'))
+      .toEqual({ scheme: 'http', host: '127.0.0.1:7897' }) // DWORD 的另一种写法
+  })
+
+  test('ProxyServer 为空 / 缺失 → null（不去猜一个不存在的代理）', () => {
+    expect(parseWinProxySetting('0x1', '')).toBeNull()
+    expect(parseWinProxySetting('0x1', undefined)).toBeNull()
+    expect(parseWinProxySetting(undefined, 'http=127.0.0.1:7897')).toBeNull()
+  })
+})
+
+// 回归锚点：管理台「一键安装」以前用全局 fetch 直连 github release（~66MB），
+// 国内网络必然超时，页面永远转「安装中…」。这里锚死「项目 egress 表优先」。
 
 // —— 下载代理决议（复用项目 egress 配置，不写死地址）——
 // 回归锚点：管理台「一键安装」以前用全局 fetch 直连 github release（~66MB），
@@ -317,6 +368,55 @@ describe('下载代理决议 resolveSidecarDownloadFetch', () => {
   })
 })
 
+// —— describeFetchError：把 undici 的通用 `fetch failed` 还原成可诊断的一句话。
+// 四种故障（节点失效/代理没起/DNS 失败/超时）在界面上原本长得一模一样，
+// 用例形态全部取自实测，用合成 Error 构造，不打网络。
+
+describe('describeFetchError 传输层错误还原', () => {
+  // 实测形态：depth0 是 undici 的通用包装（无 code），真原因在 cause
+  const wrap = (code: string, msg: string): Error =>
+    new TypeError('fetch failed', { cause: Object.assign(new Error(msg), { code }) })
+
+  test('ECONNRESET（代理能连但节点失效）：带出 code + 分诊建议', () => {
+    const out = describeFetchError(wrap(
+      'ECONNRESET', 'Client network socket disconnected before secure TLS connection was established'))
+    expect(out).toContain('fetch failed')
+    expect(out).toContain('ECONNRESET')
+    expect(out).toContain('节点') // 建议里要点出「多半是节点失效」
+  })
+
+  test('ECONNREFUSED（代理端口没人监听）：保留原始地址便于核对', () => {
+    const out = describeFetchError(wrap('ECONNREFUSED', 'connect ECONNREFUSED 127.0.0.1:10944'))
+    expect(out).toContain('ECONNREFUSED')
+    expect(out).toContain('127.0.0.1:10944')
+    expect(out).toContain('没人监听')
+  })
+
+  test('ENOTFOUND（DNS 失败）', () => {
+    const out = describeFetchError(wrap('ENOTFOUND', 'getaddrinfo ENOTFOUND no-such-host.invalid'))
+    expect(out).toContain('ENOTFOUND')
+    expect(out).toContain('域名解析')
+  })
+
+  test('TimeoutError：没有 cause，靠 error.name 判', () => {
+    const e = new Error('The operation was aborted due to timeout')
+    e.name = 'TimeoutError'
+    const out = describeFetchError(e)
+    expect(out).toContain('超时')
+  })
+
+  test('无法识别的错误原样带出，不硬塞建议', () => {
+    expect(describeFetchError(new Error('boom'))).toBe('boom')
+    expect(describeFetchError('plain string')).toBe('plain string')
+  })
+
+  test('cause 链自引用不死循环', () => {
+    const a = new Error('x') as Error & { cause?: unknown }
+    a.cause = a
+    expect(() => describeFetchError(a)).not.toThrow()
+  })
+})
+
 // —— Install 下载（注入 fetch 替身，不打真实网络）
 
 describe('Install 下载安装', () => {
@@ -350,7 +450,8 @@ describe('Install 下载安装', () => {
       const dest = await s.install(false, { fetch: f, goos: 'darwin', arch: 'arm64' })
       expect(dest).toBe(join(dir, 'bin', 'zcode-proxy'))
       expect(readFileSync(dest, 'utf8')).toBe('FAKEBIN')
-      expect(statSync(dest).mode & 0o777).toBe(0o700)
+      // 同上：Windows 上 mode 恒为 0o666，helper 已按平台跳过。
+      expectMode(dest, 0o700)
       expect(calls).toBe(2)
       // 已存在 → 跳过下载
       const dest2 = await s.install(false, { fetch: f, goos: 'darwin', arch: 'arm64' })
@@ -370,8 +471,73 @@ describe('Install 下载安装', () => {
       .rejects.toThrow(/无资产/)
     await expect(s.install(false, { fetch: jsonFetch({}, 403), goos: 'darwin', arch: 'arm64' }))
       .rejects.toThrow(/http 403/)
+    // Windows 本地落地文件名必须带 .exe——历史缺陷是资产名解析对了（zcode-proxy.exe）
+    // 而 dest 仍硬编码 'zcode-proxy'，装出来一个无后缀文件，spawn/taskkill 都不认。
     await expect(s.install(false, { fetch: jsonFetch(releaseBody), goos: 'windows', arch: 'x64' }))
-      .resolves.toBe(join(s.binDir, 'zcode-proxy'))
+      .resolves.toBe(join(s.binDir, 'zcode-proxy.exe'))
+  })
+
+  test('release API 的 digest 会被自动采用（不再静默放行）', async () => {
+    const dir = makeTemp('polycode-sdig-')
+    try {
+      // 造一个带真实 sha256 的 body：摘要对上 → 正常安装
+      const good = createHash('sha256').update(bytes).digest('hex')
+      const body = {
+        tag_name: 'v9.9.9',
+        assets: [{
+          name: 'zcode-proxy-darwin-arm64',
+          browser_download_url: 'https://objects.githubusercontent.com/bin',
+          size: bytes.length,
+          digest: 'sha256:' + good,
+        }],
+      }
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const f = async (url: string | URL | Request): Promise<Response> =>
+        String(url).includes('api.github.com') ? jsonFetch(body)() : binFetch()()
+      await expect(s.install(false, { fetch: f, goos: 'darwin', arch: 'arm64' }))
+        .resolves.toBe(join(dir, 'bin', 'zcode-proxy'))
+
+      // 摘要对不上 → 必须拒绝，且不落地
+      const bad = { ...body, assets: [{ ...body.assets[0]!, digest: 'sha256:' + 'de'.repeat(32) }] }
+      const dir2 = makeTemp('polycode-sdig2-')
+      const s2 = new Sidecar(join(dir2, 'cred'), { binDir: join(dir2, 'bin') })
+      const f2 = async (url: string | URL | Request): Promise<Response> =>
+        String(url).includes('api.github.com') ? jsonFetch(bad)() : binFetch()()
+      await expect(s2.install(false, { fetch: f2, goos: 'darwin', arch: 'arm64' }))
+        .rejects.toThrow(/摘要不匹配/)
+      expect(existsSync(join(dir2, 'bin', 'zcode-proxy'))).toBe(false)
+      rmSync(dir2, { recursive: true, force: true })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('localName：Windows 带 .exe，其余不带；幂等口径与 assetName 对齐', () => {
+    expect(localName(normalizeGOOS('win32'))).toBe('zcode-proxy.exe')
+    expect(localName('windows')).toBe('zcode-proxy.exe')
+    expect(localName('darwin')).toBe('zcode-proxy')
+    expect(localName('linux')).toBe('zcode-proxy')
+  })
+
+  test('findBinary 认 binName（Windows 下必须找 .exe，不是无后缀）', () => {
+    // Windows 生命周期用例被 POSIX 夹具限制跳过了，这里补上「查找口径」这条
+    // 纯逻辑锚点：把 binName 显式设成 .exe，验证 findBinary 找的就是这个名字。
+    // 历史缺陷：install 落地 zcode-proxy.exe，而 findBinary 找 zcode-proxy，
+    // 于是「装得上但 status 永远 not installed、start 直接抛未安装」。
+    const dir = makeTemp('polycode-sfind-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: dir })
+      s.binName = 'zcode-proxy.exe'
+      // 只有无后缀文件时：找不到（证明确实按 binName 找，而非宽容匹配）
+      writeFileSync(join(dir, 'zcode-proxy'), 'STALE', { mode: 0o755 })
+      expect(() => s.findBinary(dir)).toThrow(/未安装/)
+      // 补上 .exe 后：命中
+      const exe = join(dir, 'zcode-proxy.exe')
+      writeFileSync(exe, 'FAKEBIN', { mode: 0o755 })
+      expect(s.findBinary(dir)).toBe(exe)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
   test('latestRelease 解析 tag 与资产', async () => {
@@ -455,7 +621,7 @@ describe('Install 下载安装', () => {
 // —— EnsureReady：装 → 配 → 起 编排（注入 fetch + 即时 sleep，不碰网络）
 
 describe('EnsureReady 一键入口', () => {
-  test('下载失败重试 3 次后报错', async () => {
+  test('release 查询失败不重试（http 500 是上游答复，重试无意义）', async () => {
     const dir = makeTemp('polycode-sready-')
     try {
       const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
@@ -463,14 +629,305 @@ describe('EnsureReady 一键入口', () => {
       const f = async (): Promise<Response> => { calls++; return new Response('nope', { status: 500 }) }
       let sleeps = 0
       await expect(s.ensureReady(join(dir, 'sidecar'), { fetch: f, sleep: async () => { sleeps++ } }))
-        .rejects.toThrow()
-      expect(calls).toBe(3)
-      expect(sleeps).toBe(3)
+        .rejects.toThrow(/http 500/)
+      // 「查释放版本」这一步拿到的 500 是上游的明确答复（不是网络抖动），
+      // 重试只是把同一个错误再问一遍。重试与续传都留给下载那一段。
+      expect(calls).toBe(1)
+      expect(sleeps).toBe(0)
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
   })
 })
+
+// —— 安装进度上报：管理台不再只有一个静止的「安装中」
+
+describe('安装进度上报', () => {
+  // 资产表必须覆盖三个平台：install 可以显式传 goos，但 ensureReady 不接受
+  // goos（它按本机平台解析资产名），少一个平台这条用例就会在该平台上失败。
+  const releaseBody = {
+    tag_name: 'v9.9.9',
+    assets: [
+      { name: 'zcode-proxy-darwin-arm64', browser_download_url: 'https://objects.githubusercontent.com/bin', size: 7 },
+      { name: 'zcode-proxy-darwin-x64', browser_download_url: 'https://objects.githubusercontent.com/bin', size: 7 },
+      { name: 'zcode-proxy-linux-x64', browser_download_url: 'https://objects.githubusercontent.com/bin', size: 7 },
+      { name: 'zcode-proxy.exe', browser_download_url: 'https://objects.githubusercontent.com/bin.exe', size: 7 },
+    ],
+  }
+  const bytes = new TextEncoder().encode('FAKEBIN')
+  const twoStepFetch = async (url: string | URL | Request): Promise<Response> =>
+    String(url).includes('api.github.com')
+      ? new Response(JSON.stringify(releaseBody), { status: 200 })
+      : new Response(bytes, { status: 200 })
+
+  test('install 上报 resolving → downloading（带字节）→ verifying', async () => {
+    const dir = makeTemp('polycode-spg-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const seen: SidecarProgress[] = []
+      await s.install(false, { fetch: twoStepFetch, goos: 'darwin', arch: 'arm64', onProgress: (p) => seen.push(p) })
+
+      // 查询 release 也要走网络（弱网下这一步就可能卡几十秒），必须先报出来，
+      // 否则用户分不清是「卡在查版本」还是「卡在下载」。
+      expect(seen[0]!.phase).toBe('resolving')
+      const dl = seen.filter((p) => p.phase === 'downloading')
+      expect(dl.length).toBeGreaterThan(0)
+      expect(dl[0]!.total).toBe(7)
+      expect(dl[dl.length - 1]!.received).toBe(7)
+      for (let i = 1; i < dl.length; i++) {
+        expect(dl[i]!.received).toBeGreaterThanOrEqual(dl[i - 1]!.received)
+      }
+      expect(seen[seen.length - 1]!.phase).toBe('verifying')
+      expect(seen[seen.length - 1]!.received).toBe(7)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('响应无 Content-Length 时用 release 报的 size 兜底（代理丢头也能画百分比）', async () => {
+    const dir = makeTemp('polycode-spg2-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const f = async (url: string | URL | Request): Promise<Response> => {
+        if (String(url).includes('api.github.com')) {
+          return new Response(JSON.stringify(releaseBody), { status: 200 })
+        }
+        // 流式 body → undici 不会写 content-length，模拟代理转发丢头
+        return new Response(new ReadableStream<Uint8Array>({
+          start(c) { c.enqueue(bytes); c.close() },
+        }), { status: 200 })
+      }
+      const seen: SidecarProgress[] = []
+      const dest = await s.install(false, { fetch: f, goos: 'darwin', arch: 'arm64', onProgress: (p) => seen.push(p) })
+      // 流式读取必须与原来的 arrayBuffer 语义等价：内容一字不差
+      expect(readFileSync(dest, 'utf8')).toBe('FAKEBIN')
+      const dl = seen.filter((p) => p.phase === 'downloading')
+      expect(dl[dl.length - 1]!.total).toBe(7) // 来自 asset.size
+      expect(dl[dl.length - 1]!.received).toBe(7)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('进度回调自己抛错不影响安装（旁路不能打断主流程）', async () => {
+    const dir = makeTemp('polycode-spg3-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const dest = await s.install(false, {
+        fetch: twoStepFetch, goos: 'darwin', arch: 'arm64',
+        onProgress: () => { throw new Error('回调自己炸了') },
+      })
+      expect(readFileSync(dest, 'utf8')).toBe('FAKEBIN')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('ensureReady 补齐 configuring / starting 两个阶段', async () => {
+    const dir = makeTemp('polycode-spg4-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      // 不真起进程：running 报 false、start 打桩成立即返回。真实 start 会
+      // waitHealthy 最长 45 秒，那 45 秒以前在页面上完全不可见。
+      vi.spyOn(s, 'running').mockResolvedValue(false)
+      const started = vi.spyOn(s, 'start').mockResolvedValue(undefined)
+      const phases: string[] = []
+      await s.ensureReady(join(dir, 'sidecar'), {
+        fetch: twoStepFetch,
+        onProgress: (p) => phases.push(p.phase),
+      })
+      expect(started).toHaveBeenCalledTimes(1)
+      expect(phases[0]).toBe('resolving')
+      expect(phases).toContain('configuring')
+      expect(phases).toContain('starting')
+      // 顺序：先装（下载/校验）→ 再配 → 最后起
+      expect(phases.indexOf('configuring')).toBeLessThan(phases.indexOf('starting'))
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+// —— 断点续传：87MB 产物在弱网/代理下每 20 秒就被掐断一次，只重试不续传
+// 等于进度条永远爬不到头（真实缺陷：macOS 装得上、Windows 装不下来）
+
+describe('下载断点续传', () => {
+  const releaseBody = {
+    tag_name: 'v9.9.9',
+    assets: [
+      { name: 'zcode-proxy.exe', browser_download_url: 'https://objects.githubusercontent.com/bin.exe', size: 100 },
+    ],
+  }
+  // 整份内容：前 40 字节 + 后 60 字节，用来验证续传拼出来的字节与一次下完等价
+  const full = Buffer.alloc(100)
+  for (let i = 0; i < full.length; i++) full[i] = i % 251
+
+  // flakyFetch：第一次只给前 40 字节就「断线」，第二次按 Range 头给剩下的。
+  // 这是 ECONNRESET 的最小复现形态——数据流中途抛错，而不是干净地结束。
+  function flakyFetch(): {
+    fetch: (url: string | URL | Request, init?: RequestInit) => Promise<Response>
+    seenRanges: (string | null)[]
+  } {
+    const seenRanges: (string | null)[] = []
+    let attempt = 0
+    const f = async (url: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      if (String(url).includes('api.github.com')) {
+        return new Response(JSON.stringify(releaseBody), { status: 200 })
+      }
+      const range = new Headers(init?.headers).get('range')
+      seenRanges.push(range)
+      attempt++
+      const start = range === null ? 0 : Number(/bytes=(\d+)-/.exec(range)![1])
+      if (attempt === 1) {
+        // 前 40 字节正常吐出来（read 拿到数据），**下一次 read 才**抛 ECONNRESET。
+        // 这是真实断流的最小复现：数据先到，然后连接被重置。若在同一个
+        // start() 里 enqueue 完立刻 error，排队的 chunk 会被丢弃、根本到不了
+        // 读端——那不是断流，是「什么都没收到」。
+        let n = 0
+        return new Response(new ReadableStream<Uint8Array>({
+          pull(c) {
+            if (n++ === 0) { c.enqueue(full.subarray(0, 40)); return }
+            c.error(new Error('read ECONNRESET'))
+          },
+        }), { status: 200 })
+      }
+      // 第二轮：带 Range 续传，必须真的只补剩下那一段
+      return new Response(full.subarray(start), {
+        status: 206,
+        headers: { 'content-range': `bytes ${start}-99/100` },
+      })
+    }
+    return { fetch: f, seenRanges }
+  }
+
+  test('中断后带 Range 续传，落地内容与一次下完完全一致', async () => {
+    const dir = makeTemp('polycode-sres-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const { fetch: f, seenRanges } = flakyFetch()
+      const dest = await s.install(false, {
+        fetch: f as never, sleep: async () => { /* 不真等 */ },
+      })
+      // 第一次不带 Range；第二次必须从第 40 字节接着下（而不是从 0 重来）
+      expect(seenRanges[0]).toBeNull()
+      expect(seenRanges[1]).toBe('bytes=40-')
+      // 拼出来的文件必须与完整内容一字不差
+      expect(Buffer.compare(readFileSync(dest), full)).toBe(0)
+      // 半成品文件在成功后必须消失
+      expect(existsSync(partPath(dest))).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('续传期间进度只增不减（不因重试倒回 0）', async () => {
+    const dir = makeTemp('polycode-sres2-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const { fetch: f } = flakyFetch()
+      const seen: SidecarProgress[] = []
+      await s.install(false, { fetch: f as never, sleep: async () => {}, onProgress: (p) => seen.push(p) })
+      const dl = seen.filter((p) => p.phase === 'downloading')
+      // 关键回归：收到过 40 字节之后，后续上报不允许再出现更小的 received。
+      // 旧实现每次重试都从 0 重下，进度条会一次次打回起点。
+      let max = 0
+      for (const p of dl) {
+        expect(p.received).toBeGreaterThanOrEqual(max)
+        max = Math.max(max, p.received)
+      }
+      expect(max).toBe(100)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('服务端不支持 Range（回 200）时不追加，避免拼出错位文件', async () => {
+    const dir = makeTemp('polycode-sres3-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      let attempt = 0
+      const f = async (url: string | URL | Request): Promise<Response> => {
+        if (String(url).includes('api.github.com')) {
+          return new Response(JSON.stringify(releaseBody), { status: 200 })
+        }
+        attempt++
+        if (attempt === 1) {
+          let n = 0
+          return new Response(new ReadableStream<Uint8Array>({
+            pull(c) {
+              if (n++ === 0) { c.enqueue(full.subarray(0, 40)); return }
+              c.error(new Error('read ECONNRESET'))
+            },
+          }), { status: 200 })
+        }
+        // 假装是个不认 Range 的镜像：无视 Range 头，从 0 重发整份
+        return new Response(full, { status: 200 })
+      }
+      const dest = await s.install(false, { fetch: f as never, sleep: async () => {} })
+      // 200 必须走截断重写：若误用追加，文件会是 40+100=140 字节的错位数据
+      expect(readFileSync(dest).length).toBe(100)
+      expect(Buffer.compare(readFileSync(dest), full)).toBe(0)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // 回归：断流恰好发生在「一段已经读完」的时刻。真实网络上极常见——数据收齐了，
+  // 收尾时连接被掐断。若只在 catch 里记失败而不回头核对落盘长度，下一轮会拿
+  // Range: bytes=<总长>- 去请求，服务端回一段又断，于是空转到耗尽重试次数。
+  // 修前实测：20MB 用例第 5 轮起 Range 卡在文件总长，一直试到 60 次才报错。
+  test('每轮都断在「刚好读完一段」时，多轮续传仍能下完（不空转到耗尽次数）', async () => {
+    const dir = makeTemp('polycode-sres5-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const chunk = 40 // 每轮只吐 40 字节，然后立刻断
+      let rounds = 0
+      const f = async (url: string | URL | Request, init?: RequestInit): Promise<Response> => {
+        if (String(url).includes('api.github.com')) {
+          return new Response(JSON.stringify(releaseBody), { status: 200 })
+        }
+        const range = new Headers(init?.headers).get('range')
+        const start = range === null ? 0 : Number(/bytes=(\d+)-/.exec(range)![1])
+        rounds++
+        const end = Math.min(start + chunk, full.length)
+        let off = start
+        return new Response(new ReadableStream<Uint8Array>({
+          pull(c) {
+            // 这一段吐完（off 到 end）之后才抛断流——断在「刚好读完」这个点上
+            if (off >= end) { c.error(new Error('read ECONNRESET')); return }
+            c.enqueue(full.subarray(off, end)); off = end
+          },
+        }), { status: 206, headers: { 'content-range': `bytes ${start}-${full.length - 1}/${full.length}` } })
+      }
+      const dest = await s.install(false, { fetch: f as never, sleep: async () => {} })
+      expect(Buffer.compare(readFileSync(dest), full)).toBe(0)
+      // 100 字节 / 每轮 40 → 3 轮足够；空转的话会一路试到上限 60
+      expect(rounds).toBeLessThanOrEqual(4)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('4xx 不重试：资产被删/被限流重试也只是再错一次', async () => {    const dir = makeTemp('polycode-sres4-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      let dlCalls = 0
+      const f = async (url: string | URL | Request): Promise<Response> => {
+        if (String(url).includes('api.github.com')) {
+          return new Response(JSON.stringify(releaseBody), { status: 200 })
+        }
+        dlCalls++
+        return new Response('denied', { status: 404 })
+      }
+      await expect(s.install(false, { fetch: f as never, sleep: async () => {} }))
+        .rejects.toThrow(/http 404/)
+      expect(dlCalls).toBe(1)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
 
 // —— Uninstall（uninstall_test.go 三个用例）
 
@@ -480,7 +937,8 @@ describe('Uninstall 卸载清理', () => {
     try {
       const binDir = join(dir, 'bin')
       mkdirSync(binDir, { recursive: true })
-      const bin = join(binDir, 'zcode-proxy')
+      // 用与 install 相同的本地命名口径（Windows 是 zcode-proxy.exe）
+      const bin = join(binDir, localName(normalizeGOOS(process.platform)))
       writeFileSync(bin, 'fake', { mode: 0o700 })
       const cred = join(dir, 'zcode-proxy-key')
       writeFileSync(cred, 'sk-local-test', { mode: 0o600 })
@@ -494,6 +952,27 @@ describe('Uninstall 卸载清理', () => {
       }
       expect(removed.binary).toBe(bin)
       expect(removed.credKey).toBe(cred)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('Windows 口径下：.exe 与历史遗留的无后缀文件一并清理', async () => {
+    // 老版本 Windows 装出来的是无后缀 'zcode-proxy'，升级后不能让它留成孤儿。
+    // 用 s.binName 显式指定 Windows 口径，使这条锚点在任意平台都能跑。
+    const dir = makeTemp('polycode-sunstale-')
+    try {
+      const binDir = join(dir, 'bin')
+      mkdirSync(binDir, { recursive: true })
+      const s = new Sidecar(join(dir, 'cred'), { binDir, workDir: join(dir, 'work') })
+      s.binName = 'zcode-proxy.exe'
+      const exe = join(binDir, 'zcode-proxy.exe')
+      const stale = join(binDir, 'zcode-proxy')
+      writeFileSync(exe, 'fake', { mode: 0o700 })
+      writeFileSync(stale, 'stale', { mode: 0o700 })
+      await s.uninstall(false)
+      expect(existsSync(exe)).toBe(false)
+      expect(existsSync(stale)).toBe(false)
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -530,8 +1009,12 @@ describe('跨平台命令构造', () => {
 })
 
 // —— Start → Running → 停止 生命周期（lifecycle_test.go：真实子进程扮演 sidecar）
-
-describe('生命周期（真实子进程）', () => {
+//
+// 仅在 POSIX 跑：夹具是一个 `#!/bin/sh` 假二进制 + `pkill` 清理，两者在 Windows
+// 上都不存在（Windows 没有 shebang 解释器，spawn 也不能直接执行 .cmd）。这不是
+// 在回避 Windows——Windows 侧的进程管理正确性由下面的「findBinary 用 binName」
+// 锚点 + killSidecarSpec('win32') 用例覆盖（taskkill /IM zcode-proxy.exe）。
+describe.skipIf(process.platform === 'win32')('生命周期（真实子进程）', () => {
   let dir: string
   let deadFile: string
   let port: number
@@ -552,7 +1035,7 @@ describe('生命周期（真实子进程）', () => {
       `setInterval(() => { if (f.existsSync(${JSON.stringify(deadFile)})) process.exit(0) }, 200)`,
     ].join('\n')
     writeFileSync(join(dir, 'sidecar-server.js'), server, { mode: 0o644 })
-    const bin = join(dir, 'zcode-proxy')
+    const bin = join(dir, localName(normalizeGOOS(process.platform)))
     writeFileSync(bin, `#!/bin/sh\nexec "${process.execPath}" "${join(dir, 'sidecar-server.js')}" "$@"\n`, { mode: 0o755 })
   })
 
