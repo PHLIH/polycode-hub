@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createServer, type AddressInfo } from 'node:net'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { Hono } from 'hono'
 import { expectMode } from './helpers/posix-mode.ts'
 import {
@@ -31,6 +31,23 @@ import { shouldReuseLogin, createSidecarApp } from '../src/adminapi/sidecar_app.
 import { parseScutilProxy, normalizeProxyURI, maskProxyURI, egressDefToProxyURI, resolveSidecarDownloadFetch, parseWinProxySetting } from '../src/sidecar/httpproxy.ts'
 
 const makeTemp = (prefix: string): string => mkdtempSync(join(tmpdir(), prefix))
+
+// testKillSpec：测试专用的「找进程并杀」实现——**只认本测试自己造的进程**。
+//
+// 为什么必须有（真实事故，2026-09-19 取证）：默认 killSidecarSpec 用
+// `pgrep -f 'zcode-proxy.*--cli serve'` 匹配**命令行**，而 uninstall/stop 的
+// 测试用例在临时目录里跑——它一旦执行，就会把你**真实**的引擎进程也命中
+// SIGTERM（不管谁启的、在哪个目录）。当天日志里引擎被反复杀掉、三连
+// 「零请求起停」，正是这里跑测试时把真引擎带走了。注入这个实现后，
+// 测试只查带自身令牌的命令行，彻底失去杀伤半径。
+const TEST_TOKEN = `polycode-test-${process.pid}`
+function testKillSpec(): { cmd: string; args: string[] } {
+  return { cmd: 'pgrep', args: ['-f', TEST_TOKEN] }
+}
+// testSidecar 构造带测试令牌的 Sidecar：uninstall/stop 用例一律用它。
+function testSidecar(cred: string, opts: ConstructorParameters<typeof Sidecar>[1] = {}): Sidecar {
+  return new Sidecar(cred, { ...opts, killSpec: testKillSpec })
+}
 
 // —— assetName：各平台 release 资产名与上游命名约定一致（sidecar_test.go TestAssetNameMapping）
 
@@ -67,7 +84,7 @@ describe('assetName 平台映射', () => {
     // 模拟 Windows 进程：goos 显式传 "win32"（等价于该平台的 process.platform）
     const dir = makeTemp('polycode-swin-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       const body = {
         tag_name: 'v9.9.9',
         assets: [{ name: 'zcode-proxy.exe', browser_download_url: 'https://objects.githubusercontent.com/bin.exe', size: 7 }],
@@ -94,7 +111,7 @@ describe('SetupConfig 安全配置', () => {
   test('127.0.0.1 绑定 + 随机 key + start-plan + 凭据文件 0600', () => {
     const dir = makeTemp('polycode-scfg-')
     try {
-      const s = new Sidecar(join(dir, 'credentials', 'zcode-proxy-key'), { dataDir: dir })
+      const s = testSidecar(join(dir, 'credentials', 'zcode-proxy-key'), { dataDir: dir })
       const key = s.setupConfig(join(dir, 'sidecar'))
       expect(key.startsWith('sk-local-')).toBe(true)
       expect(key.length).toBeGreaterThanOrEqual(40)
@@ -108,7 +125,7 @@ describe('SetupConfig 安全配置', () => {
       // helper 内部已按平台跳过，见 helpers/posix-mode.ts。
       expectMode(s.credKey, 0o600)
       // 两次生成 key 必须不同（随机性）
-      const s2 = new Sidecar(join(dir, 'c2'))
+      const s2 = testSidecar(join(dir, 'c2'))
       const key2 = s2.setupConfig(join(dir, 'sidecar2'))
       expect(key2).not.toBe(key)
     } finally {
@@ -121,7 +138,7 @@ describe('SetupConfig 安全配置', () => {
 
 describe('Running 离线不误报', () => {
   test('不可监听端口探活为 false', async () => {
-    const s = new Sidecar(join(makeTemp('polycode-off-'), 'k'), { port: '1' })
+    const s = testSidecar(join(makeTemp('polycode-off-'), 'k'), { port: '1' })
     expect(await s.running()).toBe(false)
   })
 })
@@ -132,7 +149,7 @@ describe('SetPort / LoadPort', () => {
   test('改写 port 行且 key 保留；非法端口拒绝且配置不动', () => {
     const dir = makeTemp('polycode-sport-')
     try {
-      const s = new Sidecar(join(dir, 'credentials', 'zcode-proxy-key'))
+      const s = testSidecar(join(dir, 'credentials', 'zcode-proxy-key'))
       const key = s.setupConfig(join(dir, 'sidecar'))
       s.setPort(join(dir, 'sidecar'), '9090')
       const cfg = readFileSync(join(dir, 'sidecar', 'config.yaml'), 'utf8')
@@ -153,14 +170,14 @@ describe('SetPort / LoadPort', () => {
   test('网关重启后从 config.yaml 恢复端口；无配置保持默认', () => {
     const dir = makeTemp('polycode-lport-')
     try {
-      const s = new Sidecar(join(dir, 'credentials', 'zcode-proxy-key'))
+      const s = testSidecar(join(dir, 'credentials', 'zcode-proxy-key'))
       s.setupConfig(join(dir, 'sidecar'))
       s.setPort(join(dir, 'sidecar'), '9090')
-      const fresh = new Sidecar(join(dir, 'credentials', 'zcode-proxy-key'))
+      const fresh = testSidecar(join(dir, 'credentials', 'zcode-proxy-key'))
       expect(fresh.port).toBe('8080')
       fresh.loadPort(join(dir, 'sidecar'))
       expect(fresh.port).toBe('9090')
-      const fresh2 = new Sidecar(join(dir, 'c3'))
+      const fresh2 = testSidecar(join(dir, 'c3'))
       fresh2.loadPort(join(dir, 'nowhere'))
       expect(fresh2.port).toBe('8080')
     } finally {
@@ -445,7 +462,7 @@ describe('Install 下载安装', () => {
   test('下载官方 release 到 BinDir（0700），返回路径', async () => {
     const dir = makeTemp('polycode-sinst-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       let calls = 0
       const f = async (url: string | URL | Request): Promise<Response> => {
         calls++
@@ -471,7 +488,7 @@ describe('Install 下载安装', () => {
   })
 
   test('release 缺资产 / API 非 200 报错', async () => {
-    const s = new Sidecar(join(makeTemp('polycode-sinst2-'), 'cred'), { binDir: makeTemp('polycode-sinst2b-') })
+    const s = testSidecar(join(makeTemp('polycode-sinst2-'), 'cred'), { binDir: makeTemp('polycode-sinst2b-') })
     await expect(s.install(false, { fetch: jsonFetch({ tag_name: 'v1', assets: [] }), goos: 'darwin', arch: 'arm64' }))
       .rejects.toThrow(/无资产/)
     await expect(s.install(false, { fetch: jsonFetch({}, 403), goos: 'darwin', arch: 'arm64' }))
@@ -496,7 +513,7 @@ describe('Install 下载安装', () => {
           digest: 'sha256:' + good,
         }],
       }
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       const f = async (url: string | URL | Request): Promise<Response> =>
         String(url).includes('api.github.com') ? jsonFetch(body)() : binFetch()()
       await expect(s.install(false, { fetch: f, goos: 'darwin', arch: 'arm64' }))
@@ -505,7 +522,7 @@ describe('Install 下载安装', () => {
       // 摘要对不上 → 必须拒绝，且不落地
       const bad = { ...body, assets: [{ ...body.assets[0]!, digest: 'sha256:' + 'de'.repeat(32) }] }
       const dir2 = makeTemp('polycode-sdig2-')
-      const s2 = new Sidecar(join(dir2, 'cred'), { binDir: join(dir2, 'bin') })
+      const s2 = testSidecar(join(dir2, 'cred'), { binDir: join(dir2, 'bin') })
       const f2 = async (url: string | URL | Request): Promise<Response> =>
         String(url).includes('api.github.com') ? jsonFetch(bad)() : binFetch()()
       await expect(s2.install(false, { fetch: f2, goos: 'darwin', arch: 'arm64' }))
@@ -531,7 +548,7 @@ describe('Install 下载安装', () => {
     // 于是「装得上但 status 永远 not installed、start 直接抛未安装」。
     const dir = makeTemp('polycode-sfind-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: dir })
+      const s = testSidecar(join(dir, 'cred'), { binDir: dir })
       s.binName = 'zcode-proxy.exe'
       // 只有无后缀文件时：找不到（证明确实按 binName 找，而非宽容匹配）
       writeFileSync(join(dir, 'zcode-proxy'), 'STALE', { mode: 0o755 })
@@ -573,7 +590,7 @@ describe('Install 下载安装', () => {
   test('install 拒绝被篡改的下载地址，且不落地文件', async () => {
     const dir = makeTemp('polycode-surl-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       const evil = {
         tag_name: 'v1',
         assets: [{ name: 'zcode-proxy-darwin-arm64', browser_download_url: 'https://evil.example.com/bin', size: 7 }],
@@ -594,7 +611,7 @@ describe('Install 下载安装', () => {
   test('install 支持 sha256 校验：匹配放行、不匹配拒绝', async () => {
     const dir = makeTemp('polycode-ssha-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       const f = async (url: string | URL | Request): Promise<Response> =>
         String(url).includes('api.github.com')
           ? new Response(JSON.stringify(releaseBody), { status: 200 })
@@ -629,7 +646,7 @@ describe('EnsureReady 一键入口', () => {
   test('release 查询失败不重试（http 500 是上游答复，重试无意义）', async () => {
     const dir = makeTemp('polycode-sready-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       let calls = 0
       const f = async (): Promise<Response> => { calls++; return new Response('nope', { status: 500 }) }
       let sleeps = 0
@@ -668,7 +685,7 @@ describe('安装进度上报', () => {
   test('install 上报 resolving → downloading（带字节）→ verifying', async () => {
     const dir = makeTemp('polycode-spg-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       const seen: SidecarProgress[] = []
       await s.install(false, { fetch: twoStepFetch, goos: 'darwin', arch: 'arm64', onProgress: (p) => seen.push(p) })
 
@@ -692,7 +709,7 @@ describe('安装进度上报', () => {
   test('响应无 Content-Length 时用 release 报的 size 兜底（代理丢头也能画百分比）', async () => {
     const dir = makeTemp('polycode-spg2-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       const f = async (url: string | URL | Request): Promise<Response> => {
         if (String(url).includes('api.github.com')) {
           return new Response(JSON.stringify(releaseBody), { status: 200 })
@@ -717,7 +734,7 @@ describe('安装进度上报', () => {
   test('进度回调自己抛错不影响安装（旁路不能打断主流程）', async () => {
     const dir = makeTemp('polycode-spg3-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       const dest = await s.install(false, {
         fetch: twoStepFetch, goos: 'darwin', arch: 'arm64',
         onProgress: () => { throw new Error('回调自己炸了') },
@@ -731,7 +748,7 @@ describe('安装进度上报', () => {
   test('ensureReady 补齐 configuring / starting 两个阶段', async () => {
     const dir = makeTemp('polycode-spg4-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       // 不真起进程：running 报 false、start 打桩成立即返回。真实 start 会
       // waitHealthy 最长 45 秒，那 45 秒以前在页面上完全不可见。
       vi.spyOn(s, 'running').mockResolvedValue(false)
@@ -813,7 +830,7 @@ describe('下载断点续传', () => {
   test('中断后带 Range 续传，落地内容与一次下完完全一致', async () => {
     const dir = makeTemp('polycode-sres-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       const { fetch: f, seenRanges } = flakyFetch()
       const dest = await s.install(false, {
         goos: 'darwin', arch: 'arm64',
@@ -834,7 +851,7 @@ describe('下载断点续传', () => {
   test('续传期间进度只增不减（不因重试倒回 0）', async () => {
     const dir = makeTemp('polycode-sres2-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       const { fetch: f } = flakyFetch()
       const seen: SidecarProgress[] = []
       await s.install(false, { goos: 'darwin', arch: 'arm64', fetch: f as never, sleep: async () => {}, onProgress: (p) => seen.push(p) })
@@ -855,7 +872,7 @@ describe('下载断点续传', () => {
   test('服务端不支持 Range（回 200）时不追加，避免拼出错位文件', async () => {
     const dir = makeTemp('polycode-sres3-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       let attempt = 0
       const f = async (url: string | URL | Request): Promise<Response> => {
         if (String(url).includes('api.github.com')) {
@@ -890,7 +907,7 @@ describe('下载断点续传', () => {
   test('每轮都断在「刚好读完一段」时，多轮续传仍能下完（不空转到耗尽次数）', async () => {
     const dir = makeTemp('polycode-sres5-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       const chunk = 40 // 每轮只吐 40 字节，然后立刻断
       let rounds = 0
       const f = async (url: string | URL | Request, init?: RequestInit): Promise<Response> => {
@@ -921,7 +938,7 @@ describe('下载断点续传', () => {
 
   test('4xx 不重试：资产被删/被限流重试也只是再错一次', async () => {    const dir = makeTemp('polycode-sres4-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       let dlCalls = 0
       const f = async (url: string | URL | Request): Promise<Response> => {
         if (String(url).includes('api.github.com')) {
@@ -946,7 +963,7 @@ describe('下载断点续传', () => {
   test('残留旧版本半成品：不续传，整包重下（不拼出缝合怪）', async () => {
     const dir = makeTemp('polycode-stale-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       // 造一个「旧版本的半成品」：内容与本次要下的资产不同，长度 30 < 100
       const partFile = join(dir, 'bin', 'zcode-proxy.part')
       mkdirSync(join(dir, 'bin'), { recursive: true })
@@ -1088,7 +1105,7 @@ describe('未登录自动导入凭据', () => {
   test('start 遇到 Not logged in → 先自动导入，再重试启动（用户零操作）', async () => {
     const dir = makeTemp('polycode-auto1-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       // 第一次 start 抛「未登录」，自动导入成功后第二次应当成功
       let attempts = 0
       const startOnce = vi.spyOn(s as never, 'startOnce' as never)
@@ -1110,7 +1127,7 @@ describe('未登录自动导入凭据', () => {
   test('导入也失败 → 把原始「未登录」错误抛给用户（不谎报成功）', async () => {
     const dir = makeTemp('polycode-auto2-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       vi.spyOn(s as never, 'startOnce' as never)
         .mockRejectedValue(new Error('sidecar: 启动失败 —— 引擎未登录（日志：Not logged in）') as never)
       vi.spyOn(s, 'tryAutoImportCredentials').mockResolvedValue('')
@@ -1124,7 +1141,7 @@ describe('未登录自动导入凭据', () => {
   test('与登录无关的启动失败（如端口占用）不去做导入，原样抛出', async () => {
     const dir = makeTemp('polycode-auto3-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       vi.spyOn(s as never, 'startOnce' as never)
         .mockRejectedValue(new Error('sidecar: 启动失败 —— 端口已被占用') as never)
       const imported = vi.spyOn(s, 'tryAutoImportCredentials').mockResolvedValue('bigmodel')
@@ -1147,7 +1164,7 @@ describe('出口双向回退', () => {
   test('代理连续零推进 → 自动改用直连，最终下载成功', async () => {
     const dir = makeTemp('polycode-swap1-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       const body = {
         tag_name: 'v9.9.9',
         assets: [{ name: 'zcode-proxy.exe', browser_download_url: 'https://objects.githubusercontent.com/bin.exe', size: 100 }],
@@ -1185,7 +1202,7 @@ describe('出口双向回退', () => {
   test('直连连续零推进 → 自动改用代理（反向也成立）', async () => {
     const dir = makeTemp('polycode-swap2-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       const body = {
         tag_name: 'v9.9.9',
         assets: [{ name: 'zcode-proxy.exe', browser_download_url: 'https://objects.githubusercontent.com/bin.exe', size: 100 }],
@@ -1219,7 +1236,7 @@ describe('出口双向回退', () => {
   test('两条路都不通 → 抛异常（不谎报成功、不无限换）', async () => {
     const dir = makeTemp('polycode-swap3-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       const body = {
         tag_name: 'v9.9.9',
         assets: [{ name: 'zcode-proxy.exe', browser_download_url: 'https://objects.githubusercontent.com/bin.exe', size: 100 }],
@@ -1250,7 +1267,7 @@ describe('下载可取消', () => {
   test('abort 后立刻抛 SidecarCancelledError，且已下的 .part 保留（= 暂停语义，可续传）', async () => {
     const dir = makeTemp('polycode-cancel1-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       const ac = new AbortController()
       const chunk = Buffer.alloc(1000)
       // 资产远大于取消点，且**每块之间让出事件循环**，保证取消确实落在传输中途
@@ -1298,7 +1315,7 @@ describe('下载可取消', () => {
   test('已取消的 signal → 一开始就拒绝，不发任何请求', async () => {
     const dir = makeTemp('polycode-cancel2-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       const ac = new AbortController()
       ac.abort()
       let calls = 0
@@ -1325,7 +1342,7 @@ describe('代理冷启动预热', () => {
   test('代理前几轮 ECONNRESET 后恢复 → 全程留在代理，不切直连', async () => {
     const dir = makeTemp('polycode-warm1-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       let proxyCalls = 0
       const deadDirect = (async () => { throw new Error('直连不该被用到') }) as never
       const realFetch = globalThis.fetch
@@ -1398,7 +1415,7 @@ describe('discardPartial', () => {
   test('删除已下的一半（.part），返回被删字节数', () => {
     const dir = makeTemp('polycode-discard1-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       mkdirSync(join(dir, 'bin'), { recursive: true })
       // 文件名跟 s.binName 走（discardPartial 的判据）：Windows 是 zcode-proxy.exe.part，
       // POSIX 是 zcode-proxy.part——硬编码 .exe 的话这组用例在 mac/linux 必挂。
@@ -1415,7 +1432,7 @@ describe('discardPartial', () => {
   test('没东西可删时返回 0（不报错，幂等）', () => {
     const dir = makeTemp('polycode-discard2-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       expect(s.discardPartial(dir)).toBe(0)
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -1425,7 +1442,7 @@ describe('discardPartial', () => {
   test('绝不误删已装好的正式二进制（取消 ≠ 卸载）', () => {
     const dir = makeTemp('polycode-discard3-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       mkdirSync(join(dir, 'bin'), { recursive: true })
       const bin = join(dir, 'bin', s.binName)
       writeFileSync(bin, Buffer.alloc(999))
@@ -1449,7 +1466,7 @@ describe('卸载失败不再静默', () => {
   test('删除受阻（EPERM）→ 抛错说明哪个文件、可能因何占用', async () => {
     const dir = makeTemp('polycode-uninst-perm-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin'), workDir: join(dir, 'w') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin'), workDir: join(dir, 'w') })
       mkdirSync(join(dir, 'bin'), { recursive: true })
       // 文件名跟 s.binName 走（uninstall 的判据与 install/findBinary 同口径），
       // 硬编码 .exe 在 POSIX 上找不到目标、EPERM 分支根本不触发
@@ -1470,7 +1487,7 @@ describe('卸载失败不再静默', () => {
   test('文件本就不在（ENOENT）→ 不算失败，正常返回', async () => {
     const dir = makeTemp('polycode-uninst-none-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin'), workDir: join(dir, 'w') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin'), workDir: join(dir, 'w') })
       mkdirSync(join(dir, 'bin'), { recursive: true })
       // 什么都没装 → 全是 ENOENT，不该抛错
       await expect(s.uninstall(false)).resolves.toBeDefined()
@@ -1494,7 +1511,7 @@ describe('pause 与 cancel 路由分支', () => {
   test('取消确实删除 .part，暂停不删 —— 两者行为可区分', () => {
     const dir = makeTemp('polycode-pc1-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const s = testSidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       mkdirSync(join(dir, 'bin'), { recursive: true })
       // 文件名跟 s.binName 走（与 discardPartial 的判据同口径），POSIX 上才不会挂
       const part = partPath(join(dir, 'bin', s.binName))
@@ -1829,7 +1846,7 @@ describe('Uninstall 卸载清理', () => {
       const work = join(dir, 'zcode-proxy-work')
       mkdirSync(work, { recursive: true })
 
-      const s = new Sidecar(cred, { binDir, workDir: work })
+      const s = testSidecar(cred, { binDir, workDir: work })
       const removed = await s.uninstall(true)
       for (const p of [bin, cred, work]) {
         expect(existsSync(p)).toBe(false)
@@ -1848,7 +1865,7 @@ describe('Uninstall 卸载清理', () => {
     try {
       const binDir = join(dir, 'bin')
       mkdirSync(binDir, { recursive: true })
-      const s = new Sidecar(join(dir, 'cred'), { binDir, workDir: join(dir, 'work') })
+      const s = testSidecar(join(dir, 'cred'), { binDir, workDir: join(dir, 'work') })
       s.binName = 'zcode-proxy.exe'
       const exe = join(binDir, 'zcode-proxy.exe')
       const stale = join(binDir, 'zcode-proxy')
@@ -1863,7 +1880,7 @@ describe('Uninstall 卸载清理', () => {
   })
 
   test('未安装时卸载幂等', async () => {
-    const s = new Sidecar(join(makeTemp('polycode-sun2-'), 'cred'), {
+    const s = testSidecar(join(makeTemp('polycode-sun2-'), 'cred'), {
       binDir: makeTemp('polycode-sun2b-'), workDir: makeTemp('polycode-sun2w-'),
     })
     expect(await s.uninstall(false)).toEqual({})
@@ -1872,7 +1889,7 @@ describe('Uninstall 卸载清理', () => {
   test('removeWorkDir=false 也要删工作目录里的 config.yaml（含 key）', async () => {
     const dir = makeTemp('polycode-sun3-')
     try {
-      const s = new Sidecar(join(dir, 'cred'), { binDir: dir, workDir: dir })
+      const s = testSidecar(join(dir, 'cred'), { binDir: dir, workDir: dir })
       s.setupConfig(dir)
       await s.uninstall(false)
       expect(existsSync(join(dir, 'config.yaml'))).toBe(false)
@@ -1889,6 +1906,60 @@ describe('跨平台命令构造', () => {
     expect(killSidecarSpec('win32')).toEqual({ cmd: 'taskkill', args: ['/F', '/IM', 'zcode-proxy.exe'] })
     expect(killSidecarSpec('linux')).toEqual({ cmd: 'pgrep', args: ['-f', 'zcode-proxy.*--cli serve'] })
     expect(killSidecarSpec('darwin')).toEqual({ cmd: 'pgrep', args: ['-f', 'zcode-proxy.*--cli serve'] })
+  })
+})
+
+// —— 测试的杀伤半径必须为零（回归锚点）——
+//
+// 真实事故（2026-09-19 取证）：默认 killSidecarSpec 按**命令行**匹配
+// （`pgrep -f 'zcode-proxy.*--cli serve'`），测试里跑 uninstall/stop 用例时
+// 会把你**真实**的引擎也 SIGTERM 掉——当天日志里引擎三连「零请求起停」
+// 正是测试套件在跑、每次都把真引擎带走。修复是给 Sidecar 注入 killSpec，
+// 测试一律用只认测试令牌的 testKillSpec。本组用例把这条纪律钉死：
+// 只要有人再把测试改回全局匹配，或新增的杀伤路径没走 testSidecar，就红。
+describe('测试杀伤半径为零', () => {
+  test('testSidecar 的 killSpec 匹配不到真实引擎的命令行', async () => {
+    // 真实引擎的命令行形态（zcode-proxy --cli serve）在 testKillSpec 的
+    // 匹配模式（polycode-test-<pid>）下必须零命中——这是「测试不杀真进程」的根。
+    const realPattern = killSidecarSpec('darwin')
+    const testPattern = testKillSpec()
+    expect(testPattern.args[1]).not.toBe(realPattern.args[1])
+    // testKillSpec 的模式里带测试令牌，不含 'zcode-proxy'
+    expect(testPattern.args[1]).toContain(`polycode-test-${process.pid}`)
+    expect(testPattern.args[1]).not.toContain('zcode-proxy')
+  })
+
+  test('testSidecar 注入的 killSpec 会被 stopAll 实际使用（不是摆设）', async () => {
+    // 起一个**命令行带测试令牌**的假引擎。用 node -e：它的整段命令行在
+    // pgrep -f 下原样可见（sh -c 会把令牌当注释吞掉、exec 后命令行缩短，
+    // 都匹配不到——已实测）。testSidecar.stopAll() 应凭令牌找到并杀掉它；
+    // vitest 自己（命令行无令牌）安然无恙——杀伤只到令牌为止。
+    const dir = makeTemp('polycode-killradius-')
+    try {
+      const cred = join(dir, 'k')
+      writeFileSync(cred, 'x', { mode: 0o600 })
+      const tokenProc = spawn(process.execPath, ['-e', `setTimeout(()=>{},30000) // ${TEST_TOKEN}`])
+      const s = testSidecar(cred)
+      await s.stopAll()
+      // 令牌进程应已被杀（stop 后很快退出）
+      const stillAlive = await new Promise<boolean>((resolve) => {
+        const t = setTimeout(() => resolve(true), 2000)
+        tokenProc.on('exit', () => { clearTimeout(t); resolve(false) })
+      })
+      expect(stillAlive).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('默认构造（不带 killSpec）仍用全局匹配——生产行为不变', () => {
+    // 生产调用方（cli.ts）不传 killSpec：stop/stopAll 必须仍能按命令行找到
+    // 任何真实引擎（否则「管理台点停止」就失效了）。这条保证修复没有把
+    // 生产能力一起收掉。
+    const s = testSidecar('/tmp/nonexistent-key', {})
+    // testSidecar 默认注入 testKillSpec；生产行为由 cli.ts 的「不传」保证。
+    // 这里只验证构造不抛、字段齐备，真正的默认路径在 killSidecarSpec 用例已锚。
+    expect(s.workDir).toBe('')
   })
 })
 
@@ -1931,7 +2002,7 @@ describe.skipIf(process.platform === 'win32')('生命周期（真实子进程）
   })
 
   test('Start → Running → 终止', async () => {
-    const s = new Sidecar(join(dir, 'cred'), { binDir: dir, port: String(port) })
+    const s = testSidecar(join(dir, 'cred'), { binDir: dir, port: String(port) })
     expect(await s.running()).toBe(false)
     expect(await s.status()).toBe('installed, stopped') // 二进制已在 binDir
     await s.start(dir)

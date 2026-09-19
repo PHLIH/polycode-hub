@@ -154,6 +154,16 @@ export interface SidecarOptions {
   dataDir?: string // 默认 ~/.zcode-proxy
   port?: string // 默认 8080
   workDir?: string // sidecar 工作目录（含其 config.yaml）
+  // killSpec 覆盖「找出 sidecar 进程并杀掉」的命令（默认 killSidecarSpec）。
+  //
+  // 为什么必须可注入（真实事故，2026-09-19 取证）：默认的
+  // `pgrep -f 'zcode-proxy.*--cli serve'` 匹配的是**命令行**而不是路径——
+  // 测试在临时目录里跑 uninstall 用例时，stopAll 一执行就会把你**真实**
+  // 引擎也命中杀掉（不管它谁启的、在哪个目录）。当天日志里引擎被反复
+  // SIGTERM、三连「零请求起停」，正是测试套件在跑、每次都把真引擎带走。
+  // 生产调用方不传（用默认全局匹配）；测试必须传一个**只认自己造的进程**的
+  // 实现（见 sidecar.test.ts 的 testKillSpec），让测试彻底失去杀伤半径。
+  killSpec?: (platform: string) => { cmd: string; args: string[] }
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => { setTimeout(r, ms) })
@@ -561,6 +571,8 @@ export class Sidecar {
   // workDir 是 sidecar 工作目录（含其 config.yaml 与可选的本地二进制）。
   // findBinary 查找顺序：workDir/<binName> → sidecarDir/<binName> → binDir/<binName>。
   workDir: string
+  // killSpec 是「找进程并杀」的实现（默认全局 pgrep/taskkill，见 SidecarOptions）。
+  private readonly killSpec: (platform: string) => { cmd: string; args: string[] }
 
   constructor(credKey: string, opts: SidecarOptions = {}) {
     const home = homedir()
@@ -570,6 +582,7 @@ export class Sidecar {
     this.port = opts.port ?? '8080'
     this.binName = localName(normalizeGOOS(process.platform))
     this.workDir = opts.workDir ?? ''
+    this.killSpec = opts.killSpec ?? killSidecarSpec
   }
 
   // —— 下载安装 ——
@@ -1089,7 +1102,7 @@ defaultModel: glm-5.3-flash
   // stop 停止 sidecar（按进程名匹配）。
   async stop(): Promise<void> {
     if (!(await this.running())) return
-    const spec = killSidecarSpec(process.platform)
+    const spec = this.killSpec(process.platform)
     const out = await new Promise<string>((resolve) => {
       execFile(spec.cmd, spec.args, { encoding: 'utf8', timeout: 10_000 }, (err, stdout) => {
         resolve(err ? '' : stdout) // pgrep 无匹配 = 已停
@@ -1110,7 +1123,7 @@ defaultModel: glm-5.3-flash
   // 典型就是登录流程：auth login 要等用户授权 5 分钟，它持有 exe 文件句柄，
   // 但不监听端口。卸载时 Windows 因此报 EPERM「文件被占用」，删不掉。
   async stopAll(): Promise<void> {
-    const spec = killSidecarSpec(process.platform)
+    const spec = this.killSpec(process.platform)
     const out = await new Promise<string>((resolve) => {
       execFile(spec.cmd, spec.args, { encoding: 'utf8', timeout: 10_000 }, (err, stdout) => {
         resolve(err ? '' : stdout)
