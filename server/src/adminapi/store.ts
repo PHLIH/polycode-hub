@@ -412,9 +412,15 @@ export function migrateWorkBuddyAttributionHeaders(s: ProviderStore): number {
   return fixed
 }
 
+// 缺失补种：种子表里有、库里没有的账号补进去（按 id 判等，已存在的一律不动）。
+// 不能只认「空库才播种」：账号表一旦有别的渠道（如 workbuddy 先导了几行），
+// apps.yaml 里的账号就永远进不来——静默丢失，管理台上看不到，池子里也不轮换。
+// 种子是配置文件的口径，运行时改动（惩罚/disabled）都在库里已有的行上，互不打架。
 export function seedAccountsIfEmpty(s: AccountStore, seed: Account[]): void {
-  if (s.list().length > 0) return
-  for (const a of seed) s.put(a)
+  for (const a of seed) {
+    if (s.get(a.id)) continue
+    s.put(a)
+  }
 }
 
 // ---- 出口代理（egress）----

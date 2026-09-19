@@ -2,6 +2,7 @@
 // 路径表按 goos 参数生成（darwin/linux/windows），一律可注入，测试不依赖运行环境。
 // 报告永不含密钥原文。
 
+import { createHash } from 'node:crypto'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -525,27 +526,95 @@ export function checkWorkBuddyWithAccounts(
   return checkWorkBuddyRealm('cn', paths, authDirs, fallbackRoots)
 }
 
-// ---- ZCode（仅装机提示，JWT 不落本地可读存储） ----
+// ---- ZCode（读客户端配置判定登录态；JWT 不落本地可读存储之外做最小指纹） ----
 
-// 装机即 unknown + OAuth 指引；未发现安装目录则 missing。
-// 登录态无法本地判定（JWT 不落可读存储）。
-export function checkZCode(dirs: string[]): Finding {
+// ZCode 客户端把「已登录」的痕迹留在两份 JSON 里（都不含业务 JWT 本体以外的
+// 结构化信息，只认 apiKey 形态的 access_token 字段）：
+//   · CLI：~/.zcode/cli/config.json → provider.zai.options.apiKey
+//   · 桌面：~/.zcode/v2/config.json → provider["builtin:zai-start-plan" 等].options.apiKey
+// 任一处有非空 apiKey 即视为已登录（enabled=false 只代表当前未选中该通道，
+// 不代表凭据失效——多通道客户端常驻多个凭据）。
+// 报告只给指纹（sha256 前 12 位），绝不回传密钥原文——发现层全链路脱敏。
+//
+// 之前这里恒报「登录态无法本地判定」，发现页对 ZCode 永远显示 unknown：
+// 用户配好了账号也看不出本机登录态是否被识别，只能开终端自己验证。改为读
+// 上述两处配置后，「已登录/未登录」在发现页直接可见。
+export function checkZCode(dirs: string[], home = homedir()): Finding {
   const f: Finding = { key: 'zcode', harness: 'ZCode' }
+  let installed = false
   for (const d of dirs) {
     try {
       if (statSync(d).isDirectory()) {
-        f.status = 'unknown'
-        f.detail = '已安装；登录态无法本地判定（JWT 不落可读存储）'
-        f.actions = ['用 polycode-hub zcode login 走 OAuth 登录后手动填 JWT']
-        return f
+        installed = true
+        break
       }
     } catch {
       // 缺失继续
     }
   }
-  f.status = 'missing'
-  f.detail = '未发现安装目录'
+  // 登录痕迹与安装目录分开判：CLI/桌面配置都在 ~/.zcode 下，安装目录
+  // （macOS 是 Application Support/ZCode）可能因为便携安装等原因缺席。
+  const fp = zcodeLoginFingerprint(home)
+  if (fp) {
+    f.status = 'ready'
+    f.detail = `已登录（${fp.source === 'cli' ? 'CLI' : '桌面'}凭据，指纹 ${fp.fingerprint}）`
+    f.actions = ['凭据已在客户端本地，账号请用 polycode-hub zcode login 换取业务 JWT 后填入']
+  } else if (installed) {
+    f.status = 'unknown'
+    f.detail = '已安装；未发现登录痕迹（客户端内登录一次后再扫）'
+    f.actions = ['在 ZCode 客户端完成登录，或用 polycode-hub zcode login 走 OAuth 登录后手动填 JWT']
+  } else {
+    f.status = 'missing'
+    f.detail = '未发现安装目录与登录痕迹'
+  }
   return f
+}
+
+// ZCode 本机登录指纹：读 CLI/桌面配置里的 access_token 形态字段，返回脱敏指纹。
+// 只回「来源 + sha256 前 12 位」，任何地方都不落 token 本体（含日志/DB/前端）。
+export function zcodeLoginFingerprint(home: string): { source: 'cli' | 'desktop'; fingerprint: string } | undefined {
+  const candidates: { source: 'cli' | 'desktop'; path: string }[] = [
+    { source: 'cli', path: join(home, '.zcode', 'cli', 'config.json') },
+    { source: 'desktop', path: join(home, '.zcode', 'v2', 'config.json') },
+  ]
+  for (const { source, path } of candidates) {
+    let raw: string
+    try {
+      raw = readFileSync(path, 'utf8')
+    } catch {
+      continue
+    }
+    let cfg: unknown
+    try {
+      cfg = JSON.parse(raw)
+    } catch {
+      continue
+    }
+    if (hasZcodeCredential(cfg)) return { source, fingerprint: zcodeCredentialFingerprint(cfg) }
+  }
+  return undefined
+}
+
+// 递归找 options.apiKey 形态的非空字符串值（provider.*.options.apiKey）。
+// 刻意只认 options.apiKey 这一个键：碰到别的键名一律忽略，避免把无关
+// 文件内容当凭据指纹。
+function hasZcodeCredential(cfg: unknown): boolean {
+  return zcodeApiKeyValues(cfg).length > 0
+}
+
+function zcodeCredentialFingerprint(cfg: unknown): string {
+  const first = zcodeApiKeyValues(cfg)[0] ?? ''
+  return createHash('sha256').update(first, 'utf8').digest('hex').slice(0, 12)
+}
+
+function zcodeApiKeyValues(node: unknown, depth = 0): string[] {
+  if (depth > 4 || node === null || typeof node !== 'object') return []
+  const out: string[] = []
+  for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+    if (k === 'apiKey' && typeof v === 'string' && v.length >= 20) out.push(v)
+    else out.push(...zcodeApiKeyValues(v, depth + 1))
+  }
+  return out
 }
 
 // ---- OpenCode Zen（连通性探针，无需凭据） ----
@@ -1094,6 +1163,9 @@ export interface ScanConfig {
   // 智能兜底递归起点（各平台扩展数据根）。空 = 不做兜底（测试默认，路径全显式）。
   workBuddyFallbackRoots?: string[]
   zCodeDirs?: string[]
+  // ZCode 登录痕迹的 home（~/.zcode 所在目录）。不填 = 真实 HOME；
+  // 测试显式注入，避免依赖运行环境有没有装 ZCode。
+  zCodeHome?: string
   zenBaseURL?: string
   zenTimeoutMs?: number // <=0 用 8000
   fetchImpl?: FetchLike // 不填用全局 fetch
@@ -1115,6 +1187,8 @@ export function defaultConfig(): ScanConfig {
     // 智能兜底起点：候选全 miss 时按文件名递归找（覆盖装到别处/目录改名）。
     workBuddyFallbackRoots: workBuddyDataRoots(goos, home, profile),
     zCodeDirs: zCodeSearchDirs(goos, home, profile),
+    // 登录痕迹的 home（~/.zcode）：与安装目录（Application Support/ZCode）分离。
+    zCodeHome: home,
     // opencode 数据目录（指纹自动识别的来源）。
     openCodeDirs: openCodeDataDirs(goos, home, profile),
     zenBaseURL: 'https://opencode.ai/zen',
@@ -1192,7 +1266,7 @@ export class Scanner {
         out.push(wb)
       }
     }
-    out.push(checkZCode(this.cfg.zCodeDirs ?? []))
+    out.push(checkZCode(this.cfg.zCodeDirs ?? [], this.cfg.zCodeHome))
     // 指纹自动识别：从本机 opencode 日志读真实 UA/会话（用户无需手抄任何东西）。
     const fp = this.cfg.openCodeDirs && this.cfg.openCodeDirs.length > 0
       ? discoverOpenCodeFingerprint(this.cfg.openCodeDirs)

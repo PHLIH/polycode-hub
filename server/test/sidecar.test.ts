@@ -757,9 +757,14 @@ describe('安装进度上报', () => {
 // 等于进度条永远爬不到头（真实缺陷：macOS 装得上、Windows 装不下来）
 
 describe('下载断点续传', () => {
+  // 两个平台的资产都登记，且每个用例显式传 goos/arch：这套用例测的是「续传语义」，
+  // 与跑在什么机器上无关。此前 fixture 只登记 .exe，用例又不传平台，
+  // 于是在 macOS/Linux 上按本机平台算出 zcode-proxy-darwin-arm64 → 找不到资产，
+  // 5 个用例全挂在「无资产」上（Windows 上却是绿的）——测试成了平台相关的。
   const releaseBody = {
     tag_name: 'v9.9.9',
     assets: [
+      { name: 'zcode-proxy-darwin-arm64', browser_download_url: 'https://objects.githubusercontent.com/bin', size: 100 },
       { name: 'zcode-proxy.exe', browser_download_url: 'https://objects.githubusercontent.com/bin.exe', size: 100 },
     ],
   }
@@ -811,6 +816,7 @@ describe('下载断点续传', () => {
       const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       const { fetch: f, seenRanges } = flakyFetch()
       const dest = await s.install(false, {
+        goos: 'darwin', arch: 'arm64',
         fetch: f as never, sleep: async () => { /* 不真等 */ },
       })
       // 第一次不带 Range；第二次必须从第 40 字节接着下（而不是从 0 重来）
@@ -831,7 +837,7 @@ describe('下载断点续传', () => {
       const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
       const { fetch: f } = flakyFetch()
       const seen: SidecarProgress[] = []
-      await s.install(false, { fetch: f as never, sleep: async () => {}, onProgress: (p) => seen.push(p) })
+      await s.install(false, { goos: 'darwin', arch: 'arm64', fetch: f as never, sleep: async () => {}, onProgress: (p) => seen.push(p) })
       const dl = seen.filter((p) => p.phase === 'downloading')
       // 关键回归：收到过 40 字节之后，后续上报不允许再出现更小的 received。
       // 旧实现每次重试都从 0 重下，进度条会一次次打回起点。
@@ -868,7 +874,7 @@ describe('下载断点续传', () => {
         // 假装是个不认 Range 的镜像：无视 Range 头，从 0 重发整份
         return new Response(full, { status: 200 })
       }
-      const dest = await s.install(false, { fetch: f as never, sleep: async () => {} })
+      const dest = await s.install(false, { goos: 'darwin', arch: 'arm64', fetch: f as never, sleep: async () => {} })
       // 200 必须走截断重写：若误用追加，文件会是 40+100=140 字节的错位数据
       expect(readFileSync(dest).length).toBe(100)
       expect(Buffer.compare(readFileSync(dest), full)).toBe(0)
@@ -904,7 +910,7 @@ describe('下载断点续传', () => {
           },
         }), { status: 206, headers: { 'content-range': `bytes ${start}-${full.length - 1}/${full.length}` } })
       }
-      const dest = await s.install(false, { fetch: f as never, sleep: async () => {} })
+      const dest = await s.install(false, { goos: 'darwin', arch: 'arm64', fetch: f as never, sleep: async () => {} })
       expect(Buffer.compare(readFileSync(dest), full)).toBe(0)
       // 100 字节 / 每轮 40 → 3 轮足够；空转的话会一路试到上限 60
       expect(rounds).toBeLessThanOrEqual(4)
@@ -924,7 +930,7 @@ describe('下载断点续传', () => {
         dlCalls++
         return new Response('denied', { status: 404 })
       }
-      await expect(s.install(false, { fetch: f as never, sleep: async () => {} }))
+      await expect(s.install(false, { goos: 'darwin', arch: 'arm64', fetch: f as never, sleep: async () => {} }))
         .rejects.toThrow(/http 404/)
       expect(dlCalls).toBe(1)
     } finally {

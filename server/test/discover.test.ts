@@ -314,17 +314,45 @@ describe('WorkBuddy 双版本识别', () => {
 })
 
 describe('checkZCode', () => {
-  test('未安装 → missing', () => {
-    const f = checkZCode([join('/nonexistent', 'ZCode')])
+  test('未安装且无登录痕迹 → missing', () => {
+    const f = checkZCode([join('/nonexistent', 'ZCode')], '/nonexistent-home')
     expect(f.key).toBe('zcode')
     expect(f.status).toBe('missing')
   })
 
-  test('已安装（目录存在）→ unknown + OAuth 指引', async () => {
+  test('已安装（目录存在）无登录痕迹 → unknown + OAuth 指引', async () => {
     const dir = await tempDir()
-    const f = checkZCode([dir])
+    const f = checkZCode([dir], '/nonexistent-home')
     expect(f.status).toBe('unknown')
     expect(f.actions?.some((a) => a.includes('zcode login'))).toBe(true)
+  })
+
+  test('CLI 配置里有凭据 → ready + 脱敏指纹（不含密钥原文）', async () => {
+    const home = await tempDir()
+    const cliDir = join(home, '.zcode', 'cli')
+    await mkdir(cliDir, { recursive: true })
+    await writeFile(join(cliDir, 'config.json'), JSON.stringify({
+      provider: { zai: { options: { apiKey: 'zcode-test-key-0123456789abcdef', baseURL: 'https://api.z.ai/api/anthropic' } } },
+    }))
+    const f = checkZCode([join('/nonexistent', 'ZCode')], home)
+    expect(f.status).toBe('ready')
+    expect(f.detail).toContain('CLI')
+    // 脱敏红线：指纹是 sha256 前 12 位十六进制，绝不含 key 原文
+    expect(f.detail).not.toContain('zcode-test-key')
+    expect(f.detail).toMatch(/指纹 [0-9a-f]{12}/)
+  })
+
+  test('凭据原文绝不出现在 detail/actions（desktop 来源同样脱敏）', async () => {
+    const home = await tempDir()
+    const v2Dir = join(home, '.zcode', 'v2')
+    await mkdir(v2Dir, { recursive: true })
+    await writeFile(join(v2Dir, 'config.json'), JSON.stringify({
+      provider: { 'builtin:zai-start-plan': { options: { apiKey: 'desktop-secret-key-0123456789' } } },
+    }))
+    const f = checkZCode([], home)
+    expect(f.status).toBe('ready')
+    expect(f.detail).toContain('桌面')
+    expect(f.detail).not.toContain('desktop-secret-key')
   })
 })
 
@@ -659,6 +687,7 @@ describe('Scanner 聚合', () => {
     const cfg: ScanConfig = {
       workBuddyPaths: [wb],
       zCodeDirs: [join(dir, 'nope')],
+      zCodeHome: join(dir, 'no-home'), // 无登录痕迹 → zcode missing
       zenBaseURL: 'http://127.0.0.1:9', // 不可达 → unreachable
       zenTimeoutMs: 500,
     }

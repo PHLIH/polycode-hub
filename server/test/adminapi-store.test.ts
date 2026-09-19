@@ -113,7 +113,7 @@ describe('SQLite 存储（admin.db 两表 + 内存实现）', () => {
     ps.close()
   })
 
-  test('仅空库播种；非空不覆盖运行时变更', async () => {
+  test('Provider 仅空库播种；非空不覆盖运行时变更', async () => {
     const path = join(dir, 'seed.db')
     const ps = await SQLiteProviderStore.open(path)
     const seed: Provider = { ...provider, providerId: 0, name: 'seed' }
@@ -124,14 +124,21 @@ describe('SQLite 存储（admin.db 两表 + 内存实现）', () => {
     ps.put({ ...seed, displayName: '改过' })
     await seedProvidersIfEmpty(ps, [seed])
     expect(ps.get(pid)!.displayName).toBe('改过')
+    ps.close()
+  })
 
+  test('账号种子：非空库也补缺失的 id，已有行不被覆盖', async () => {
+    const path = join(dir, 'seed-mixed.db')
     const as = await SQLiteAccountStore.open(path)
-    await seedAccountsIfEmpty(as, [account])
+    const other: Account = { ...account, id: 'b2', displayName: '先来的' }
+    as.put(other) // 表非空：别的渠道先导入了账号
+    await seedAccountsIfEmpty(as, [account]) // 种子里的 a1 缺失 → 必须补进来
     expect(as.get('a1')).toBeDefined()
-    as.put({ ...account, displayName: '改过' })
-    await seedAccountsIfEmpty(as, [account])
-    expect(as.get('a1')!.displayName).toBe('改过')
-    ps.close(); as.close()
+    // 已存在的行（哪怕与种子同 id）以库为准——运行时状态不被种子抹掉。
+    as.put({ ...account, displayName: '运行时改的' })
+    await seedAccountsIfEmpty(as, [{ ...account, displayName: '种子原文' }])
+    expect(as.get('a1')!.displayName).toBe('运行时改的')
+    as.close()
   })
 
   test('新建（providerId=0）由 AUTOINCREMENT 分配并回填', async () => {
