@@ -19,6 +19,7 @@ import {
   killSidecarSpec,
   latestRelease,
   sha256Hex,
+  startupFailureHint,
   validatePort,
 } from '../src/sidecar/sidecar.ts'
 import type { SidecarProgress } from '../src/sidecar/sidecar.ts'
@@ -922,6 +923,78 @@ describe('下载断点续传', () => {
       await expect(s.install(false, { fetch: f as never, sleep: async () => {} }))
         .rejects.toThrow(/http 404/)
       expect(dlCalls).toBe(1)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+
+// —— 启动失败的根因要能到达页面 ——
+//
+// 真实缺陷（Windows「老是启动失败」）：引擎没登录时打印 `Not logged in` 并以
+// 退出码 1 立刻退出，而 waitHealthy 只会说「启动超时」——用户被引向
+// 「网络/二进制坏了」，真正该做的「跑一次登录」反而看不见。
+
+describe('启动失败提示 startupFailureHint', () => {
+  const writeLog = (dir: string, text: string): string => {
+    const work = join(dir, 'sidecar')
+    mkdirSync(join(work, 'logs'), { recursive: true })
+    writeFileSync(join(work, 'logs', 'sidecar.log'), text)
+    return work
+  }
+
+  test('未登录 → 给出可直接照做的登录指引（而不是一句「超时」）', () => {
+    const dir = makeTemp('polycode-shint1-')
+    try {
+      const work = writeLog(dir, 'Not logged in. Run: zcode-proxy auth login zai\n')
+      const hint = startupFailureHint(work)
+      expect(hint).toContain('未登录')
+      expect(hint).toContain('zcode sidecar login')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('端口占用 / 权限 各有对应建议', () => {
+    const dir = makeTemp('polycode-shint2-')
+    try {
+      const a = writeLog(dir, 'listen tcp 127.0.0.1:8080: bind: address already in use\n')
+      expect(startupFailureHint(a)).toContain('端口已被占用')
+      const b = writeLog(dir, 'open ./zcode-proxy: permission denied\n')
+      expect(startupFailureHint(b)).toContain('执行权限')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('认不出的失败：带出日志最后一行，总比只说「超时」有用', () => {
+    const dir = makeTemp('polycode-shint3-')
+    try {
+      const work = writeLog(dir, 'panic: some brand new failure mode\n')
+      expect(startupFailureHint(work)).toContain('panic: some brand new failure mode')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('日志不存在 → 返回空串（调用方退回「启动超时」，不编造原因）', () => {
+    const dir = makeTemp('polycode-shint4-')
+    try {
+      expect(startupFailureHint(join(dir, 'nope'))).toBe('')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('只看日志尾部：陈旧的 Not logged in 不该掩盖当前真实失败', () => {
+    const dir = makeTemp('polycode-shint5-')
+    try {
+      // 早先登录过、后来因为端口占用失败——不能因为历史里有 Not logged in 就误报
+      const old = 'Not logged in. Run: zcode-proxy auth login zai\n'.repeat(50)
+      const work = writeLog(dir, old + 'x'.repeat(5000)
+        + '\nlisten tcp 127.0.0.1:8080: bind: address already in use\n')
+      expect(startupFailureHint(work)).toContain('端口已被占用')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

@@ -362,6 +362,39 @@ export async function latestRelease(fetchImpl: FetchLike = fetch): Promise<Relea
   }
 }
 
+// startupFailureHint 读引擎日志尾部，把已知的启动失败原因翻译成一句能照做的
+// 中文建议。返回空串表示日志里没有可识别的线索（调用方退回「启动超时」）。
+//
+// 为什么值得单独做：引擎自己的报错是英文且面向终端（`Not logged in. Run:
+// zcode-proxy auth login zai`），而用户是在网页上点「一键启动」的——他既不知道
+// 要去哪看日志，也未必认得出这条信息就是根因。实测最常撞上的就是「没登录」。
+export function startupFailureHint(sidecarDir: string): string {
+  let tail = ''
+  try {
+    const all = readFileSync(join(sidecarDir, 'logs', 'sidecar.log'), 'utf8')
+    // 只看尾部：日志是追加写的，历史失败会一直留在前面，读全量容易被旧错误误导。
+    tail = all.slice(-4096)
+  } catch {
+    return ''
+  }
+  if (tail === '') return ''
+  // 未登录：引擎启动即退出，日志里是唯一线索。必须把「怎么做」写清楚——
+  // 这条是 Windows 上「老是启动失败」的头号原因。
+  if (/not logged in/i.test(tail)) {
+    return '引擎未登录（日志：Not logged in）。先完成一次授权登录再启动：'
+      + '在终端跑 `polycode-hub zcode sidecar login`（会拉起浏览器 OAuth）。'
+  }
+  if (/address already in use|bind: address already/i.test(tail)) {
+    return '端口已被占用。改一个端口，或先停掉占用它的程序。'
+  }
+  if (/permission denied|access is denied/i.test(tail)) {
+    return '二进制没有执行权限（或被安全软件拦截）。'
+  }
+  // 兜底：把最后一行原始日志带出来，总比只说「超时」有用。
+  const lastLine = tail.trimEnd().split('\n').pop() ?? ''
+  return lastLine.trim() === '' ? '' : `引擎日志最后一行：${lastLine.trim()}`
+}
+
 // Sidecar 是 zcode-proxy 本地实例的管理句柄。
 export class Sidecar {
   binDir: string // 二进制安装目录（~/.polycode-hub/bin）
@@ -704,13 +737,22 @@ defaultModel: glm-5.3-flash
   }
 
   // waitHealthy 等到 /health 200 或超时（日志在 sidecarDir/logs 下看）。
+  //
+  // 超时时必须把**日志里的真实原因**带出来。真实缺陷（Windows 上表现为
+  // 「老是启动失败」）：引擎没登录时会打印 `Not logged in. Run: zcode-proxy
+  // auth login zai` 并以退出码 1 立刻退出，而这里只会说「启动超时」——把用户
+  // 引向「网络/二进制坏了」的错误方向，真正该做的「跑一次登录」反而看不到。
   private async waitHealthy(timeoutMs: number, sidecarDir: string): Promise<void> {
     const deadline = Date.now() + timeoutMs
     while (Date.now() < deadline) {
       if (await this.running()) return
       await sleep(500)
     }
-    throw new Error(`sidecar: 启动超时（查看 ${join(sidecarDir, 'logs')}）`)
+    const hint = startupFailureHint(sidecarDir)
+    throw new Error(
+      hint === ''
+        ? `sidecar: 启动超时（查看 ${join(sidecarDir, 'logs')}）`
+        : `sidecar: 启动失败 —— ${hint}`)
   }
 
   // login 交互提示：sidecar 的 OAuth 登录需要浏览器，直接把用户引到官方登录命令。
