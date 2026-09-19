@@ -77,11 +77,76 @@ const {
   sc, installing: scInstalling, percent: scPercent,
   phaseText: scPhase, detailText: scProgressDetail,
   errorText: scError, proxyText: scProxy, start: scStart,
+  pause: scPauseRun, cancel: scCancelRun,
   refresh: loadSidecar,
 } = useSidecar()
 const scBusy = ref('')
 
+// scPause：暂停下载，保留已下的部分（下次断点续传）。
+// 服务端作业态只统一标 cancelled，分不出暂停还是取消，所以反馈在这里就地给。
+async function scPause() {
+  const ok = await scPauseRun()
+  if (ok) ElMessage.success('已暂停：已下载的进度已保留，下次安装从断点续传')
+}
+
+// scCancel：取消并**丢弃**已下的内容（下次从 0 开始）。
+// 会丢数据，所以必须二次确认；这是它与「暂停」的唯一区别。
+async function scCancel() {
+  try {
+    await ElMessageBox.confirm(
+      '取消会删除已下载的进度，下次安装从头开始。若只想暂时停下，请用「暂停」（保留进度，可续传）。',
+      '取消安装', { type: 'warning', confirmButtonText: '取消安装', cancelButtonText: '再想想' })
+  } catch { return }
+  const ok = await scCancelRun()
+  if (ok) ElMessage.success('已取消安装：半成品已删除，下次从 0 开始')
+}
+
+// 登录 provider：引擎支持 z.ai 与智谱（bigmodel）两种账号，用户要能自己选。
+// '' = 自动（按本机 ZCode 客户端已登录的那个猜）。
+const scProvider = ref('')
+
+// scLogin：网页内一键登录授权。
+//
+// 用户原话：「为啥不能手动弹出登录界面呢？」——以前引擎未登录时，页面上只有
+// 一句「去终端跑 polycode-hub zcode sidecar login」的文案，登录被赶出了网页。
+//
+// **绝不能在这里 window.open**。真实缺陷（用户报告「点一次登录弹出两个一模一样
+// 的授权页」）：引擎 4.6.8 起 `auth login` 会**自己打开默认浏览器**（spawn 的
+// 引擎进程内跑 `cmd /c start <授权页>`，本机实测确认），旧版引擎不自带这行为，
+// 当时由网页代开是对的；引擎行为变了这边没跟上，就变成引擎开一次 + 网页再开
+// 一次 = 两个一模一样的页面。zai / bigmodel 两种账号都走同一条引擎代码路径，
+// 症状相同。引擎也没有关闭自开的旗标（--paste 只管 bigmodel 验证码流），
+// 所以唯一一次打开交给引擎，这里只展示兜底链接。
+// loginToast：当前常驻的登录提示句柄。duration:0 的提示不会自己消失，
+// 换 provider 再点一次会叠出两条，展示新提示前先把旧的关掉。
+let loginToast = null
+
+async function scLogin() {
+  // 防重入：scBusy 的赋值是同步的，但 `:disabled` 要等 Vue 更新 DOM 才生效，
+  // 快速双击仍可能进两次函数。这里显式挡一道。
+  if (scBusy.value === 'login') return
+  scBusy.value = 'login'
+  try {
+    const q = scProvider.value === '' ? '' : `?provider=${scProvider.value}`
+    const r = await api.sidecarAction('login' + q)
+    if (!r.url) { ElMessage.error('未取得授权链接'); return }
+    // 引擎此刻已自行弹出默认浏览器。链接只是兜底：个别机器上自动弹出会失灵
+    // （没有默认浏览器关联、远程会话等），用户点一下就能到达授权页。
+    // 常驻提示只保留最新一条：换 provider 再点时旧的还在，会跟新文案打架。
+    loginToast?.close()
+    loginToast = ElMessage({
+      duration: 0, showClose: true, dangerouslyUseHTMLString: true,
+      message: `引擎已在默认浏览器打开 <b>${r.provider}</b> 授权页 —— 完成授权后回来点「启动」。`
+        + `<br><a href="${r.url}" target="_blank" rel="noopener">没看到弹窗？点此打开授权页</a>`
+        + `<br><span style="opacity:.7">若随后自动弹出 ZCode 客户端窗口，那是授权回调`
+        + `（zcode:// 链接），直接关掉即可，不影响登录。</span>`,
+    })
+  } catch (e) { ElMessage.error(e.message) } finally { scBusy.value = '' }
+}
+
 async function scAction(action, confirmText) {
+  // 防重入：与 scLogin 同理，`:disabled` 生效前的快速双击会双发 POST。
+  if (scBusy.value === action) return
   if (confirmText && !window.confirm(confirmText)) return
   scBusy.value = action
   try {
@@ -104,6 +169,8 @@ async function scUninstall() {
       '卸载会删除引擎二进制与网关侧鉴权 key。登录态（OAuth 身份）不受影响。',
       '卸载 ZCode 本地引擎', { type: 'warning', confirmButtonText: '继续' })
   } catch { return }
+  // 防重入：scBusy 在下方才赋值，await 确认框期间按钮是「活的」。
+  if (scBusy.value === 'uninstall') return
   let q = '?confirm=true'
   try {
     await ElMessageBox.confirm('是否同时清除配置文件与日志？（含 proxyApiKey 明文）',
@@ -323,6 +390,11 @@ function gotoProviders() {
         <span class="sc-prog-track"><span class="sc-prog-fill" :class="{ indet: scPercent === null }"
           :style="scPercent === null ? {} : { width: scPercent + '%' }" /></span>
       </span>
+      <!-- 暂停 / 取消：下载中途的两个出口，语义必须分开。
+           · 暂停 = 停下但保留进度，下次续传
+           · 取消 = 停下并丢弃已下的内容，下次从 0 开始（带二次确认） -->
+      <button v-if="scInstalling" class="btn ghost" @click="scPause">暂停</button>
+      <button v-if="scInstalling" class="btn ghost danger" @click="scCancel">取消</button>
       <template v-else-if="sc && sc.installed">
         <button v-if="!sc.running" class="btn" :disabled="scBusy === 'start'"
           @click="scAction('start')">{{ scBusy === 'start' ? '启动中…' : '启动' }}</button>
@@ -342,6 +414,19 @@ function gotoProviders() {
         {{ scBusy === 'endpoint' ? '测试中…' : '自定义引擎地址' }}</button>
       <button v-if="sc && sc.custom" class="btn ghost" :disabled="scBusy === 'endpoint'"
         @click="scRestoreBuiltin">恢复内置引擎</button>
+      <!-- 登录授权：引擎装好了但没登录时给它一个网页内的出口。
+           以前只有一句「去终端跑 … login」的文案，登录被赶出了网页。
+           provider 可选：引擎支持 z.ai 与智谱两种账号（`auth login <zai|bigmodel>`），
+           默认「自动」按本机 ZCode 客户端已登录的那个来，用户也能自己指定。 -->
+      <template v-if="sc && sc.installed && !sc.running">
+        <select v-model="scProvider" class="sc-provider" :disabled="scBusy === 'login'">
+          <option value="">自动选择</option>
+          <option value="zai">z.ai 账号</option>
+          <option value="bigmodel">智谱（bigmodel）账号</option>
+        </select>
+        <button class="btn ghost" :disabled="scBusy === 'login'"
+          @click="scLogin">{{ scBusy === 'login' ? '获取授权链接…' : '登录授权' }}</button>
+      </template>
       <button class="btn ghost" @click="rescan">刷新状态</button>
     </div>
     <!-- 失败原因常驻（不是会消失的 toast）：切页回来仍看得到，并带出本次走的下载出口 -->
@@ -361,7 +446,7 @@ function gotoProviders() {
     </p>
     <p class="field-hint">
       引擎是本机运行的官方社区工具（TriDefender/zcode-proxy），负责 ZCode 免费额度的验证与转发。
-      首次使用：安装 → 配置 → 启动 → 在终端跑一次 <code>polycode-hub zcode sidecar login</code> 完成授权。
+      首次使用：安装 → 配置 → 启动 → 点上方「登录授权」完成授权（引擎会自动打开浏览器），回网页点「启动」。
       二进制从其 GitHub Releases 下载（约 66MB），不由本仓分发；下载自动复用项目配置的出口代理。
     </p>
     <details class="api-spec">
@@ -477,6 +562,13 @@ function gotoProviders() {
 .sc-state { font-size: 12px; }
 .sc-state.ok { color: var(--ok); }
 .sc-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+/* 登录 provider 选择：跟着按钮的视觉走，别在按钮行里冒出一个系统默认灰框 */
+.sc-provider {
+  padding: 6px 8px; font-size: 12px; font-family: inherit;
+  color: var(--text); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 6px; cursor: pointer;
+}
+.sc-provider:disabled { opacity: .5; cursor: default; }
 /* 安装进度条：固定宽度，避免字节数变化时按钮行左右抖动 */
 .sc-prog { display: block; width: 320px; }
 .sc-prog-head { display: flex; justify-content: space-between; gap: 8px; font-size: 11px; line-height: 1.4; }

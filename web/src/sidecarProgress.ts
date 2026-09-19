@@ -7,9 +7,16 @@ export interface InstallJobLike {
   phase: string
   received: number
   total: number
+  // startedAt/finishedAt/cancelled 服务端恒下发；标成可选是为兼容旧载荷与测试
+  // 构造的部分字面量。消费侧一律带缺省判断（finishedAt ?? 0、cancelled === true）。
+  startedAt?: number
   elapsedMs: number
+  // finishedAt !== 0 = 作业已有结论（成功/失败/取消）；空闲初值两者都是 0。
+  finishedAt?: number
   ok: boolean
   error: string
+  // 用户主动暂停/取消（非失败）：页面不渲染成红报错。
+  cancelled?: boolean
   downloadProxy: string
   downloadProxySource: string
 }

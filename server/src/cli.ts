@@ -558,11 +558,13 @@ async function runZCode(args: string[]): Promise<void> {
         console.log(`  下载中${pct} ${mb(p.received)}/${mb(p.total)} MB（断线会自动续传）`)
       }
       if (action === 'install') {
-        const p = await sc.install(args.includes('--force'), { fetch: dl.fetch, onProgress })
+        const p = await sc.install(args.includes('--force'), { fetch: dl.fetch, onProgress, proxySource: dl.source })
         console.log('已安装:', p)
         return
       }
-      await sc.ensureReady(sc.workDir, { fetch: dl.fetch, onProgress })
+      // proxySource 必须传：零推进双向回退要靠它判断「当前在哪条路、还有没有
+      // 另一条可换」。漏传会让 CLI 的下载把回退整个禁用（子代理审查抓到的 P1）。
+      await sc.ensureReady(sc.workDir, { fetch: dl.fetch, onProgress, proxySource: dl.source })
       console.log('sidecar 就绪:', await sc.status())
       console.log('网关凭据:', sc.credKey)
       return

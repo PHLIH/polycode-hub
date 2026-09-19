@@ -181,7 +181,7 @@ function readScutil(): ProxyURL | null {
 //
 // 具体优先级见下方 resolveSidecarDownloadFetch（唯一的决议入口）：
 // 显式 --proxy → 显式 egress id → Provider 的 egress 引用 → 仅一项时自动采用
-// → HTTPS_PROXY 环境变量 → darwin 系统代理 → 直连。
+// → HTTPS_PROXY 环境变量 → darwin scutil / windows 注册表读系统代理 → 直连。
 //
 // 只接受 http/https（与 router/upstream.egressProxyURI 同口径：undici
 // ProxyAgent 不支持 socks5；Clash 类混合端口用其 http 端口）。
@@ -266,7 +266,7 @@ export function egressDefToProxyURI(e: { id?: string; kind: string; addr: string
 //   4. egressList 仅一项时自动采用（多用户单 clash 最常见；多项时不猜，
 //      交给 env/系统代理，避免把下载送错出口）
 //   5. HTTPS_PROXY / ALL_PROXY 环境变量（只认 http/https，与 envProxyURL 同口径）
-//   6. darwin 系统代理（scutil --proxy；wantSystem=false 时跳过，纯测试/离线用）
+//   6. 系统代理（darwin scutil / windows 注册表；wantSystem=false 时跳过，纯测试/离线用）
 //   7. 直连（返回 proxyURI=null，保持旧行为）
 //
 // 只接受 http/https（undici ProxyAgent 不支持 socks5；Clash 混合端口用 http）。
@@ -337,7 +337,7 @@ export function resolveSidecarDownloadFetch(opts: SidecarDownloadResolveOpts = {
       : env.ALL_PROXY !== undefined ? 'ALL_PROXY' : 'all_proxy'
     return { proxyURI: fromEnv, source: `env:${key}`, fetch: proxiedFetch(fromEnv) }
   }
-  // 6. 系统代理（darwin scutil；socks5 直接放弃，回落直连）
+  // 6. 系统代理（darwin scutil / windows 注册表；socks5 直接放弃，回落直连）
   if (wantSystem) {
     try {
       const sys = (opts.systemProxy ?? ghProxyURL)()

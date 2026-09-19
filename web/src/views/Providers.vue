@@ -163,6 +163,7 @@ const {
   sc, running: scRunning, installing: scInstalling, busy: scBusy, stale: scStale,
   percent: scPercent, phaseText: scPhase, detailText: scProgressDetail,
   errorText: scError, proxyText: scProxy, start: scStart,
+  pause: scPauseRun, cancel: scCancelRun,
 } = useSidecar()
 
 const scDetail = computed(() => {
@@ -179,6 +180,22 @@ async function scQuickReady() {
   // 失败刻意不弹 toast：原因由 scError 常驻显示（切页回来还在）。
   // 否则用户看到「安装中」突然变回「一键安装」，完全不知道发生过什么。
   if (await scStart()) await Promise.all([load(), loadFindings()])
+}
+
+// scPause：暂停下载，保留已下的部分（下次断点续传）。
+async function scPause() {
+  await scPauseRun()
+}
+
+// scCancel：取消并**丢弃**已下的内容（下次从 0 开始）。
+// 会丢数据，必须二次确认；这是它与「暂停」的唯一区别。
+async function scCancel() {
+  try {
+    await ElMessageBox.confirm(
+      '取消会删除已下载的进度，下次安装从头开始。若只想暂时停下，请用「暂停」（保留进度，可续传）。',
+      '取消安装', { type: 'warning', confirmButtonText: '取消安装', cancelButtonText: '再想想' })
+  } catch { return }
+  await scCancelRun()
 }
 
 async function quickImport(f) {
@@ -599,6 +616,12 @@ async function adoptModels() {
             <span class="qi-prog-track"><span class="qi-prog-fill" :class="{ indet: scPercent === null }"
               :style="scPercent === null ? {} : { width: scPercent + '%' }" /></span>
           </span>
+          <!-- 暂停 / 取消：两个出口语义分开。暂停保留进度可续传；
+               取消丢弃已下内容（带二次确认），下次从 0 开始。 -->
+          <!-- qi-cancel / danger-solid 从未在任何样式表里定义过（取消按钮实际
+               渲染成普通主色 .btn），改用与 Discover 页一致的全局类。 -->
+          <button v-if="scInstalling" class="btn ghost" @click="scPause">暂停</button>
+          <button v-if="scInstalling" class="btn ghost danger" @click="scCancel">取消</button>
           <button v-else class="btn" :disabled="scBusy" @click="scQuickReady">
             {{ sc && sc.installed ? '一键启动' : (scError ? '重试' : '一键安装') }}</button>
         </span>
@@ -715,7 +738,7 @@ async function adoptModels() {
             粘进来即可用：保存后写入 <span class="mono">config/credentials/</span>（0600），
             密钥不落数据库、不在列表回显。留空 = 不改动现有凭据。
           </template>
-          <template v-else">
+          <template v-else>
             只存引用不存明文：网关每次请求现读该环境变量（改值需重启网关）。
             留空 = 不改动现有凭据。
           </template>

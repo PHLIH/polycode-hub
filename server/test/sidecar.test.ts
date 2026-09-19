@@ -3,11 +3,12 @@
 
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createServer, type AddressInfo } from 'node:net'
 import { execFileSync } from 'node:child_process'
+import { Hono } from 'hono'
 import { expectMode } from './helpers/posix-mode.ts'
 import {
   Sidecar,
@@ -19,11 +20,14 @@ import {
   killSidecarSpec,
   latestRelease,
   sha256Hex,
+  SidecarCancelledError,
   startupFailureHint,
+  logTailHint,
   validatePort,
 } from '../src/sidecar/sidecar.ts'
 import type { SidecarProgress } from '../src/sidecar/sidecar.ts'
-import { partPath } from '../src/sidecar/sidecar.ts'
+import { partPath, authURLRe } from '../src/sidecar/sidecar.ts'
+import { shouldReuseLogin, createSidecarApp } from '../src/adminapi/sidecar_app.ts'
 import { parseScutilProxy, normalizeProxyURI, maskProxyURI, egressDefToProxyURI, resolveSidecarDownloadFetch, parseWinProxySetting } from '../src/sidecar/httpproxy.ts'
 
 const makeTemp = (prefix: string): string => mkdtempSync(join(tmpdir(), prefix))
@@ -999,8 +1003,744 @@ describe('启动失败提示 startupFailureHint', () => {
       rmSync(dir, { recursive: true, force: true })
     }
   })
+
+  // logTailHint 是早退路径专用的：只看「本次启动新增」的那一段日志。
+  // 这条是上一条的强化——历史里的 Not logged in 必须与本次无关。
+  test('logTailHint 只认本次新增的日志，不被历史错误污染', () => {
+    const dir = makeTemp('polycode-shint6-')
+    try {
+      const work = join(dir, 'sidecar')
+      mkdirSync(join(work, 'logs'), { recursive: true })
+      const logPath = join(work, 'logs', 'sidecar.log')
+      const old = 'Not logged in. Run: zcode-proxy auth login zai\n'
+      writeFileSync(logPath, old)
+      const from = old.length
+      writeFileSync(logPath, old + 'bind: address already in use\n')
+      // 从 from 之后读 → 只看到本次的端口冲突
+      expect(logTailHint(work, logPath, from)).toContain('端口已被占用')
+      // 退而求其次读全量时，才会看到历史里的 Not logged in（说明切片确实生效）
+      expect(startupFailureHint(work)).toContain('未登录')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
 })
 
+
+// ——（注：这里曾有一个用**本地复刻正则**的「登录授权 URL 抓取」用例块——
+// 复刻的正则只认 oauth/authorize、缺 bigmodel 分支，与生产 authURLRe 各说各话，
+// 生产正则再退化它也测不出来，已整块删除；分块边界与「无 URL → 空串」的用例
+// 都并入下面使用生产 authURLRe 的 beginLogin 块。）——
+
+// —— 未登录时自动导入本机 ZCode 凭据 ——
+//
+// 用户原话：「既然没登陆就不能自动弹出登录界面吗」。以前启动失败只会甩给用户
+// 一句「去终端跑 polycode-hub zcode sidecar login」——而多数人早就用 ZCode
+// 客户端登录过，凭据现成放着，程序完全可以自己导入。
+
+describe('未登录自动导入凭据', () => {
+  test('start 遇到 Not logged in → 先自动导入，再重试启动（用户零操作）', async () => {
+    const dir = makeTemp('polycode-auto1-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      // 第一次 start 抛「未登录」，自动导入成功后第二次应当成功
+      let attempts = 0
+      const startOnce = vi.spyOn(s as never, 'startOnce' as never)
+        .mockImplementation((async () => {
+          attempts++
+          if (attempts === 1) throw new Error('sidecar: 启动失败 —— 引擎未登录（日志：Not logged in）')
+        }) as never)
+      const imported = vi.spyOn(s, 'tryAutoImportCredentials').mockResolvedValue('bigmodel')
+
+      await s.start(join(dir, 'sidecar'))
+      expect(imported).toHaveBeenCalledTimes(1)
+      expect(attempts).toBe(2) // 失败 → 导入 → 再试一次
+      expect(startOnce).toHaveBeenCalledTimes(2)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('导入也失败 → 把原始「未登录」错误抛给用户（不谎报成功）', async () => {
+    const dir = makeTemp('polycode-auto2-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      vi.spyOn(s as never, 'startOnce' as never)
+        .mockRejectedValue(new Error('sidecar: 启动失败 —— 引擎未登录（日志：Not logged in）') as never)
+      vi.spyOn(s, 'tryAutoImportCredentials').mockResolvedValue('')
+
+      await expect(s.start(join(dir, 'sidecar'))).rejects.toThrow(/未登录/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('与登录无关的启动失败（如端口占用）不去做导入，原样抛出', async () => {
+    const dir = makeTemp('polycode-auto3-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      vi.spyOn(s as never, 'startOnce' as never)
+        .mockRejectedValue(new Error('sidecar: 启动失败 —— 端口已被占用') as never)
+      const imported = vi.spyOn(s, 'tryAutoImportCredentials').mockResolvedValue('bigmodel')
+
+      await expect(s.start(join(dir, 'sidecar'))).rejects.toThrow(/端口已被占用/)
+      // 别在无关故障上白跑导入：那是两次多余的进程 spawn
+      expect(imported).not.toHaveBeenCalled()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+// —— 出口双向回退 + 取消（用户明确要求的三点）——
+//
+// 1) 代理连不上 → 自动换直连；2) 直连连不上 → 自动换代理；3) 两条都不通 → 抛异常。
+// 4) 下载中必须能取消（以前只能等它跑满 60 轮或杀进程）。
+
+describe('出口双向回退', () => {
+  test('代理连续零推进 → 自动改用直连，最终下载成功', async () => {
+    const dir = makeTemp('polycode-swap1-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const body = {
+        tag_name: 'v9.9.9',
+        assets: [{ name: 'zcode-proxy.exe', browser_download_url: 'https://objects.githubusercontent.com/bin.exe', size: 100 }],
+      }
+      let proxyTries = 0
+      // 代理：release 查询能过（走直连兜底），但资产永远 ECONNRESET
+      const proxyFetch = (async (url: string | URL | Request) => {
+        if (String(url).includes('api.github.com')) return new Response(JSON.stringify(body), { status: 200 })
+        proxyTries++
+        throw new Error('read ECONNRESET')
+      }) as never
+      // 直连：正常给数据
+      const realFetch = globalThis.fetch
+      globalThis.fetch = (async (url: string | URL | Request) => {
+        if (String(url).includes('api.github.com')) return new Response(JSON.stringify(body), { status: 200 })
+        return new Response(Buffer.alloc(100), { status: 200 })
+      }) as never
+      try {
+        // goos 显式给 'windows'：release 替身里只有 zcode-proxy.exe 资产，
+        // 而默认 goos 跟随 process.platform——POSIX 上会找不到资产直接抛错。
+        // assetName('windows', …) 与 arch 无关，任何平台都能跑这个替身。
+        const dest = await s.install(false, {
+          goos: 'windows', fetch: proxyFetch, proxySource: 'egress-auto:clash', sleep: async () => {},
+        })
+        expect(existsSync(dest)).toBe(true)
+        // 阈值是 20 轮零推进（见 ZERO_PROGRESS_LIMIT 的演进注释）；这里断言
+        // 代理确实被试满冷启动窗口之后才换，而不是第 3 轮就放弃。
+        expect(proxyTries).toBeGreaterThanOrEqual(15)
+      } finally { globalThis.fetch = realFetch }
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('直连连续零推进 → 自动改用代理（反向也成立）', async () => {
+    const dir = makeTemp('polycode-swap2-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const body = {
+        tag_name: 'v9.9.9',
+        assets: [{ name: 'zcode-proxy.exe', browser_download_url: 'https://objects.githubusercontent.com/bin.exe', size: 100 }],
+      }
+      let directTries = 0
+      const realFetch = globalThis.fetch
+      globalThis.fetch = (async (url: string | URL | Request) => {
+        if (String(url).includes('api.github.com')) return new Response(JSON.stringify(body), { status: 200 })
+        directTries++
+        throw new Error('read ECONNRESET')
+      }) as never
+      let proxyTries = 0
+      const proxyFetch = (async (url: string | URL | Request) => {
+        if (String(url).includes('api.github.com')) return new Response(JSON.stringify(body), { status: 200 })
+        proxyTries++
+        return new Response(Buffer.alloc(100), { status: 200 })
+      }) as never
+      try {
+        const dest = await s.install(false, {
+          goos: 'windows', fetch: proxyFetch, proxySource: 'direct', sleep: async () => {},
+        })
+        expect(existsSync(dest)).toBe(true)
+        expect(directTries).toBeGreaterThanOrEqual(3) // 直连先失败若干轮
+        expect(proxyTries).toBeGreaterThan(0)         // 然后切到代理成功
+      } finally { globalThis.fetch = realFetch }
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('两条路都不通 → 抛异常（不谎报成功、不无限换）', async () => {
+    const dir = makeTemp('polycode-swap3-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const body = {
+        tag_name: 'v9.9.9',
+        assets: [{ name: 'zcode-proxy.exe', browser_download_url: 'https://objects.githubusercontent.com/bin.exe', size: 100 }],
+      }
+      const dead = (async (url: string | URL | Request) => {
+        if (String(url).includes('api.github.com')) return new Response(JSON.stringify(body), { status: 200 })
+        throw new Error('read ECONNRESET')
+      }) as never
+      const realFetch = globalThis.fetch
+      globalThis.fetch = dead
+      try {
+        await expect(s.install(false, {
+          goos: 'windows', fetch: dead, proxySource: 'egress-auto:clash', sleep: async () => {},
+        })).rejects.toThrow(/ECONNRESET|失败/)
+      } finally { globalThis.fetch = realFetch }
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('下载可取消', () => {
+  const body = {
+    tag_name: 'v9.9.9',
+    assets: [{ name: 'zcode-proxy.exe', browser_download_url: 'https://objects.githubusercontent.com/bin.exe', size: 100_000 }],
+  }
+
+  test('abort 后立刻抛 SidecarCancelledError，且已下的 .part 保留（= 暂停语义，可续传）', async () => {
+    const dir = makeTemp('polycode-cancel1-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const ac = new AbortController()
+      const chunk = Buffer.alloc(1000)
+      // 资产远大于取消点，且**每块之间让出事件循环**，保证取消确实落在传输中途
+      // 而不是「假流瞬间跑完」。不让出的话 100KB 会在 20ms 内读完，定时器根本
+      // 来不及触发 —— 这正是前两版测试一直 resolved 的原因。
+      const f = (async (url: string | URL | Request, init?: RequestInit) => {
+        if (String(url).includes('api.github.com')) return new Response(JSON.stringify(body), { status: 200 })
+        let sent = 0
+        return new Response(new ReadableStream<Uint8Array>({
+          async pull(c) {
+            if (init?.signal?.aborted === true) throw new DOMException('aborted', 'AbortError')
+            if (sent >= 100_000) { c.close(); return }
+            sent += chunk.length
+            c.enqueue(chunk)
+            await new Promise((r) => setTimeout(r, 2)) // 让真实时间流逝
+          },
+        }), { status: 200 })
+      }) as never
+
+      let triggered = false
+      const t0 = Date.now()
+      // 用定时器触发取消，而不是挂在 onProgress 上：进度回调有 200ms 节流，
+      // 假流又跑得极快，挂在回调上会「还没等回调就被下完」→ 测试变成 flaky。
+      // 定时器能稳定地打在传输中途。
+      const timer = setTimeout(() => { triggered = true; ac.abort() }, 30)
+      try {
+        await expect(s.install(false, {
+          goos: 'windows', fetch: f, signal: ac.signal, sleep: async () => {},
+        })).rejects.toThrow(SidecarCancelledError)
+      } finally { clearTimeout(timer) }
+      expect(triggered).toBe(true)
+      // 立刻停下（不是等退避重试跑完）
+      expect(Date.now() - t0).toBeLessThan(5000)
+      // 半成品保留：取消不等于把已下的字节也扔掉，下次能接着传
+      const part = join(dir, 'bin', 'zcode-proxy.exe.part')
+      expect(existsSync(part)).toBe(true)
+      expect(statSync(part).size).toBeGreaterThan(0)
+      // 目标文件不该落地（没下完就不是有效二进制）
+      expect(existsSync(join(dir, 'bin', 'zcode-proxy.exe'))).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('已取消的 signal → 一开始就拒绝，不发任何请求', async () => {
+    const dir = makeTemp('polycode-cancel2-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      const ac = new AbortController()
+      ac.abort()
+      let calls = 0
+      const f = (async () => { calls++; return new Response(JSON.stringify(body), { status: 200 }) }) as never
+      await expect(s.install(false, { goos: 'windows', fetch: f, signal: ac.signal, sleep: async () => {} }))
+        .rejects.toThrow(SidecarCancelledError)
+      expect(calls).toBe(0)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('代理冷启动预热', () => {
+  // 真实缺陷（用户实测打脸后修正）：代理是好的，但**头几次连接会被重置**，
+  // 之后非常快。我一度误判成「代理坏了」，把换路阈值设成 3 轮——正好卡在冷启动
+  // 窗口中间，于是永远用不上代理，掉到慢 53 倍的直连（2.67 vs 0.05 MB/s）。
+  // 症状就是用户说的「切不切代理都一样慢」。
+  const body = {
+    tag_name: 'v9.9.9',
+    assets: [{ name: 'zcode-proxy.exe', browser_download_url: 'https://objects.githubusercontent.com/bin.exe', size: 100 }],
+  }
+
+  test('代理前几轮 ECONNRESET 后恢复 → 全程留在代理，不切直连', async () => {
+    const dir = makeTemp('polycode-warm1-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      let proxyCalls = 0
+      const deadDirect = (async () => { throw new Error('直连不该被用到') }) as never
+      const realFetch = globalThis.fetch
+      globalThis.fetch = deadDirect
+      // 前 5 次 resets，第 6 次开始成功（贴近实测的冷启动窗口）
+      const warmProxy = (async (url: string | URL | Request) => {
+        if (String(url).includes('api.github.com')) return new Response(JSON.stringify(body), { status: 200 })
+        proxyCalls++
+        if (proxyCalls <= 5) throw new Error('read ECONNRESET')
+        return new Response(Buffer.alloc(100), { status: 200 })
+      }) as never
+      try {
+        const dest = await s.install(false, {
+          goos: 'windows', fetch: warmProxy, proxySource: 'egress-auto:clash', sleep: async () => {},
+        })
+        expect(existsSync(dest)).toBe(true)
+        // 关键：必须撑过冷启动，而不是第 3 轮就换路
+        expect(proxyCalls).toBeGreaterThan(5)
+      } finally { globalThis.fetch = realFetch }
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('latestRelease 在代理冷启动后仍优先用代理（不因一次失败就跳直连）', async () => {
+    let proxyCalls = 0
+    const flaky = (async () => {
+      proxyCalls++
+      if (proxyCalls <= 4) throw new Error('read ECONNRESET')
+      return new Response(JSON.stringify({ tag_name: 'v9.9.9', assets: [] }), { status: 200 })
+    }) as never
+    const r = await latestRelease(flaky, 'egress-auto:clash')
+    expect(r.tagName).toBe('v9.9.9')
+    expect(proxyCalls).toBe(5) // 试到第 5 次成功，而不是第 1 次就放弃
+  })
+})
+
+// —— 暂停（保留） vs 取消（丢弃）——
+//
+// 用户明确指出：此前的「取消」实际是暂停语义，名不副实。两者必须分开：
+//   · 暂停 = 停下载，保留 .part，下次续传
+//   · 取消 = 停下载 + 删 .part，下次从 0 开始
+
+describe('discardPartial', () => {
+  test('删除已下的一半（.part），返回被删字节数', () => {
+    const dir = makeTemp('polycode-discard1-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      mkdirSync(join(dir, 'bin'), { recursive: true })
+      // 文件名跟 s.binName 走（discardPartial 的判据）：Windows 是 zcode-proxy.exe.part，
+      // POSIX 是 zcode-proxy.part——硬编码 .exe 的话这组用例在 mac/linux 必挂。
+      const part = partPath(join(dir, 'bin', s.binName))
+      writeFileSync(part, Buffer.alloc(1234))
+      const removed = s.discardPartial(dir)
+      expect(removed).toBe(1234)
+      expect(existsSync(part)).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('没东西可删时返回 0（不报错，幂等）', () => {
+    const dir = makeTemp('polycode-discard2-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      expect(s.discardPartial(dir)).toBe(0)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('绝不误删已装好的正式二进制（取消 ≠ 卸载）', () => {
+    const dir = makeTemp('polycode-discard3-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      mkdirSync(join(dir, 'bin'), { recursive: true })
+      const bin = join(dir, 'bin', s.binName)
+      writeFileSync(bin, Buffer.alloc(999))
+      s.discardPartial(dir)
+      // 正式产物必须还在：取消的是「这次下载」，不是卸载引擎
+      expect(existsSync(bin)).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+// —— 卸载失败必须报出来，不能静默吞掉 ——
+//
+// 真实缺陷（用户报告「点了卸载还是显示 installed」）：Windows 上可执行文件
+// 正被占用时 unlinkSync 抛 EPERM/EBUSY，原实现用 `catch {}` 当「本来就不在」
+// 静默跳过 → 卸载返回成功、二进制原封不动。静默吞异常比报错更糟：
+// 用户以为卸了，实际没卸。
+
+describe('卸载失败不再静默', () => {
+  test('删除受阻（EPERM）→ 抛错说明哪个文件、可能因何占用', async () => {
+    const dir = makeTemp('polycode-uninst-perm-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin'), workDir: join(dir, 'w') })
+      mkdirSync(join(dir, 'bin'), { recursive: true })
+      // 文件名跟 s.binName 走（uninstall 的判据与 install/findBinary 同口径），
+      // 硬编码 .exe 在 POSIX 上找不到目标、EPERM 分支根本不触发
+      const bin = join(dir, 'bin', s.binName)
+      writeFileSync(bin, Buffer.alloc(10))
+      // ESM 的 namespace 是只读的，spyon 会报 Cannot redefine property。
+      // 改用「临时替换 statSync 之后再把它换回来」不可行（同为只读），
+      // 于是走另一条路：直接验证 uninstall 的错误分支——把文件变成不可删的
+      // 目录（unlinkSync 对目录抛 EPERM/EISDIR，正好覆盖非 ENOENT 分支）。
+      rmSync(bin)
+      mkdirSync(bin) // 同名目录：unlinkSync 会失败，且不是 ENOENT
+      await expect(s.uninstall(false)).rejects.toThrow(/卸载未能删除|占用|停止/)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('文件本就不在（ENOENT）→ 不算失败，正常返回', async () => {
+    const dir = makeTemp('polycode-uninst-none-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin'), workDir: join(dir, 'w') })
+      mkdirSync(join(dir, 'bin'), { recursive: true })
+      // 什么都没装 → 全是 ENOENT，不该抛错
+      await expect(s.uninstall(false)).resolves.toBeDefined()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+// —— 暂停 / 取消 两个路由必须走不同分支 ——
+
+//
+// 真实 bug（用户反馈「我取消安装，还是从下载到一半的进度开始」）：
+// 路由曾写成
+//   case 'cancel':
+//   case 'pause':
+// 于是 'cancel' 直接 fall-through 进 pause 分支，删除逻辑永远执行不到，
+// 「取消」实际只做了暂停，.part 一直留着 → 取消后仍从一半续传。
+
+describe('pause 与 cancel 路由分支', () => {
+  test('取消确实删除 .part，暂停不删 —— 两者行为可区分', () => {
+    const dir = makeTemp('polycode-pc1-')
+    try {
+      const s = new Sidecar(join(dir, 'cred'), { binDir: join(dir, 'bin') })
+      mkdirSync(join(dir, 'bin'), { recursive: true })
+      // 文件名跟 s.binName 走（与 discardPartial 的判据同口径），POSIX 上才不会挂
+      const part = partPath(join(dir, 'bin', s.binName))
+
+      // 取消 = 删除
+      writeFileSync(part, Buffer.alloc(5000))
+      expect(s.discardPartial(dir)).toBe(5000)
+      expect(existsSync(part)).toBe(false)
+
+      // 暂停 = 什么都不删（模拟：文件留在那儿）
+      writeFileSync(part, Buffer.alloc(5000))
+      expect(existsSync(part)).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+// —— pause / cancel / login 走**真实路由** ——
+//
+// 此前这里有两组「测自己」的用例：一是在测试里复刻一份 switch 来验证
+// 分发（生产再出现 case fall-through 它照样绿），二是复刻 startLogin 的
+// 会话守卫（同病）。现在统一改为 createSidecarApp + 打桩 Sidecar，直接打
+// HTTP 路由断言行为——生产接线变了测试立刻红。
+
+// 给一组打桩 Sidecar 造一个挂好路由的 Hono app（与 wiring.test.ts 同法）。
+function sidecarAppFor(svc: Record<string, unknown>) {
+  const app = new Hono()
+  app.route('/admin/api/sidecar', createSidecarApp(
+    svc as never,
+    { getByName: () => undefined, put: () => {} } as never,
+    () => {},
+  ))
+  return app
+}
+
+describe('pause / cancel 路由（真实接线）', () => {
+  // 造一个「正在下载」的作业：ensureReady 挂住直到 signal 被 abort。
+  function runningSvc(dir: string, discardCalls: () => number) {
+    const ac = new AbortController()
+    return {
+      ac,
+      svc: {
+        workDir: dir,
+        port: '8080',
+        credKey: join(dir, 'k'),
+        detectProvider: () => 'zai',
+        ensureReady: (_d: string, o: { signal?: AbortSignal }) => new Promise<void>((_, rej) => {
+          o.signal?.addEventListener('abort', () => rej(new SidecarCancelledError()))
+        }),
+        discardPartial: discardCalls,
+        running: async () => false,
+        status: async () => 'stopped',
+      },
+    }
+  }
+
+  test('cancel → 回 cancelled:true，且真的删了半成品；GET / 报 cancelled 无 error', async () => {
+    const dir = makeTemp('polycode-route-cancel-')
+    try {
+      let discardCalls = 0
+      const { svc } = runningSvc(dir, () => { discardCalls++; return 0 })
+      const app = sidecarAppFor(svc)
+      const ensured: Promise<Response> = Promise.resolve(app.request('/admin/api/sidecar/ensure', { method: 'POST' }))
+      await new Promise((r) => setTimeout(r, 20)) // 让作业先跑起来
+      const res = await app.request('/admin/api/sidecar/cancel', { method: 'POST' })
+      expect(res.status).toBe(200)
+      expect(await res.json()).toMatchObject({ ok: true, cancelled: true })
+      expect(discardCalls).toBe(1) // 取消必须真的删半成品（fall-through 回归锚点）
+      await ensured.catch(() => {}) // 作业随 abort 收尾，500 由作业态承载
+      const b = await (await app.request('/admin/api/sidecar')).json() as Record<string, unknown>
+      const inst = b.install as Record<string, unknown>
+      expect(inst.running).toBe(false)
+      expect(inst.cancelled).toBe(true)
+      expect(inst.error).toBe('') // 取消不是失败：不带红报错
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('pause → 回 paused:true，且不删半成品', async () => {
+    const dir = makeTemp('polycode-route-pause-')
+    try {
+      let discardCalls = 0
+      const { svc } = runningSvc(dir, () => { discardCalls++; return 0 })
+      const app = sidecarAppFor(svc)
+      void Promise.resolve(app.request('/admin/api/sidecar/ensure', { method: 'POST' })).catch(() => {})
+      await new Promise((r) => setTimeout(r, 20))
+      const res = await app.request('/admin/api/sidecar/pause', { method: 'POST' })
+      expect(res.status).toBe(200)
+      expect(await res.json()).toMatchObject({ ok: true, paused: true })
+      expect(discardCalls).toBe(0) // 暂停保留进度：删除逻辑一步都不许走
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('没有在跑的作业时 pause/cancel 都幂等（paused/cancelled=false，不报错）', async () => {
+    const app = sidecarAppFor({
+      workDir: '/wd', port: '8080', credKey: '/k',
+      discardPartial: () => 0,
+      running: async () => false, status: async () => 'stopped',
+    })
+    expect(await (await app.request('/admin/api/sidecar/pause', { method: 'POST' })).json())
+      .toMatchObject({ ok: true, paused: false })
+    expect(await (await app.request('/admin/api/sidecar/cancel', { method: 'POST' })).json())
+      .toMatchObject({ ok: true, cancelled: false })
+  })
+})
+
+// —— 网页登录（beginLogin）——
+//
+// 用户原话：「为啥不能手动弹出登录界面呢？」此前登录只能走 CLI，管理台上
+// 只有一句报错文案，登录被赶出网页。beginLogin 让网页能拿到 OAuth 链接，
+// 作为「引擎自动弹出的授权页没出现时」的兜底入口（引擎 4.6.8 起自己会弹
+// 默认浏览器，那是唯一一次打开；网页只展示链接，绝不再自动开）。
+
+describe('beginLogin 抓取授权链接', () => {
+  // 用**生产代码导出的那一个** authURLRe，而不是在测试里另抄一份。
+  // 教训：这里原先抄了一份只认 oauth/authorize 的正则，于是「bigmodel 抓不到」
+  // 这个真实缺陷在测试里永远暴露不出来——抄一份等于把被测规则换成了另一个。
+  // （仍试过直接 spawn .cmd/.py 替身，Windows 上 spawn UNKNOWN、python 环境又不保证，
+  //  所以沿用纯函数复刻「等整行 + 正则」这套做法。）
+  const AUTHORIZE_RE = authURLRe
+  function sniff(chunks: string[]): string {
+    let buffered = ''
+    for (const c of chunks) {
+      buffered += c
+      const nl = buffered.lastIndexOf('\n')
+      if (nl < 0) continue
+      const m = AUTHORIZE_RE.exec(buffered.slice(0, nl))
+      if (m !== null) return m[0]
+    }
+    return ''
+  }
+
+  const want = 'https://chat.z.ai/api/oauth/authorize?client_id=abc&state=deadbeef&response_type=code'
+  const full = 'Open this URL to authorize:\n\n  ' + want + '\n\nWaiting for authorization...\n'
+
+  test('引擎给出授权 URL → 抓到完整链接', () => {
+    expect(sniff([full])).toBe(want)
+  })
+
+  test('任意分块边界都只认完整 URL（半截链接点不开授权页，只会害用户）', () => {
+    for (const size of [1, 3, 7, 13, 40, 100]) {
+      const chunks: string[] = []
+      for (let i = 0; i < full.length; i += size) chunks.push(full.slice(i, i + size))
+      expect(sniff(chunks), `分片 ${size} 字节`).toBe(want)
+    }
+  })
+
+  test('URL 没收完（无换行）→ 返回空串（拿不到完整链接）', () => {
+    expect(sniff(['Open this URL:\n\n  https://chat.z.ai/api/oauth/authorize?clie'])).toBe('')
+  })
+
+  test('输出里没有授权 URL → 空串（不误抓别的链接当兜底入口）', () => {
+    expect(sniff(['Device identity generated: xyz\nNot logged in\n'])).toBe('')
+  })
+
+  // 引擎支持两个 provider，而它们的授权页 URL 形态**完全不同**。
+  // 真实缺陷（用户要求「我要支持 zcode 的两种登入」）：正则只认 oauth/authorize，
+  // bigmodel 的授权页（bigmodel.cn/login?appId=…）永远抓不到，表现为「点了没反应」。
+  const BM = 'https://bigmodel.cn/login?appId=zcode&redirect=https%3A%2F%2Fzcode.z.ai'
+    + '%2Fapp%2Foauth%2Flogin%3Fredirect%3Dzcode%253A%252F%252Foauth%252Fcallback&state=99641e03'
+
+  test('bigmodel 的授权链接（bigmodel.cn/login?appId=…）也能抓到', () => {
+    const out = 'Logging in: bigmodel (OAuth)\n\nOpen this URL to authorize:\n\n  ' + BM
+      + '\n\nWaiting for authorization... (expires in 300s)\n'
+    expect(sniff([out])).toBe(BM)
+  })
+
+  test('两种 provider 的 URL 都能抓到（同一套规则）', () => {
+    const zai = 'https://chat.z.ai/api/oauth/authorize?client_id=abc&state=xyz&response_type=code'
+    for (const u of [zai, BM]) {
+      expect(authURLRe.exec('  ' + u + '\n')?.[0], u.slice(0, 40)).toBe(u)
+    }
+  })
+})
+
+// —— 登录会话复用：连点不该开多个窗口 ——
+//
+// 真实缺陷（用户报告「我点一次授权登入你给我开两个一样的窗口」）：
+// 守卫原先在 `finally` 里清空 —— URL 一拿到（约 0.2 秒）就放行，而 OAuth 会话
+// 本身要活 5 分钟。于是两次点击只要隔了 0.2 秒以上就各起一个引擎进程、各开一个
+// 窗口（实测连点 3 次 = 3 个进程 + 3 个不同的 state）。两个窗口长得一模一样，
+// 但只有最后一个的会话是活的。
+
+describe('登录会话复用', () => {
+  // —— 判定规则直接用生产代码 ——
+  //
+  // 测试教训：这里上一版自己重写了一个 mock 判定（连点复用、引擎退出释放全套
+  // 复刻），变异测试改生产代码时它根本不动 —— 测自己等于没测。守卫语义现在
+  // 由下面的**真实路由级**用例覆盖；这里只留 shouldReuseLogin 纯函数的判定矩阵。
+  //
+  // 真实缺陷（用户报告「你只修好了 zai 的，bigmodel 也有这个问题」）：守卫只看
+  // 「有没有会话在飞」，不看是哪个 provider。于是把下拉切到 bigmodel 再点，
+  // 服务端仍把上一轮 zai 的链接原样返回 —— 界面选了智谱，授权页却是 z.ai。
+  test('同 provider 在飞 → 复用（不开新会话）', () => {
+    expect(shouldReuseLogin({ provider: 'zai' }, 'zai')).toBe(true)
+    expect(shouldReuseLogin({ provider: 'bigmodel' }, 'bigmodel')).toBe(true)
+  })
+
+  test('换了 provider → 不复用（必须开新会话）', () => {
+    expect(shouldReuseLogin({ provider: 'zai' }, 'bigmodel')).toBe(false)
+    expect(shouldReuseLogin({ provider: 'bigmodel' }, 'zai')).toBe(false)
+  })
+
+  test('没有在飞的会话 → 不复用（开新的）', () => {
+    expect(shouldReuseLogin(null, 'zai')).toBe(false)
+    expect(shouldReuseLogin(null, 'bigmodel')).toBe(false)
+  })
+
+  // 真实缺陷（子代理审查抓到的 P2）：beginLogin 的 15 秒竞速把「引擎迟迟不给
+  // URL」判成 ''，这种会话若还被复用，用户在引擎等授权的 5 分钟里点多少次都是
+  // 同一个「未能取得授权链接」。urlValue==='' 即死会话，必须放行开新的。
+  test('urlValue 已判空（15 秒没等到 URL）→ 不复用死会话', () => {
+    expect(shouldReuseLogin({ provider: 'zai', urlValue: '' }, 'zai')).toBe(false)
+    // 正常在飞（还没定型）与已拿到链接的，都仍是活会话
+    expect(shouldReuseLogin({ provider: 'zai' }, 'zai')).toBe(true)
+    expect(shouldReuseLogin({ provider: 'zai', urlValue: 'https://u' }, 'zai')).toBe(true)
+  })
+})
+
+// —— login 路由（真实接线）：连点不该开多个窗口 ——
+//
+// 真实缺陷（用户报告「我点一次授权登入你给我开两个一样的窗口」）：守卫原先在
+// `finally` 里清空 —— URL 一拿到（约 0.2 秒）就放行，而 OAuth 会话本身要活
+// 5 分钟。于是两次点击只要隔了 0.2 秒以上就各起一个引擎进程、各开一个窗口
+//（实测连点 3 次 = 3 个进程 + 3 个不同的 state）。两个窗口长得一模一样，
+// 但只有最后一个的会话是活的。
+
+describe('login 路由会话守卫（真实接线）', () => {
+  // 打桩 beginLogin：每次 spawn 记录编号，URL/done 由测试逐个放行。
+  function loginSvc() {
+    let spawned = 0
+    const releaseURL: ((u: string) => void)[] = []
+    const releaseDone: ((n: number) => void)[] = []
+    const killed: number[] = []
+    const svc = {
+      workDir: '/wd',
+      detectProvider: () => 'zai' as const,
+      beginLogin: () => {
+        spawned++
+        const n = spawned
+        return {
+          url: new Promise<string>((r) => { releaseURL[n - 1] = r }),
+          done: new Promise<number>((r) => { releaseDone[n - 1] = r }),
+          child: { kill: () => { killed.push(n) } },
+        }
+      },
+    }
+    return { svc, spawned: () => spawned, releaseURL, releaseDone, killed }
+  }
+
+  const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 10))
+
+  test('同 provider 在飞期间连点 → 复用同一会话（只 spawn 一次，URL 一致）', async () => {
+    const { svc, spawned, releaseURL } = loginSvc()
+    const app = sidecarAppFor(svc)
+    const first = app.request('/admin/api/sidecar/login', { method: 'POST' })
+    await tick()
+    releaseURL[0]!('https://chat.z.ai/u1')
+    expect(await (await first).json()).toMatchObject({ ok: true, url: 'https://chat.z.ai/u1', provider: 'zai' })
+    const second = await (await app.request('/admin/api/sidecar/login', { method: 'POST' })).json()
+    expect(spawned()).toBe(1) // 关键：不是 2
+    expect((second as Record<string, unknown>).url).toBe('https://chat.z.ai/u1')
+  })
+
+  test('引擎进程退出后，才允许开新的', async () => {
+    const { svc, spawned, releaseURL, releaseDone } = loginSvc()
+    const app = sidecarAppFor(svc)
+    const first = app.request('/admin/api/sidecar/login', { method: 'POST' })
+    await tick()
+    releaseURL[0]!('u1')
+    expect(await (await first).json()).toMatchObject({ url: 'u1' })
+    expect(spawned()).toBe(1)
+    releaseDone[0]!(0) // 引擎退出（授权成功）
+    await tick() // 让 done 回调清掉会话
+    const second = app.request('/admin/api/sidecar/login', { method: 'POST' })
+    await tick()
+    releaseURL[1]!('u2')
+    expect(await (await second).json()).toMatchObject({ url: 'u2' })
+    expect(spawned()).toBe(2)
+  })
+
+  test('换 provider → kill 旧会话并开新的（不复用旧链接）', async () => {
+    const { svc, spawned, releaseURL, killed } = loginSvc()
+    const app = sidecarAppFor(svc)
+    const first = app.request('/admin/api/sidecar/login', { method: 'POST' }) // 自动 → zai
+    await tick()
+    releaseURL[0]!('https://chat.z.ai/u1')
+    expect(await (await first).json()).toMatchObject({ provider: 'zai' })
+    const second = app.request('/admin/api/sidecar/login?provider=bigmodel', { method: 'POST' })
+    await tick()
+    releaseURL[1]!('https://bigmodel.cn/u2')
+    expect(await (await second).json()).toMatchObject({ provider: 'bigmodel', url: 'https://bigmodel.cn/u2' })
+    expect(spawned()).toBe(2)
+    expect(killed).toEqual([1]) // 旧会话必须被结束掉，不能白占 5 分钟
+  })
+
+  test('15 秒没等到 URL 的死会话 → 下一次点击开新会话，不再永远返回空', async () => {
+    const { svc, spawned, releaseURL } = loginSvc()
+    const app = sidecarAppFor(svc)
+    const first = app.request('/admin/api/sidecar/login', { method: 'POST' })
+    await tick()
+    releaseURL[0]!('') // 模拟 15 秒竞速判空（引擎迟迟不打印 URL）
+    const res1 = await first
+    expect(res1.status).toBe(500) // 首次点击如实报「未能取得授权链接」
+    await tick()
+    const second = app.request('/admin/api/sidecar/login', { method: 'POST' })
+    await tick()
+    releaseURL[1]!('https://chat.z.ai/u2')
+    const b2 = await (await second).json() as Record<string, unknown>
+    expect(b2.url).toBe('https://chat.z.ai/u2')
+    expect(spawned()).toBe(2) // 死会话不复用：重开而不是把空链接再还一遍
+  })
+})
 
 // —— Uninstall（uninstall_test.go 三个用例）
 

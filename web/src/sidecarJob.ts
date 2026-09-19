@@ -5,7 +5,7 @@
 //   切回即重建。原来「安装中」存在组件 ref 里（Providers 的 qiBusy、Discover 的
 //   scBusy），于是切页回来按钮变回「一键安装」——而服务端其实还在下载（普通
 //   fetch 不随组件卸载 abort）。页面显示的状态和事实分叉，用户再点一次就会发出
-//   第二个 POST /ensure（两个 ensureReady 并发往同一个 dest+'.tmp' 写）。
+//   第二个 POST /ensure（两个 ensureReady 并发往同一个 dest+'.part' 写）。
 //
 // 所以这里做两件事：
 //   1. 状态放模块级：同一时刻所有视图读的是同一份，切页不丢；
@@ -86,7 +86,27 @@ const running = computed(() => job.value?.running === true)
 // installing 是视图真正该看的那个：服务端作业在跑，**或者**用户刚点下、作业态
 // 还没标起来。少了后半个条件，从点击到服务端响应之间界面仍是「一键安装」，
 // 用户以为没点动——这正是「必须切页才变进度条」的直接成因。
-const installing = computed(() => running.value || optimistic.value)
+//
+// 但 optimistic 必须**只在还没拿到服务端答复之前**起作用。真实缺陷（用户报告
+// 「下载完成后，进度条又变成了……正在安装」）：作业其实早就结束了
+// （服务端 install.running=false 且 installed=true），而 start() 里的 POST 若迟迟
+// 不返回（或视图在中途重新挂载），optimistic 就一直为真，界面于是永远停在
+// 「正在安装」，和下面「installed, stopped」「上次安装失败」自相矛盾。
+// 所以：一旦拿到作业态且它明确不在跑，就不再算「安装中」。
+const installing = computed(() => {
+  if (running.value) return true
+  // 「作业态已有结论」（成功/失败/取消，finishedAt 已落值）→ 以服务端为准，
+  // 不听 optimistic——否则作业结束后、POST 还在途的那段时间，界面会永远停在
+  // 「正在安装」，和下面「installed, stopped」「上次安装失败」自相矛盾。
+  //
+  // 但判据必须是「有没有结论」，**不是「install 字段存在不存在」**：服务端
+  // GET / 永远返回非空 install（空闲时是全 0 的初值），按后者判的话 optimistic
+  // 永远没有出场机会——点击安装后的头 1 秒（POST 在途、作业还没标 running）
+  // 按钮又变回「一键安装」，用户以为没点动（子代理审查抓到的口径错位）。
+  const inst = sc.value?.install
+  if (inst != null && (inst.ok || inst.error !== '' || inst.cancelled === true || (inst.finishedAt ?? 0) !== 0)) return false
+  return optimistic.value
+})
 
 // 下面四个 computed 的取值规则都在 sidecarProgress.ts 里（纯函数、有单测）：
 // 百分比只在有总数时给、失败原因常驻并标注「上次」、字节与耗时的拼法。
@@ -122,14 +142,22 @@ async function start(): Promise<boolean> {
     if (sc.value?.install?.running === true) return true
     // 关键：**不要 await 到底**。POST 在后台跑，立刻开始按 1 秒轮询接管进度。
     // POST 自己返回时只代表「这一轮结束了」，真实结果以作业态为准（下面 finally 里读）。
+    //
+    // settled 必须是独立标记，**不能用「race 结果 === false」当继续条件**：
+    // 旧写法 `Promise.race([post, sleep]) === false` 在 POST 一失败就死循环——
+    // post 永远以 false 兑现，race 每次立刻取到 false，循环永不退出，
+    // finally 到不了 → busy 恒为 true → 两个页面的安装按钮从此全部失效
+    // （且新加的「暂停/取消」会 abort 下载让服务端回 500，恰好触发它）。
+    let settled: boolean | null = null
     const post = api.sidecarAction('ensure').then(
-      () => true,
-      () => false, // 失败详情在服务端作业态里，由 errorText 就地显示
+      () => { settled = true },
+      () => { settled = false }, // 失败详情在服务端作业态里，由 errorText 就地显示
     )
-    while (await Promise.race([post, sleep(POLL_MS).then(() => false)]) === false) {
-      await refresh()
+    while (settled === null) {
+      await Promise.race([post, sleep(POLL_MS)])
+      if (settled === null) await refresh()
     }
-    if (!(await post)) return false
+    if (!settled) return false
     ElMessage.success('ZCode 本地引擎已就绪')
     return true
   } catch {
@@ -151,8 +179,6 @@ export interface UseSidecar {
   job: ComputedRef<InstallJobView | null>
   running: ComputedRef<boolean>
   busy: Ref<boolean>
-  // installing = 「该显示进度条了」：服务端说在跑，或用户刚点下、服务端还没标起来。
-  // 视图用它替代 running 来决定「按钮位换成进度条」，点击后即刻生效。
   installing: ComputedRef<boolean>
   stale: Ref<boolean>
   percent: ComputedRef<number | null>
@@ -161,6 +187,11 @@ export interface UseSidecar {
   errorText: ComputedRef<string>
   proxyText: ComputedRef<string>
   start: () => Promise<boolean>
+  // pause 暂停：停止下载但**保留**已下的部分，下次点安装从断点续传。
+  pause: () => Promise<boolean>
+  // cancel 取消：停止并**删除**已下的半成品，下次从 0 开始。
+  // 两者此前混成一个「取消」且实际是暂停语义，用户点了却留下半截文件，名不副实。
+  cancel: () => Promise<boolean>
   refresh: () => Promise<void>
 }
 
@@ -171,6 +202,33 @@ export interface UseSidecar {
 // 但**保留 sc.value 这份快照**。切回来时先渲染上次已知的进度，再立刻 refresh，
 // 于是页面不会先闪一下「一键安装」再跳回进度条——那一下闪烁正是用户说的
 // 「切换页面状态变回去了」。状态本身从没丢过（服务端持有），丢的是这一帧。
+// pause 暂停：停止本次下载，保留 .part（下次断点续传）。
+//
+// 不碰 busy/optimistic：abort 会让服务端 ensure 返回 500，start() 的 POST 随之
+// 结算并在它自己的 finally 里收尾。这里若无条件清 busy，会在 start() 还在途时
+// 暗中拆掉它的重入闸，让第二次点击漏进去（子代理审查指出的状态归属混乱）。
+async function pause(): Promise<boolean> {
+  try {
+    await api.sidecarAction('pause')
+  } catch {
+    // 暂停失败不弹错：用户要的是「停下来」，最坏也只是没停。
+  }
+  await refresh()
+  return sc.value?.install?.running !== true
+}
+
+// cancel 取消：停止并删除 .part（下次从 0 开始）。
+// 会让用户丢弃已下的内容，所以调用方**必须二次确认**。
+async function cancel(): Promise<boolean> {
+  try {
+    await api.sidecarAction('cancel')
+  } catch {
+    // 同上：不弹错，真实状态以下面的 refresh 为准。
+  }
+  await refresh()
+  return sc.value?.install?.running !== true
+}
+
 export function useSidecar(): UseSidecar {
   onMounted(() => {
     consumers++
@@ -181,6 +239,7 @@ export function useSidecar(): UseSidecar {
     if (consumers === 0) stopPoll()
   })
   return {
-    sc, job, running, busy, installing, stale, percent, phaseText, detailText, errorText, proxyText, start, refresh,
+    sc, job, running, busy, installing, stale, percent, phaseText, detailText, errorText, proxyText,
+    start, pause, cancel, refresh,
   }
 }

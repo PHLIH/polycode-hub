@@ -3,7 +3,7 @@
 
 import { existsSync } from 'node:fs'
 import { Hono, type Context } from 'hono'
-import { validatePort, type FetchLike, type Sidecar, type SidecarPhase } from '../sidecar/sidecar.ts'
+import { SidecarCancelledError, validatePort, type FetchLike, type Sidecar, type SidecarPhase } from '../sidecar/sidecar.ts'
 import { maskProxyURI, resolveSidecarDownloadFetch } from '../sidecar/httpproxy.ts'
 
 // sidecar 只关心「zcode-plan-local」这一个 Provider 的 baseUrl 与 egress 引用，
@@ -53,7 +53,7 @@ function sidecarInstalled(s: Sidecar): boolean {
 // <component :is>，每次切页都卸载重建 → 状态归零。后果有两层：
 //   1. 页面显示「一键安装」，而服务端其实还在下载（普通 fetch 不随组件卸载 abort）；
 //   2. 用户再点一次就发出第二个 POST /ensure，两个 ensureReady 并发下载，
-//      而临时文件路径是固定的 dest+'.tmp'，两个流写同一个文件会互相踩踏。
+//      而半成品路径是固定的 dest+'.part'，两个流写同一个文件会互相踩踏。
 // 所以进度与阶段记在这里，GET / 对外暴露，POST /ensure 遇到在跑的任务直接复用。
 interface InstallJob {
   running: boolean
@@ -66,6 +66,9 @@ interface InstallJob {
   error: string
   proxy: string // 本次尝试实际使用的下载代理（已脱敏）
   proxySource: string
+  // cancelled 用户主动取消/暂停（不是失败）。前端据此不渲染成红报错；
+  // 「已暂停/已取消」的确认提示由 pause/cancel 动作就地给出。
+  cancelled?: boolean
   promise: Promise<void> | null
 }
 
@@ -75,6 +78,24 @@ function idleJob(): InstallJob {
     startedAt: 0, finishedAt: 0, ok: false, error: '',
     proxy: '', proxySource: '', promise: null,
   }
+}
+
+// shouldReuseLogin 按「有没有在飞的**同 provider** 会话」决定复用还是开新。
+//
+// 从 startLogin 里抽成纯函数，是为了让测试能直接锁住判定规则本身——而不是像
+// 之前那样在测试里重新实现一个 mock（mock 与生产实现各说各话，变异测试
+// 根本拦不住 regression，上一个提交就犯了这个错）。
+//
+// urlValue 是会话最终给出的授权链接：undefined = 还没定型（正常在飞），
+// '' = beginLogin 的 15 秒竞速已判空（引擎迟迟没打印 URL）。后者是**死会话**：
+// 复用它只会永远返回空链接（用户在引擎等授权的 5 分钟里点多少次都是同一个
+// 「未能取得授权链接」），必须放行去 kill 旧会话、开新的（子代理审查抓到的 P2）。
+export type LoginWant = 'zai' | 'bigmodel'
+export function shouldReuseLogin(
+  session: { provider: string; urlValue?: string } | null,
+  want: LoginWant,
+): boolean {
+  return session !== null && session.provider === want && session.urlValue !== ''
 }
 
 export function createSidecarApp(
@@ -90,7 +111,8 @@ export function createSidecarApp(
 
   // downloadProxy 决议本次下载用的代理（复用项目 egress 配置，不写死地址）：
   // 优先 zcode-plan-local Provider 的 egress 引用 → 仅一项时自动采用 → 环境变量
-  // → darwin 系统代理 → 直连。egress 表来自管理面注入（DB 真相源）。
+  // → darwin scutil / windows 注册表读系统代理 → 直连。egress 表来自管理面注入
+  // （DB 真相源）。
   // 显式 ?egress=<id> 由「必须命中」的语义决定（不存在就报错，不静默换出口）。
   function downloadProxy(egressId = ''): { proxyURI: string | null; source: string; fetch: FetchLike } {
     const p = providers.getByName('zcode-plan-local')
@@ -104,8 +126,91 @@ export function createSidecarApp(
   // ensureJob 启动（或复用）一次安装作业。
   // 返回值就是该次安装的 promise：并发的第二个请求拿到同一个 promise，
   // 因此只会下载一次（响应结构与以前完全一致，只是不再重复起第二次下载）。
+  //
+  // 暂停 vs 取消（用户明确区分，此前两者混为一谈）：
+  //   · 暂停 pause  —— 停止本次下载，**保留 .part**，下次点安装从断点续传。
+  //   · 取消 cancel —— 停止并**删除 .part**，下次从 0 开始（干净重来）。
+  // 以前只有一个「取消」且实际是暂停语义，用户点了却保留半截文件，名不副实。
+  let jobAbort: AbortController | null = null
+
+  function pauseJob(): boolean {
+    if (!job.running || jobAbort === null) return false
+    jobAbort.abort()
+    return true
+  }
+
+  // cancelJob 比暂停多一步：把已下的一半删掉。
+  // 删除放在 abort 之后、作业态收尾之前：下载循环随后就会停。竞态上存在一个
+  // 已缓冲的 chunk 在 unlink 之后落盘的窗口（写入目标是已 unlink 的 inode /
+  // Windows delete-pending 文件，无害）——关键性质是「文件不会因此复现」，
+  // 而不是「绝不会再写」。
+  async function cancelJob(): Promise<boolean> {
+    if (!job.running || jobAbort === null) return false
+    jobAbort.abort()
+    const removed = svc.discardPartial(dir())
+    console.log(`sidecar: 已取消安装，清除半成品 ${removed} 字节（下次从 0 开始）`)
+    return true
+  }
+
+  // 登录流程：网页点「登录授权」→ 后端拉起引擎 OAuth → 拿到 URL 回给前端，
+  // 前端把它展示成兜底链接（引擎 4.6.8 起自己会弹默认浏览器，网页绝不能再
+  // window.open 一次——那正是「点一次登录弹两个一模一样的授权页」的来源）。
+  //
+  // 用户原话：「为啥不能手动弹出登录界面呢？」——以前只有 CLI 一条路
+  // （`polycode-hub zcode sidecar login`），管理台上除了报错文案里的那句
+  // 指引什么都没有，登录这一步等于把用户赶出网页。
+  //
+  // 真实缺陷（用户报告「我点一次授权登入你给我开两个一样的窗口」）：
+  // 这里原先是 `finally { loginPending = null }` —— URL 一拿到（约 0.2 秒）就把
+  // 守卫清掉了，**而 OAuth 会话本身要活 5 分钟**。于是两次点击之间只要隔了 0.2 秒
+  // 以上，就会各自起一个引擎进程、各自开一个窗口（实测连点 3 次 = 3 个
+  // zcode-proxy 进程、3 个不同的 state）。两个窗口看起来一模一样，但只有最后一个
+  // 的会话是「活的」——这正是用户看到的「两个一样的窗口」。
+  //
+  // 修法：把「刚拿到 URL」和「会话结束」分开。会话在飞（尚未授权完成）期间一律复用，
+  // 只有引擎进程真的退出（授权成功/超时）才允许开下一次。
+  interface LoginSession { url: Promise<string>; done: Promise<number>; provider: string; child?: { kill: () => void }; urlValue?: string }
+  let loginSession: LoginSession | null = null
+
+  function startLogin(provider?: string): Promise<{ url: string; provider: string }> {
+    // provider 可由前端指定（网页上给 z.ai / 智谱二选一）；不指定就按本机
+    // ZCode 客户端里实际登录的那个猜，省得用户自己判断该点哪个。
+    const want = provider === 'zai' || provider === 'bigmodel' ? provider : svc.detectProvider()
+    // 复用**仅限同一个 provider**，且会话必须是活的（urlValue !== ''）。
+    //
+    // 真实缺陷（用户报告「你只修好了 zai 的，bigmodel 也有这个问题」）：
+    // 守卫只看「有没有会话在飞」，不看是哪个 provider。于是用户把下拉切到
+    // bigmodel 再点，服务端仍把上一轮 zai 的链接原样返回 —— 界面显示选了智谱，
+    // 拿到的却是 z.ai 的授权页（服务端还挺诚实地回 provider=zai），
+    // 用户对着错误的页面登录，怎么登都不对。
+    // 换 provider 是有意的行为，必须开新会话；只有**同一个** provider 才复用。
+    // 判定规则在 shouldReuseLogin 里（导出供测试直接锁住，而不是在测试里重写 mock）。
+    if (shouldReuseLogin(loginSession, want)) {
+      const s = loginSession as LoginSession
+      return s.url.then((u) => ({ url: u, provider: s.provider }))
+    }
+    // 换了 provider（或旧会话已判死）：先把上一个会话结束掉。不杀的话它会
+    // 活满 5 分钟，留着白占进程、还可能抢写同一份凭据。
+    if (loginSession !== null) {
+      try { loginSession.child?.kill() } catch { /* 已经退了 */ }
+      loginSession = null
+    }
+    const { url, done, child } = svc.beginLogin(dir(), want)
+    const session: LoginSession = { url, done, provider: want, child }
+    loginSession = session
+    // urlValue 记录这个会话最终给出的链接（见 shouldReuseLogin）：15 秒竞速
+    // 判空即标记死会话，后续点击不再复用。
+    void url.then((u) => { if (loginSession === session) session.urlValue = u })
+    // 引擎进程退出（授权成功 / 5 分钟超时 / 被杀）才释放守卫 —— 不是 URL 一拿到就放。
+    const clear = (): void => { if (loginSession === session) loginSession = null }
+    void done.then(clear, clear)
+    return url.then((u) => ({ url: u, provider: want }))
+  }
+
   function ensureJob(dl: ReturnType<typeof downloadProxy>): Promise<void> {
     if (job.running && job.promise !== null) return job.promise
+    const ac = new AbortController()
+    jobAbort = ac
     const cur: InstallJob = {
       running: true, phase: 'resolving', received: 0, total: 0,
       startedAt: Date.now(), finishedAt: 0, ok: false, error: '',
@@ -116,6 +221,8 @@ export function createSidecarApp(
       try {
         await svc.ensureReady(dir(), {
           fetch: dl.fetch,
+          proxySource: dl.source,
+          signal: ac.signal,
           onProgress: (pr) => {
             // 只写当前作业：上一轮的延迟回调万一晚到，不能污染新一轮的进度。
             if (job !== cur) return
@@ -126,14 +233,30 @@ export function createSidecarApp(
         })
         cur.ok = true
       } catch (e) {
-        cur.error = (e as Error).message
+        // 取消不是失败：标记成 cancelled，页面不渲染成红报错（暂停/取消各自的
+        // 确认提示由动作就地给出）。判定优先认 SidecarCancelledError——生产代码
+        // 所有主动取消路径都抛它；aborted + AbortError 只是兜底。不能只看
+        // ac.signal.aborted：用户刚点完暂停、紧接着下载因「摘要不匹配」等真实
+        // 原因失败时，错误会被吞成「已取消」，真实故障对用户隐身。
+        if (e instanceof SidecarCancelledError) {
+          cur.cancelled = true
+          cur.error = ''
+        } else if (ac.signal.aborted === true && (e as Error).name === 'AbortError') {
+          cur.cancelled = true
+          cur.error = ''
+        } else {
+          cur.error = (e as Error).message
+        }
         throw e
       } finally {
         cur.running = false
         cur.finishedAt = Date.now()
+        if (jobAbort === ac) jobAbort = null
       }
     })()
     cur.promise = p
+    // 未处理的拒绝会冒泡成 unhandledRejection（HTTP 层已经在 err() 里回过 500）。
+    p.catch(() => {})
     return p
   }
 
@@ -170,14 +293,15 @@ export function createSidecarApp(
           : (job.running ? Date.now() : job.finishedAt) - job.startedAt,
         ok: job.ok,
         error: job.error,
+        cancelled: job.cancelled === true,
         downloadProxy: job.proxy,
         downloadProxySource: job.proxySource,
       },
     })
   })
 
-  // POST /{action} → start|stop|setup|uninstall|ensure|port|endpoint。
-  // install 与 login 涉及交互/长下载，仍走 CLI（页面上给指引），不进 HTTP。
+  // POST /{action} → start|stop|login|pause|cancel|setup|uninstall|ensure|port|endpoint。
+  // install 涉及交互式下载指引，仍走 CLI（页面上给指引），不进 HTTP。
   app.post('/:action', async (c) => {
     const action = c.req.param('action')
     switch (action) {
@@ -187,6 +311,37 @@ export function createSidecarApp(
       case 'stop':
         try { await svc.stop() } catch (e) { return err(c, 500, '停止失败: ' + (e as Error).message) }
         return c.json({ ok: true, status: await svc.status() })
+      case 'login':
+        // 登录授权：返回引擎给的 OAuth 授权链接。引擎自己会弹默认浏览器，
+        // 前端只把链接当「没弹出来时的兜底入口」展示，不自动打开。
+        // 不在这里 await「用户授权完成」——那要几分钟，HTTP 请求挂不住；
+        // 由前端在用户授权后自行点「启动」验证结果。
+        // ?provider=zai|bigmodel 可选；不传就按本机客户端已登录的那个猜。
+        try {
+          const q = c.req.query('provider')
+          const { url, provider } = await startLogin(q)
+          if (url === '') {
+            return err(c, 500, `未能取得授权链接（provider=${provider}；引擎未输出 OAuth 地址，或未安装引擎）。`)
+          }
+          return c.json({ ok: true, url, provider })
+        } catch (e) {
+          return err(c, 500, '登录失败: ' + (e as Error).message)
+        }
+      case 'pause':
+        // 暂停：停止本次下载，**保留**已下的部分，下次点安装从断点续传。
+        // 幂等：没有在跑的作业时返回 paused=false（用户连点不该报错）。
+        return c.json({ ok: true, paused: pauseJob() })
+      case 'cancel':
+        // 取消：停止并**删除**已下的半成品，下次从 0 开始。
+        // 与 pause 的唯一区别就是这个删除动作。
+        //
+        // 历史 bug（本函数第一版就踩了）：这里曾写成
+        //   case 'cancel':
+        //   case 'pause':
+        // 于是 'cancel' 直接落进 pause 分支、永远走不到删除逻辑——「取消」
+        // 实际只做了暂停，.part 一直留着，用户取消后仍从一半续传（正是用户
+        // 反馈的现象）。相邻的 case 必须各带各的 return，不能 fall-through。
+        return c.json({ ok: true, cancelled: await cancelJob() })
       case 'setup': {
         let key: string
         try { key = svc.setupConfig(dir()) } catch (e) { return err(c, 500, '配置失败: ' + (e as Error).message) }
@@ -303,7 +458,7 @@ export function createSidecarApp(
       }
       default:
         return err(c, 404, '未知动作 ' + action +
-          '（支持: start|stop|setup|ensure；install/login 走 CLI: polycode-hub zcode sidecar …）')
+          '（支持: start|stop|login|pause|cancel|setup|uninstall|ensure|port|endpoint；install 走 CLI: polycode-hub zcode sidecar …）')
     }
   })
 
