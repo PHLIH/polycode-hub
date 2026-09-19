@@ -1361,6 +1361,31 @@ describe('代理冷启动预热', () => {
     expect(r.tagName).toBe('v9.9.9')
     expect(proxyCalls).toBe(5) // 试到第 5 次成功，而不是第 1 次就放弃
   })
+
+  // 回归：本地代理「活着但连不上游」时最常见的是 502/503，而不是连接异常。
+  // 旧实现只在**抛异常**时才兜底直连（判据是 res === null），拿到 5xx 会立刻
+  // 走到 `if (res.status !== 200) throw`，正是它注释里宣称要解决的那个场景。
+  test('latestRelease 代理返回 5xx 也会兜底直连（不只兜异常）', async () => {
+    const realFetch = globalThis.fetch
+    let proxyCalls = 0
+    let directCalls = 0
+    const proxy = (async () => {
+      proxyCalls++
+      return new Response('bad gateway', { status: 502 })
+    }) as never
+    globalThis.fetch = (async () => {
+      directCalls++
+      return new Response(JSON.stringify({ tag_name: 'v9.9.9', assets: [] }), { status: 200 })
+    }) as never
+    try {
+      const r = await latestRelease(proxy, 'egress-auto:clash')
+      expect(r.tagName).toBe('v9.9.9')
+      expect(proxyCalls).toBe(6)   // 5xx 计入重试，把 6 次额度用完
+      expect(directCalls).toBe(1)  // 然后才走直连
+    } finally {
+      globalThis.fetch = realFetch
+    }
+  })
 })
 
 // —— 暂停（保留） vs 取消（丢弃）——

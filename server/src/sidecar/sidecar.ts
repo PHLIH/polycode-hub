@@ -7,7 +7,7 @@
 
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
-import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -408,7 +408,17 @@ export async function latestRelease(
   let res: Response | null = null
   for (let i = 0; i < PROXY_TRIES && res === null; i++) {
     try {
-      res = await fetchImpl(releaseAPI, init)
+      const r = await fetchImpl(releaseAPI, init)
+      // 代理返回 5xx 也算「这个出口不可用」：本地代理上游节点挂掉时最常见的
+      // 表现就是 502/503，而不是连接异常。旧实现只在**抛异常**时兜底直连，
+      // 于是「配的代理活着但连不上游」这个正主场景反而不会被兜住，
+      // 用户看到的就是一句 http 502。这里把 5xx 也计入重试，耗尽后走直连。
+      if (r.status >= 500) {
+        lastProxyErr = new Error(`http ${r.status}`)
+        try { await r.body?.cancel() } catch { /* 忽略 */ }
+      } else {
+        res = r
+      }
     } catch (e) {
       lastProxyErr = e
       if (signal?.aborted === true) throw new SidecarCancelledError()
@@ -431,9 +441,18 @@ export async function latestRelease(
   if (res.status !== 200) {
     throw new Error(`sidecar: 查询 release 失败: http ${res.status}`)
   }
-  const raw = JSON.parse(await res.text()) as {
+  // 解析失败也要给人话：上游 200 但返回 HTML（代理门户页/被截断的响应）时，
+  // 原始 SyntaxError「Unexpected token '<'」会原样落到管理台的「就绪失败」上，
+  // 正是 describeFetchError 想消灭的那类不可读错误。
+  let raw: {
     tag_name?: string
     assets?: { name?: string; browser_download_url?: string; size?: number; digest?: string }[]
+  }
+  try {
+    raw = JSON.parse(await res.text()) as typeof raw
+  } catch (e) {
+    throw new Error(`sidecar: 查询 release 失败 —— 上游返回的不是合法 JSON（${describeFetchError(e)}）；`
+      + `多半是代理/网关插了一页 HTML，检查出口 ${proxySource || 'direct'} 后重试`)
   }
   return {
     tagName: raw.tag_name ?? '',
@@ -1330,7 +1349,12 @@ defaultModel: glm-5.3-flash
         // 下次安装带着 Range 头从一段来路不明的数据中间接着写。
         for (const c of [join(dir, n), partPath(join(dir, n))]) {
           try {
-            if (statSync(c).size >= 0) {
+            // 先 stat 确认存在，再 unlink。刻意**不**用 isFile() 过滤掉目录：
+            // 同名目录（用户/安装脚本误建）也必须走 unlink 并让失败暴露出来——
+            // 静默跳过正是「点了卸载还是显示 installed」那个真实缺陷的形态。
+            // 原先这里写的是 size >= 0（恒真，等价于「没抛错」），语义相同但读着
+            // 像在判大小；改成显式的 existsSync 意图更清楚。
+            if (existsSync(c)) {
               unlinkSync(c)
               if (!c.endsWith('.part') && res.binary === undefined) res.binary = c
             }

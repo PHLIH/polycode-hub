@@ -482,19 +482,6 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
       + `两版 token 互不通用，请先在发现页「一键导入」采用${wantLabel} Provider（${wbProviderNameOf(realm)}）后再导账号`
   }
 
-  // 同 Provider 账号池里是否已有这个 token（按凭据文件内容比对；读不了视为不重复）。
-  function sourceAccountWithToken(providerId: number, token: string): Account | undefined {
-    for (const acct of accounts.list()) {
-      if (acct.providerId !== providerId || !acct.credential.apiKeyFile) continue
-      try {
-        if (readFileSync(acct.credential.apiKeyFile, 'utf8').trim() === token) return acct
-      } catch {
-        // 读不了视为不重复
-      }
-    }
-    return undefined
-  }
-
   // 同一个 harness 身份在账号池里已存在的那一行（**跨 Provider** 找）。
   //
   // 判据必须跨 Provider：反复「删掉渠道再一键导入」时，每次导入都会新建一条

@@ -55,11 +55,15 @@ interface Checked {
 // Provider 草稿（baseUrl / X-Domain 由它派生），否则导入哪个版本都打到国内域名。
 export type WbRealm = 'cn' | 'ai'
 
-// 各版本的发行标识：文件名后缀 + 认证域。顺序即「同名冲突时的优先顺序」（国内版在前，
-// 因为无后缀的 workbuddy-desktop.info 在老机器上是主文件）。
-export const WB_REALMS: readonly { realm: WbRealm; suffix: string; label: string; issuer: string; upstream: string }[] = [
-  { realm: 'cn', suffix: '', label: '国内版', issuer: 'www.workbuddy.cn', upstream: 'copilot.tencent.com' },
-  { realm: 'ai', suffix: '-ai', label: '海外版', issuer: 'www.workbuddy.ai', upstream: 'www.workbuddy.ai' },
+// 各版本的发行标识：文件名后缀 + 认证域。
+// 这里的顺序只是遍历顺序，**不承载优先级**：两个版本的文件名本就不同
+// （workbuddy-desktop.info vs workbuddy-desktop-ai.info），不存在同名冲突；
+// checkWorkBuddyRealms 也是无条件遍历全部版本各出一条 finding。
+// （issuer 字段已删除：版本判定走 workBuddyRealmOfIssuer 对文件内容判定，
+//   这个字段没有任何读取处，留着只会让人以为它参与判定。）
+export const WB_REALMS: readonly { realm: WbRealm; suffix: string; label: string; upstream: string }[] = [
+  { realm: 'cn', suffix: '', label: '国内版', upstream: 'copilot.tencent.com' },
+  { realm: 'ai', suffix: '-ai', label: '海外版', upstream: 'www.workbuddy.ai' },
 ] as const
 
 // 某版本的登录态文件名（suffix 为空时就是历史主文件名 workbuddy-desktop.info，
@@ -377,7 +381,7 @@ export function wbSuggestedProvider(realm: WbRealm = 'cn'): Provider {
 // 逐个试候选路径，首个有效文件即返回（ok=true 表示找到登录态文件，
 // 可用性看 status：ready 才可用，expired/unknown 仅表示文件存在）。
 // realm：只检查该版本的候选（未指定 = 不限，取首个命中的）。多版本场景下由
-// checkWorkBuddyWithAccounts 分版本各调一次，避免「先命中的那个版本吃掉全部账号」。
+// checkWorkBuddyRealms 分版本各调一次，避免「先命中的那个版本吃掉全部账号」。
 export function checkWorkBuddy(paths: string[], realm?: WbRealm): Checked {
   const base: Finding = {
     key: realm === 'ai' ? 'workbuddy-ai' : 'workbuddy',
@@ -519,7 +523,10 @@ function detectRealmFromFile(path: string): WbRealm | undefined {
   }
 }
 
-// 兼容旧签名的单版本入口（默认国内版）：保留给既有调用方与测试。
+// 兼容旧签名的单版本入口（默认国内版）：**仅供测试**。
+// 生产链路统一走 checkWorkBuddyRealms（两版各出一条 finding）；这里保留是因为
+// 既有单测按单版本签名断言，删掉会牵动一批用例，收益不成正比。
+// 注意：不要在新代码里调用它——它只覆盖国内版，海外版会漏。
 export function checkWorkBuddyWithAccounts(
   paths: string[], authDirs: string[], fallbackRoots: string[] = [],
 ): Checked {
