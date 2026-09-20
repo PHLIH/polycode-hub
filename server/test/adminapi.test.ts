@@ -1961,16 +1961,53 @@ describe('discover/quick-import（对齐 Go quickimport_test.go）', () => {
     }
   })
 
-  test('未就绪 400 带指引且无副作用；未知 key 404；缺 key 400', async () => {
+  // 契约变更（2026-09-20）：探测未通过**不再**拦导入。
+  //
+  // 旧行为：status !== 'ready' → 400「未就绪」，把「探针没探通」当成「不能导入」。
+  // 后果（用户实测报回）：zen 探针因请求形状被上游 403，判成 unreachable，
+  // 于是本机明明装好、跑过、指纹都识别出来的用户连导入按钮都点不到——
+  // 被一个联网探测结论锁死在门外。导入是本地动作，不该由探测结论决定。
+  // 现在只有「本机没发现」（missing / 无草稿）才拒绝，且仍带指引。
+  test('探测未通过不再拦导入：unknown + 有草稿 → 照常导入并带探测提示', async () => {
+    isolateCwd()
+    const p = readyProvider('zc-auto')
+    const call = caller(build({ discover: new StubDiscover([
+      { key: 'zcode', harness: 'ZC', status: 'unknown', detail: '探针没通', actions: ['先登录'], suggestedProvider: p },
+    ]) }))
+    const res = await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: { key: 'zcode' } })
+    expect(res.status).toBe(200)
+    const out = await res.json() as { provider: Provider; warnings?: string[] }
+    expect(out.provider.name).toBe('zc-auto')
+    // 探测结论必须显性带出：否则用户以为一切正常，调用才发现问题。
+    expect((out.warnings ?? []).join(' ')).toContain('探测未通过')
+    expect((out.warnings ?? []).join(' ')).toContain('先登录')
+    // 未知 key 404；缺 key 400 不受影响。
+    expect((await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: { key: 'nope' } })).status).toBe(404)
+    expect((await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: {} })).status).toBe(400)
+  })
+
+  test('missing 仍拒绝导入：本机没发现就没有可导入的对象', async () => {
     isolateCwd()
     const call = caller(build({ discover: new StubDiscover([
-      { key: 'zcode', harness: 'ZC', status: 'unknown', detail: '', actions: ['先登录'] },
+      { key: 'zcode', harness: 'ZC', status: 'missing', detail: '', actions: ['先安装并登录'] },
     ]) }))
     const res = await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: { key: 'zcode' } })
     expect(res.status).toBe(400)
-    expect(((await res.json()) as { error: { message: string } }).error.message).toContain('先登录')
-    expect((await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: { key: 'nope' } })).status).toBe(404)
-    expect((await call('POST', '/admin/api/discover/quick-import', { key: 'secret', body: {} })).status).toBe(400)
+    expect(((await res.json()) as { error: { message: string } }).error.message).toContain('先安装并登录')
+  })
+
+  test('adopt 同口径：unreachable + 有草稿 → 导入成功并带探测提示', async () => {
+    isolateCwd()
+    const call = caller(build({ discover: new StubDiscover([
+      { key: 'opencode-zen', harness: 'Zen', status: 'unreachable', detail: '地区受限',
+        actions: ['配 egress'], suggestedProvider: readyProvider('zen-auto') },
+    ]) }))
+    const res = await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'opencode-zen' } })
+    expect(res.status).toBe(201)
+    const out = await res.json() as { name: string; warnings?: string[] }
+    expect(out.name).toBe('zen-auto')
+    expect((out.warnings ?? []).join(' ')).toContain('探测未通过')
+    expect((out.warnings ?? []).join(' ')).toContain('配 egress')
   })
 })
 

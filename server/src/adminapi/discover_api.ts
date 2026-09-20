@@ -37,6 +37,41 @@ function field(o: Record<string, unknown>, k: string): string {
   return typeof o[k] === 'string' ? o[k] as string : ''
 }
 
+// 「采用」的前置条件：本机真的发现了这个东西，且有可采用的草稿。
+//
+// 这里**刻意不再要求 status === 'ready'**（2026-09-20 修）。原来的门是
+// `status !== 'ready' → 400 未就绪`，把「探针没探通」和「本机没发现」混为一谈：
+// status 里的 unreachable / unknown 全部来自联网探测（zen 的免费档身份校验、
+// 网络抖动、出口地区限制），而**采用是把本机发现翻译成一条 Provider 配置的本地动作**——
+// 它不联网、不需要上游同意，联网能用与否是「配好之后调一次」才知道的事。
+// 真实后果：zen 探针因请求形状被 403（FreeTierError）判成 unreachable 时，
+// 用户明明本机装好、跑过、指纹都识别出来了，却连导入的按钮都点不到，
+// 也就永远没机会去「换出口 / 补指纹 / 只留可用模型」——被一个探测结论锁死在门外。
+// 用户的诉求就是这条：只要识别出来了就让我导入。
+//
+// 仍然拦住的情况只有一种：**missing**（本机根本没发现这个 harness 的痕迹）。
+// 那时没有可导入的对象，导入只会凭空造一条空 Provider 误导用户。
+export function notAdoptableReason(found: Finding): string | undefined {
+  // 指引必须一路带上：这两条是「不能导入」的少数情况，用户更需要知道下一步做什么。
+  const guide = (found.actions ?? []).join('；')
+  if (found.status === 'missing') {
+    return `本机未发现 ${found.harness}（${guide || '未安装或从未登录过'}）`
+  }
+  if (!found.suggestedProvider) {
+    return `${found.harness} 无法生成 Provider 配置（${guide || '该 harness 需要在客户端完成登录后由 CLI 换取凭据'}）`
+  }
+  return undefined
+}
+
+// 非 ready 时给用户的提示：导入照做，但把「探测没通」如实带到结果里，
+// 免得导入成功后用户以为一切都好、转头调用才发现是 403。
+export function adoptProbeWarning(found: Finding): string | undefined {
+  if (found.status === 'ready' || found.status === 'missing') return undefined
+  const detail = found.detail ? `：${found.detail}` : ''
+  return `${found.harness} 已导入，但探测未通过（${found.status ?? '未知'}）${detail}`
+    + `。解决：${(found.actions ?? []).join('；') || '到 Providers 页测试后处理'}`
+}
+
 // credentialFile 校验：Clean 后必须仍带 config/credentials/ 前缀
 // （穿越路径、绝对路径、目录本身一律拒绝）。
 //
@@ -106,14 +141,10 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     if (key === '') return errRes(c, 400, ERR.INVALID_REQUEST, 'key 必填')
     const found = (await discover.scan()).find((f) => f.key === key)
     if (!found) return errRes(c, 404, ERR.NOT_FOUND, `未发现 ${key}`)
-    if (found.status !== 'ready') {
-      return errRes(c, 400, ERR.INVALID_REQUEST,
-        `该 harness 未就绪（${found.status}），先按指引处理：${(found.actions ?? []).join('；')}`)
-    }
-    if (!found.suggestedProvider) {
-      return errRes(c, 500, ERR.API, '该发现项无采用草稿')
-    }
-    const p: Provider = cloneProvider(found.suggestedProvider)
+    // 采用只要求「本机发现了」，不要求联网探测通过（见 notAdoptableReason 注释）。
+    const blocked = notAdoptableReason(found)
+    if (blocked) return errRes(c, 400, ERR.INVALID_REQUEST, blocked)
+    const p: Provider = cloneProvider(found.suggestedProvider!)
     if (customName !== '') p.name = customName
     p.providerId = 0
     const verr = providerValidate(p)
@@ -137,6 +168,10 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     // 打到上游，被前置网关拦成 HTML 401，用户以为「上游鉴权失败」（issue #1）。
     // 与 quick-import 共用同一段逻辑，避免两条路径的凭据处理再次漂移。
     const warnings = applyCredentialDefaults(p)
+    // 探测没通过也照常导入，但把结论带给用户（否则他以为一切都好，
+    // 转头调用才发现 403，又得回来猜是导错了还是没配好）。
+    const probeWarn = adoptProbeWarning(found)
+    if (probeWarn) warnings.push(probeWarn)
     const { warnings: importWarnings, imported } =
       importSuggestedAccounts(key, found.suggestedAccounts, p)
     warnings.push(...importWarnings)
@@ -230,18 +265,17 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     if (key === '') return errRes(c, 400, ERR.INVALID_REQUEST, 'key 必填')
     const found: Finding | undefined = (await discover.scan()).find((f: Finding) => f.key === key)
     if (!found) return errRes(c, 404, ERR.NOT_FOUND, `本机未发现 ${key}（未安装或从未登录过）`)
-    if (found.status !== 'ready') {
-      return errRes(c, 400, ERR.INVALID_REQUEST,
-        `${key} 未就绪（${found.status}）：${(found.actions ?? []).join('；')}`)
-    }
-    if (!found.suggestedProvider) {
-      return errRes(c, 500, ERR.API, '该发现项无采用草稿')
-    }
+    // 与 adopt 同口径：本机发现了就能导入，联网探测没通不算拦路条件。
+    const blocked = notAdoptableReason(found)
+    if (blocked) return errRes(c, 400, ERR.INVALID_REQUEST, blocked)
 
     const warnings: string[] = []
+    const probeWarn = adoptProbeWarning(found)
+    if (probeWarn) warnings.push(probeWarn)
 
     // ① 采用 Provider（幂等有两层：ID 相同直接返回；SourceID 相同也视为已接管）。
-    const suggested = cloneProvider(found.suggestedProvider)
+    // 上面的 notAdoptableReason 已保证草稿存在，这里断言收窄类型。
+    const suggested = cloneProvider(found.suggestedProvider!)
     const verr = providerValidate(suggested)
     if (verr) return errRes(c, 400, ERR.INVALID_REQUEST, verr)
     let p: Provider

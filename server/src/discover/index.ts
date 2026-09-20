@@ -9,6 +9,7 @@ import { dirname, join } from 'node:path'
 import type { Provider } from '../model/index.ts'
 import { mintZenRequestId, wbAuxEndpointIdentityHeaders, workBuddyRealmOfIssuer } from '../model/index.ts'
 import type { Finding } from '../adminapi/types.ts'
+import type { IrRequest, ToolDef } from '../ir/types.ts'
 
 // 状态枚举的唯一定义是 adminapi/types.ts 的 DiscoverStatus（Finding.status 用的就是它）。
 // 这里曾另有一份等价的 `export type Status`——与下面 Finding 的教训同源：
@@ -760,9 +761,17 @@ export async function checkZen(
     return f
   }
   const ids = (list.data ?? []).map((d) => d.id).filter((x): x is string => !!x)
+  // 草稿模型跟随上游刷新（纯函数，可单测）。
+  const stale: string[] = []
+  if (f.suggestedProvider) {
+    const pruned = pruneStaleDraftModels(f.suggestedProvider.models, ids)
+    f.suggestedProvider.models = pruned.kept
+    stale.push(...pruned.stale)
+  }
   // 指纹来源要一路带给用户：自动识别来的会话会过期（换号/重登就失效），
   // 用户得知道「这是自动读到的」才明白过期后该重扫，而不是以为配置坏了。
-  const fpNote = fingerprint ? ` · 指纹自动识别自本机 opencode 客户端（${fingerprint.userAgent}）` : ''
+  const staleNote = stale.length > 0 ? ` · 已剔除上游已下线的模型：${stale.join('、')}` : ''
+  const fpNote = (fingerprint ? ` · 指纹自动识别自本机 opencode 客户端（${fingerprint.userAgent}）` : '') + staleNote
   if (!callProbe) {
     f.status = 'ready'
     f.detail = `连通，${ids.length} 个模型${fpNote}（export ZEN_KEY=public 后采用）`
@@ -776,10 +785,26 @@ export async function checkZen(
   // 任一候选调通即 ready；全失败才报不可用，且报**最有信息量**的那次病因。
   // 本地判免费（不引 gateway/probe：发现层不该依赖网关层，避免反向依赖环）。
   const freeIds = ids.filter((id) => looksFreeName(id))
+  // 候选优先级（2026-09-20 修）：**先探草稿里的模型**，再拿免费档补位。
+  //
+  // 为什么必须草稿优先：草稿 models 就是「采用后会暴露给用户的那几个」。按上游
+  // 列表顺序取前 3 个会拿到当时排前面的模型（jev-1.13-free 500 / deepseek-v4-flash
+  // 已下线 / muse-spark 地区受限），于是 3 个名额全被无关模型占掉，明明草稿里的
+  // mimo-v2.5-free 当时可调用，却被判 unreachable —— 用户被告知「这个源不能用」，
+  // 而他真正要用的模型是好的。探针要回答的是「采用后我能不能用」，不是「列表里
+  // 任意三个模型行不行」。
+  const draftIds = (f.suggestedProvider?.models ?? []).map((m) => m.id)
+  const draftLive = draftIds.filter((id) => ids.includes(id))
   // 按「族」分散取样：同一族（id 去掉免费后缀后的主体）只取第一个。
   // 否则列表里同族模型扎堆时（如 muse-spark 有 1.2/1.3 两代），几个名额全被它占掉，
   // 一族不可用就误判整个 Provider 不可用——而其他族可能完全正常。
-  const cands = spreadByFamily(freeIds.length > 0 ? freeIds : ids).slice(0, ZEN_PROBE_MODELS)
+  const primary = spreadByFamily(draftLive)
+  // 补位：优先免费档；**一个免费档都没有时回落全部模型**——有些源（含测试里的
+  // 构造列表）模型名里没有 free 字样，若在这里就返回空，会把「列表可达」直接
+  // 判成「无法验证可调用性」，探测等于没做。
+  const fillPool = freeIds.length > 0 ? freeIds : ids
+  const fill = spreadByFamily(fillPool).filter((id) => !primary.includes(id))
+  const cands = [...primary, ...fill].slice(0, ZEN_PROBE_MODELS)
   if (cands.length === 0) {
     f.status = 'unreachable'
     f.detail = `连通，但模型列表为空（${ids.length} 个），无法验证可调用性`
@@ -797,17 +822,23 @@ export async function checkZen(
     f.actions = ['export ZEN_KEY=public', '然后在发现页点「采用」']
     return f
   }
+  // 每个候选的结论都留下来：只报「最优病因」会把真相压成一个词，用户无法判断
+  // 到底是源不可用还是探针撞上了单个坏模型（本轮实测的误判就出在这里）。
+  const brief = (x: { m: string; r: { kind?: string; error?: string } }): string => {
+    const k = failureKind(x.r.kind, x.r.error)
+    return `${x.m}（${k}）`
+  }
+  const summary = results.map(brief).join('、')
   const rank = (k?: string) => k === 'fingerprint' ? 3 : k === 'region' ? 2 : k ? 1 : 0
   const best = results.reduce((a, b) => (rank(b.r.kind) > rank(a.r.kind) ? b : a))
   const r = best.r
-  const probeModel = best.m
   // 列表通但调用失败：不再冒充 ready。地区限制单独说（换出口可解，不是模型下线）。
   f.status = 'unreachable'
   if (r.kind === 'region' || /not available in your country/i.test(r.error ?? '')) {
-    f.detail = `模型列表可达（${ids.length} 个），但试过的 ${cands.length} 个模型在当前出口地区都不可用（${probeModel}）`
+    f.detail = `模型列表可达（${ids.length} 个），但候选模型在当前出口地区都不可用：${summary}`
     f.actions = [
       '这些模型有地区限制：给 Provider 配一个出口代理（egress）后即可调用',
-      '若不打算用它们，可到 Providers 页只保留其他可用模型',
+      '仍可点「采用」导入（导入是本地动作，不受探测结果限制），再换出口或只保留其他模型',
     ]
     return f
   }
@@ -819,6 +850,7 @@ export async function checkZen(
       f.actions = [
         '本机 opencode 客户端的会话已过期：运行一次 opencode（如 opencode run "hi"）后重扫，网关会重新读取',
         '或改用付费档凭据',
+        '仍可点「采用」导入（导入是本地动作，不受探测结果限制），再补指纹',
       ]
     } else {
       // 没识别到：最可能是本机没装 opencode、装了没运行过、或数据目录不在默认位置。
@@ -829,13 +861,82 @@ export async function checkZen(
         '已装但重扫仍无效？确认数据目录在默认位置，或用 OPENCODE_DATA_DIR 指定其数据目录后重启网关',
         '若不打算用 opencode：在该 Provider 头里手填 User-Agent 与 x-opencode-session（抓包取真值），或设 ZEN_UA 环境变量；x-opencode-request 缺了网关会自动现铸',
         '以上都不想：改用付费档凭据（免费档的限制与额度无关，是客户端身份校验）',
+        '仍可点「采用」导入（导入是本地动作，不受探测结果限制）',
       ]
     }
   } else {
-    f.detail = `模型列表可达（${ids.length} 个），但真实调用失败：${r.error ?? '未知原因'}`
-    f.actions = ['检查 Provider 协议与模型 ID 是否正确', '到 Providers 页用「测试」逐个排查']
+    f.detail = `模型列表可达（${ids.length} 个），但真实调用失败：${summary}`
+    f.actions = ['检查 Provider 协议与模型 ID 是否正确', '到 Providers 页用「测试」逐个排查', '仍可点「采用」导入（导入是本地动作，不受探测结果限制）']
   }
   return f
+}
+
+// 草稿模型跟随上游刷新：把上游已下线的模型从草稿里剪掉。
+//
+// 为什么需要：草稿 models 是「采用后会写进 Provider 目录」的那几个，上游下线后
+// 它们仍留在草稿里，采用后就是一个永远 404 的目录项——用户拿它一调就报错，
+// 却看不出是「模型没了」还是「自己配错了」。
+//
+// 两条边界（宁可不剪，也不误删）：
+//   · manual=true 是用户手工维护的，一律保留——发现层不替用户清理他的东西；
+//   · live 为空（列表拉空/解析异常）时整体不剪——此时沉默比误删安全。
+// 返回保留项与剔除项（剔除项用于在 detail 里如实告知，不静默改动用户看到的目录）。
+export function pruneStaleDraftModels<T extends { id: string; manual?: boolean }>(
+  models: T[], live: string[],
+): { kept: T[]; stale: string[] } {
+  if (live.length === 0) return { kept: models, stale: [] }
+  const up = new Set(live)
+  const kept: T[] = []
+  const stale: string[] = []
+  for (const m of models) {
+    if (m.manual || up.has(m.id)) kept.push(m)
+    else stale.push(m.id)
+  }
+  return { kept, stale }
+}
+
+// 单次探针失败的粗分类（只用于给用户看的简报；判定仍以 kind/错误原文为准）。
+function failureKind(kind?: string, error?: string): string {
+  if (kind === 'region' || /not available in your country/i.test(error ?? '')) return '地区受限'
+  if (kind === 'fingerprint' || /free tier can only be used/i.test(error ?? '')) return '指纹被拒'
+  if (kind === 'rate_limit') return '限流'
+  if (kind === 'quota') return '额度用尽'
+  const m = /http (\d{3})/.exec(error ?? '')
+  if (m) return `http ${m[1]}`
+  return '失败'
+}
+
+// Zen 免费档探针用的最小 agent 形状（tools + 流式）。
+//
+// 为什么必须是这个形状：免费档的 403 FreeTierError 不是「缺指纹」那么单一，
+// 闸门还要求请求体像官方客户端的 agent 请求。2026-09-20 抓包实测（同一真实会话、
+// 同一秒、仅换请求体）：裸 body → 403；加 tools:[bash,read] → 200；
+// 且必须 stream=true（stream=false 同样 403），tool 名大小写敏感、
+// 必须同时含字面量 bash 与 read（别的名字组合一律 403）。
+//
+// 归属说明：这个形状是「zen 探针」这个契约的一部分，所以放在发现层（与
+// ZenCallProbe / checkZen 同处），由 cli 侧调用。放 cli 里无法单测——
+// cli.ts 顶层就是 argv 分发，import 即执行。
+export const ZEN_PROBE_TOOLS: ToolDef[] = [
+  {
+    name: 'bash',
+    description: 'Run a shell command',
+    inputSchema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] },
+  },
+  {
+    name: 'read',
+    description: 'Read a file',
+    inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+  },
+]
+
+// 探针请求体（导出让测试锁住「必须像 agent 请求」这个契约）。
+export function zenProbeRequest(model: string): IrRequest {
+  return {
+    model, stream: true, maxTokens: 8,
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    tools: ZEN_PROBE_TOOLS,
+  }
 }
 
 // ---- OpenCode 客户端指纹自动识别 ----
