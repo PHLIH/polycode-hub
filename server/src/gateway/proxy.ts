@@ -12,7 +12,7 @@ import {
 } from '../ir/index.ts'
 import { resolveProtocol, estimateRequestTokens, type Scheduler, type Upstream, type SessionHint } from '../router/index.ts'
 import type { AccountPool } from '../pool/account.ts'
-import { accountEffectiveStatus, applyReasoningFloor, type Account, type Provider, type UsageLog, type UsageStatus } from '../model/index.ts'
+import { accountEffectiveStatus, applyReasoningCap, applyReasoningPreset, type Account, type Provider, type UsageLog, type UsageStatus } from '../model/index.ts'
 import {
   DEFAULT_FIRST_BYTE_TIMEOUT_MS, DEFAULT_STREAM_IDLE_TIMEOUT_MS, type Config,
 } from '../config/index.ts'
@@ -416,7 +416,9 @@ export class Proxy {
     const pinnedId = (c.req.header('x-polycode-account') ?? '').trim()
     // opencode 客户端自带官方会话头：有就透传（zen 指纹），没有就用 Provider 静态配置。
     const session = sessionHintFromHeaders((n) => c.req.header(n))
-    // TEMP-DIAG（定案即删）：只记会话来源（透传前缀/静态），不记正文与完整 ID。
+    // 会话来源诊断（默认关，ZEN_DIAG=1 开）：只记会话来源（透传前缀/静态），
+    // 不记正文与完整 ID。曾标 TEMP-DIAG，但上游会话切换问题反复出现，保留为
+    // 常驻诊断开关（upstream.ts 的 zen-pool 首打会话日志同理）。
     if (process.env.ZEN_DIAG === '1') {
       const cli = (c.req.header('x-session-id') ?? '').trim()
       console.log(`[zen-diag] model=${irReq.model} stream=${irReq.stream} sess=${session?.id ? `passthru:${session.id.slice(0, 12)}` : 'static'} cliSid=${cli !== '' ? cli.slice(0, 12) : '-'}`)
@@ -443,11 +445,14 @@ export class Proxy {
         const pvv: Provider = acct ? { ...base, credential: acct.credential } : { ...base } // 账号 JWT 覆盖 Provider 凭据
         const [m] = this.sched.modelOf(base.providerId, irReq.model)
         if (m.egress) pvv.egress = m.egress // 模型级出口覆盖 Provider 级（未声明的模型继承 Provider）
-        // 高档位预算托底（只管 xhigh/max）：客户端值低于下限时抬到下限并记一行，
-        // 其他档位跟随客户端透传。
-        const effReq = applyReasoningFloor(irReq, m)
+        // 模型级推理等级预设：配了就强制覆盖客户端档位（follow = 跟随上游透传），
+        // 再按生效档位压预算上限（只压不抬）。两者各记一行，改写了什么一目了然。
+        const effReq = applyReasoningCap(applyReasoningPreset(irReq, m), m)
+        if ((effReq.reasoningEffort ?? '') !== (irReq.reasoningEffort ?? '')) {
+          console.log(`[effort] model=${irReq.model} ${irReq.reasoningEffort ?? '-'}→${effReq.reasoningEffort ?? '-'}`)
+        }
         if (effReq.maxTokens !== irReq.maxTokens) {
-          console.log(`[floor] model=${irReq.model} effort=${effReq.reasoningEffort ?? '-'} maxTokens=${irReq.maxTokens ?? '-'}→${effReq.maxTokens}`)
+          console.log(`[cap] model=${irReq.model} effort=${effReq.reasoningEffort ?? '-'} maxTokens=${irReq.maxTokens ?? '-'}→${effReq.maxTokens}`)
         }
         if ((effReq.reasoningEffort ?? '').trim() !== '') triedEffort = effReq.reasoningEffort!.trim()
         const stream = await this.up.stream(pvv, effReq, session)
@@ -500,8 +505,15 @@ export class Proxy {
         if (await attempt(pv, null)) break
         continue
       }
-      // 同源账号加权轮询；全冷却后结束（有界，不死循环）。
-      for (let i = 0; i < cands.length + 1; i++) {
+      // 同源账号加权轮询。上界必须是**该 Provider 的账号数**，而不是候选
+      // Provider 数（cands.length）：两者毫无关系。真实缺陷（扫描实证）：
+      // 旧写法 `i < cands.length + 1` 在单 Provider（最常见）时上界是 2——
+      // 池里 5 个号只试前 2 个，前面是坏号就整体失败，后面的好号根本没被
+      // 问过（多账号轮换的高可用断链）。proxy.test.ts 的池恰好只有 2 个
+      // 账号，正好卡在边界内，所以测试全绿。
+      // pick 抛错（无账号/全冷却）仍是自然出口；尝试次数上限由账号规模定。
+      const maxTries = Math.max(1, this.accounts.countFor(pv.providerId))
+      for (let i = 0; i < maxTries; i++) {
         let acct: Account
         try {
           acct = this.accounts.pick(pv.providerId, new Date())
@@ -560,9 +572,13 @@ export class Proxy {
     const pvv: Provider = { ...pv, credential: acct.credential }
     const [m] = this.sched.modelOf(pv.providerId, irReq.model)
     if (m.egress) pvv.egress = m.egress
-    const effReq = applyReasoningFloor(irReq, m)
+    // 模型级推理等级预设 + 档位预算上限（与轮询路径 fire() 同一条规则）。
+    const effReq = applyReasoningCap(applyReasoningPreset(irReq, m), m)
+    if ((effReq.reasoningEffort ?? '') !== (irReq.reasoningEffort ?? '')) {
+      console.log(`[effort] model=${irReq.model} ${irReq.reasoningEffort ?? '-'}→${effReq.reasoningEffort ?? '-'} account=${acct.id}`)
+    }
     if (effReq.maxTokens !== irReq.maxTokens) {
-      console.log(`[floor] model=${irReq.model} effort=${effReq.reasoningEffort ?? '-'} maxTokens=${irReq.maxTokens ?? '-'}→${effReq.maxTokens} account=${acct.id}`)
+      console.log(`[cap] model=${irReq.model} effort=${effReq.reasoningEffort ?? '-'} maxTokens=${irReq.maxTokens ?? '-'}→${effReq.maxTokens} account=${acct.id}`)
     }
     let stream: ReadableStream<Uint8Array>
     try {
@@ -617,6 +633,9 @@ export class Proxy {
       stream: irReq.stream,
       inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0,
       reasoningTokens: 0, totalTokens: 0, accuracy: 'unknown', latencyMs: 0, status: 'ok',
+      // 缓存语义随实际协议走（CACHE-SEMANTICS）：anthropic-messages 的 input
+      // 只含未命中部分（separate）；OpenAI 系 prompt 已含 cached（subset）。
+      sem: actualProto === 'anthropic-messages' ? 'separate' : 'subset',
     }
 
     if (!irReq.stream) {
@@ -791,8 +810,13 @@ export class Proxy {
           ])
         }
 
+        // clientErr 子条件：客户端报错但还没拿到首字且上游一个输出字都没给 →
+        // 说明是上游故障（而非用户中途取消）。判据用 outputTokens 而不是
+        // totalTokens：流式路径只在 mergeStreamUsage 累加各分项，totalTokens
+        // 从未被赋值（只有非流式的 fillUsage 会碰它），写 totalTokens 等价于
+        // 「恒 true」，把「客户端取消但有输出」也错记成 upstream_error。
         const status: UsageStatus =
-          upErr || streamErrKind || (clientErr && !ul.firstTokenMs && ul.totalTokens === 0)
+          upErr || streamErrKind || (clientErr && !ul.firstTokenMs && ul.outputTokens === 0)
             ? 'upstream_error'
             : 'ok'
         if (streamErrKind) ul.errorKind = streamErrKind

@@ -537,7 +537,7 @@ async function setWeight(a, v) {
               <tr v-for="m in hOf(a).models" :key="m.modelId">
                 <td><span class="model-name">{{ m.modelId }}</span></td>
                 <td class="n num">{{ fmtN(m.requests) }}</td>
-                <td class="n num">{{ fmtN(m.inputTokens) }}</td>
+                <td class="n num">{{ fmtN(m.inputSideTokens || m.inputTokens) }}</td>
                 <td class="n num">{{ fmtN(m.outputTokens) }}</td>
                 <td class="n num strong">{{ fmtN(m.totalTokens) }}</td>
                 <td class="n num" :class="{ 'err': m.errors > 0 }">{{ m.errors || '' }}</td>

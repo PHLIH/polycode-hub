@@ -128,9 +128,12 @@ export const api = {
   // 改单个模型的出口代理（空字符串 = 继承 Provider 默认）
   updateProviderModelEgress: (pid, modelId, egress) =>
     req('PUT', `/admin/api/providers/${encodeURIComponent(pid)}/models/${encodeURIComponent(modelId)}/egress`, { egress }),
-  // 改单个模型的高档位最低预算（只管 xhigh/max；{} = 清掉整张映射）
-  updateProviderModelReasoningMinTokens: (pid, modelId, reasoningMinTokens) =>
-    req('PUT', `/admin/api/providers/${encodeURIComponent(pid)}/models/${encodeURIComponent(modelId)}/reasoning-min-tokens`, { reasoningMinTokens }),
+  // 改单个模型的推理等级预设（强制覆盖上级档位；follow 或空字符串 = 跟随上游）
+  updateProviderModelReasoningEffort: (pid, modelId, reasoningEffort) =>
+    req('PUT', `/admin/api/providers/${encodeURIComponent(pid)}/models/${encodeURIComponent(modelId)}/reasoning-effort`, { reasoningEffort }),
+  // 改单个模型的按档位推理预算上限（{"档位": 正整数}；{} = 清掉整张映射）
+  updateProviderModelReasoningMaxTokens: (pid, modelId, reasoningMaxTokens) =>
+    req('PUT', `/admin/api/providers/${encodeURIComponent(pid)}/models/${encodeURIComponent(modelId)}/reasoning-max-tokens`, { reasoningMaxTokens }),
   // 开关单个模型：对外暴露（/v1/models）、路由、测试候选都以它为准
   updateProviderModelEnabled: (pid, modelId, enabled) =>
     req('PUT', `/admin/api/providers/${encodeURIComponent(pid)}/models/${encodeURIComponent(modelId)}/enabled`, { enabled }),
@@ -166,7 +169,6 @@ export const api = {
   updateAccount: (id, patch) => req('PATCH', `/admin/api/accounts/${encodeURIComponent(id)}`, patch),
   deleteAccount: (id) => req('DELETE', `/admin/api/accounts/${encodeURIComponent(id)}`),
   // 账号凭证明文按需查看（与 Provider 同口径）。
-  accountCredential: (id) => req('GET', `/admin/api/accounts/${encodeURIComponent(id)}/credential`),
   // 账号测试：用该账号凭据打一次真实请求；model 空 = 由后端挑默认模型。
   testAccount: (id, model) => req('POST', `/admin/api/accounts/${encodeURIComponent(id)}/test`, { model: model || '' }),
   // 重置惩罚（零上游成本）：只清连败与冷却，不探活。

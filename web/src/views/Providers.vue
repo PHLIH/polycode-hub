@@ -149,12 +149,27 @@ onMounted(load)
 // ---- 一键导入：发现到的 harness 一键「采用 Provider + 账号入池」，不用看文档 ----
 const findings = ref([])
 const qiBusy = ref('')
+// 扫描进行中：discover 的 zen 联网验证固有 2~8 秒，「没发现」和「还没扫完」必须分开说，
+// 否则扫描没回来前面板先谎报「本机没有发现可导入的 harness」。
+const scanning = ref(false)
 const QI_STATUS = { ready: '可采用', expired: '登录态过期', missing: '未安装', unknown: '待确认', unreachable: '不可达' }
 
 async function loadFindings() {
-  try { findings.value = await api.discover() } catch { findings.value = [] }
+  scanning.value = true
+  try { findings.value = await api.discover() } catch { findings.value = [] } finally { scanning.value = false }
 }
-onMounted(loadFindings)
+
+// discover 探测最慢 2~8 秒，不该挡卡片列表的首帧：等浏览器空闲再发。
+// quickImport / scQuickReady 里的刷新也走 loadFindings，但那是「有结果后刷新」，
+// 面板已在展示，即时执行不会造成白屏。
+function loadFindingsIdle() {
+  if (typeof requestIdleCallback === 'function') {
+    requestIdleCallback(() => { void loadFindings() }, { timeout: 1500 })
+  } else {
+    setTimeout(() => { void loadFindings() }, 0)
+  }
+}
+onMounted(loadFindingsIdle)
 
 // ZCode 本地引擎（sidecar）也进一键面板：没装→一键安装，装了→一键启动。
 // 状态与进度来自共享模块 web/src/sidecarJob.ts（真相源在服务端）：
@@ -598,7 +613,8 @@ async function adoptModels() {
       <h3>一键导入</h3>
       <span class="dim qi-sub">点一下就完成采用 + 账号入池，不用看文档</span>
     </div>
-    <p v-if="!findings.length" class="dim qi-none">本机没有发现可导入的 harness（装过并登录过的才会出现在这里）。</p>
+    <p v-if="scanning && !findings.length" class="dim qi-none">正在扫描本机可导入的 harness…</p>
+    <p v-else-if="!findings.length" class="dim qi-none">本机没有发现可导入的 harness（装过并登录过的才会出现在这里）。</p>
     <div v-else class="qi-list">
       <div class="qi-row">
         <span class="dot" :class="sc && sc.running ? 'ok' : (scInstalling ? '' : 'warn')" />

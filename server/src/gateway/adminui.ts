@@ -1,6 +1,6 @@
 import { Hono } from 'hono'
-import { createReadStream, existsSync, statSync } from 'node:fs'
-import { Readable } from 'node:stream'
+import { createHash } from 'node:crypto'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { extname, join, normalize, resolve, sep } from 'node:path'
 
 // MIME 表只需覆盖 Vite 构建产物会出现的类型（不为此引入 mime 库）。
@@ -41,7 +41,17 @@ export function createAdminUI(distDir: string): Hono {
     c.header('Cache-Control', 'no-cache')
     const type = MIME[extname(file)] ?? 'application/octet-stream'
     c.header('Content-Type', type)
-    return c.body(Readable.toWeb(createReadStream(file)) as ReadableStream)
+    // no-cache 注释里承诺的「带 ETag 回源校验」此前从未落地：ETag 根本没生成，
+    // 浏览器每次刷新都整份重下 1.6MB 产物。这里补上——内容寻址的强 ETag，
+    // 命中 If-None-Match 直接 304（管理台产物虽 1.6MB，但请求频率低，
+    // readFileSync + sha256 全量重算的代价可接受；将来访问量上去再加内存缓存）。
+    const body = readFileSync(file)
+    const etag = `"${createHash('sha256').update(body).digest('base64url')}"`
+    c.header('ETag', etag)
+    if (c.req.header('If-None-Match') === etag) {
+      return c.body(null, 304)
+    }
+    return c.body(body)
   })
   return app
 }

@@ -67,6 +67,17 @@ export interface ReleaseInfo {
 
 export type FetchLike = typeof fetch
 
+// SidecarProbe 是引擎的三种真实状态，比 running() 的布尔值多一个维度。
+//
+//   up   —— /health 通，可用
+//   hung —— 端口在监听但 /health 不通：进程活着、事件循环已饿死（卡死）
+//   down —— 端口没人监听：真没启动
+//
+// 为什么要三态（真实故障，2026-09-19 取证）：hung 与 down 的处置完全相反
+// ——hung 必须**先杀掉**才能重启（否则每次都是 EADDRINUSE），down 直接启动
+// 就行。把它们都当成「不在」就会对着一个活着的僵死进程反复 spawn。
+export type SidecarProbe = 'up' | 'hung' | 'down'
+
 // SidecarPhase 是 ensureReady 全流程的阶段名。管理台把它直接渲染成
 // 「查询版本 → 下载 → 校验并落盘 → 生成配置 → 启动引擎」这排步骤，
 // 否则 66MB 的下载 + 最长 45 秒的启动等待全挤在一个「安装中」里，用户
@@ -538,6 +549,26 @@ export function startupFailureHint(sidecarDir: string): string {
   return hintOfText(tail)
 }
 
+// PORT_IN_USE_RE 匹配「端口被占」。
+//
+// 为什么不能只写 `address already in use`（真实故障，2026-09-19 取证）：
+// 引擎是 Bun 打的二进制，bind 失败时它不打 Go/Node 那句，而是
+//   error: Failed to start server. Is port 8080 in use?
+//    syscall: "listen", errno: 0, code: "EADDRINUSE"
+// 老正则只认 Go/Node 口径，Bun 这一整段**完全匹配不上**，于是落到下面的
+// 「最后一行」兜底——而那一行正好是 Bun 的版本脚注 `Bun v1.4.0 (macOS arm64)`。
+// 用户看到的就是「启动失败 —— 引擎日志最后一行：Bun v1.4.0 (macOS arm64)」：
+// 一句与故障毫无关系的版本信息，把真正的根因（端口被僵死的旧进程占着）彻底盖住。
+const PORT_IN_USE_RE =
+  /address already in use|bind: address already|is port \d+ in use|EADDRINUSE/i
+
+// NOISE_LINE_RE 匹配「有输出但没有信息量」的行（兜底取最后一行时要跳过）。
+//
+// Bun（以及 Node）在崩栈尾部会打印一行版本脚注。它是**崩溃的产物**而不是
+// 崩溃的原因，却因为排在最后而被当成「最后一行」端给用户——这次故障里它
+// 就是那句废话的来源。栈里的源码回显（`362 | …`）同理，单独看毫无意义。
+const NOISE_LINE_RE = /^(?:bun|node|node\.js|deno) v\d|^\s*\d+\s*\|/i
+
 // hintOfText 是「日志文本 → 可照做的中文建议」的唯一判定点（两个入口共用）。
 function hintOfText(tail: string): string {
   if (tail === '') return ''
@@ -547,15 +578,46 @@ function hintOfText(tail: string): string {
     return '引擎未登录（日志：Not logged in）。先完成一次授权登录再启动：'
       + '在终端跑 `polycode-hub zcode sidecar login`（会拉起浏览器 OAuth）。'
   }
-  if (/address already in use|bind: address already/i.test(tail)) {
-    return '端口已被占用。改一个端口，或先停掉占用它的程序。'
+  if (PORT_IN_USE_RE.test(tail)) {
+    // 不止说「被占」：实测最凶的那次是**上一个引擎僵死**——TCP 还能握手，
+    // 但 /health 永不返回，于是新实例一律 EADDRINUSE。告诉用户「先停掉它」，
+    // 而不是让他去猜是谁占了端口。
+    return '端口已被占用（常见成因：上一个引擎进程还在占着端口——可能已经僵死，'
+      + '能握手但不响应 /health）。先点「停止」清掉它，或改一个端口。'
   }
   if (/permission denied|access is denied/i.test(tail)) {
     return '二进制没有执行权限（或被安全软件拦截）。'
   }
-  // 兜底：把最后一行原始日志带出来，总比只说「超时」有用。
-  const lastLine = tail.trimEnd().split('\n').pop() ?? ''
-  return lastLine.trim() === '' ? '' : `引擎日志最后一行：${lastLine.trim()}`
+  // 兜底：把最后一行**有信息量**的原始日志带出来，总比只说「超时」有用。
+  const last = lastMeaningfulLine(tail)
+  return last === '' ? '' : `引擎日志最后一行：${last}`
+}
+
+// lastMeaningfulLine 取尾部最后一行非空、非脚注的日志。
+// 全是无信息量的行（典型：只有 Bun 版本脚注）时返回空串——
+// 宁可退回「启动超时」，也不要给用户一句与故障无关的版本号。
+function lastMeaningfulLine(tail: string): string {
+  const lines = tail.split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    // ?? ''：noUncheckedIndexedAccess 下 lines[i] 可能是 undefined（索引访问
+    // 不保证越界安全），而这里是倒序遍历日志尾行，宁可当空行跳过。
+    const s = (lines[i] ?? '').trim()
+    if (s === '') continue
+    if (NOISE_LINE_RE.test(s)) continue
+    return s
+  }
+  return ''
+}
+
+// isPortInUseError 判断一次启动失败是不是「端口被占」。
+//
+// 给保活守护用：端口被占时盲目重试毫无意义（每次都是同一个 EADDRINUSE），
+// 正确动作是先清场再拉起。判定同时认两种文本——引擎日志的原始措辞（Bun/Go/Node
+// 三种口径）和 hintOfText 已经翻好的中文，这样无论错误来自日志归因还是
+// 兜底分支，守护都能对症下药。
+export function isPortInUseError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? '')
+  return PORT_IN_USE_RE.test(msg) || msg.includes('端口已被占用')
 }
 
 // Sidecar 是 zcode-proxy 本地实例的管理句柄。
@@ -1099,47 +1161,113 @@ defaultModel: glm-5.3-flash
     throw new Error(`sidecar: 未安装（先 install，或把 ${this.binName} 二进制放到 ${sidecarDir}）`)
   }
 
-  // stop 停止 sidecar（按进程名匹配）。
-  async stop(): Promise<void> {
-    if (!(await this.running())) return
+  // HEALTH_TIMEOUT_MS 是单次 /health 探活的上限。
+  //
+  // 原来是 2000ms，太短（真实故障，2026-09-19 取证）：引擎正常负载下 TTFB
+  // 就有 5–17 秒，上游 429 触发验证码重试时更久。2 秒超时把它判成「引擎不在」，
+  // 保活守护于是每 20 秒拉一个新进程——而旧进程好端端占着端口，新进程一律
+  // EADDRINUSE 退出。**探活超时比引擎的真实响应还短 = 必然误判**。
+  // 取 8 秒：高于健康时的慢响应，又不会让一轮探活拖垮守护周期。
+  private static readonly HEALTH_TIMEOUT_MS = 8000
+
+  // SIGTERM_GRACE_MS 是给优雅退出的窗口。够短——点「停止」的用户在等结果；
+  // 又足够让「只是想正常关」的引擎走完自己的收尾。
+  private readonly SIGTERM_GRACE_MS = 3000
+
+  // findPids 取出当前匹配到（即可管理）的 sidecar 进程号。
+  private async findPids(): Promise<number[]> {
     const spec = this.killSpec(process.platform)
     const out = await new Promise<string>((resolve) => {
       execFile(spec.cmd, spec.args, { encoding: 'utf8', timeout: 10_000 }, (err, stdout) => {
         resolve(err ? '' : stdout) // pgrep 无匹配 = 已停
       })
     })
+    const pids: number[] = []
     for (const line of out.trim().split('\n')) {
       const pid = Number.parseInt(line.trim(), 10)
-      if (Number.isInteger(pid) && pid > 0) {
-        try { process.kill(pid, 'SIGTERM') } catch { /* 已退出 */ }
-      }
+      if (Number.isInteger(pid) && pid > 0) pids.push(pid)
     }
+    return pids
+  }
+
+  // killFound 杀掉当前匹配到的进程：先 SIGTERM，给一个优雅退出窗口，
+  // 仍活着则升级到 SIGKILL。返回被处理的进程数。
+  //
+  // 为什么必须升级（真实故障，2026-09-19 取证）：引擎被上游验证码重试风暴
+  // 拖成「活着但不服务」时（实测 280% CPU、RSS 4GB、/health 永不返回），
+  // SIGTERM 的优雅收尾路径根本跑不到——收到了也不退，端口照样占着。
+  // 只发 SIGTERM 的 stop 因此完全无效：既不释放端口，又挡住新进程，
+  // 表现为「点停止没反应、点启动必失败」的死锁。
+  private async killFound(): Promise<number> {
+    const pids = await this.findPids()
+    if (pids.length === 0) return 0
+    const alive = new Set(pids)
+    for (const pid of pids) {
+      try { process.kill(pid, 'SIGTERM') } catch { alive.delete(pid) /* 已退出 */ }
+    }
+    const deadline = Date.now() + this.SIGTERM_GRACE_MS
+    while (alive.size > 0) {
+      for (const pid of [...alive]) {
+        try { process.kill(pid, 0) } catch { alive.delete(pid) } // ESRCH = 已退
+      }
+      // 先查再睡，且睡得短：绝大多数进程被 SIGTERM 后瞬间就退，不该让
+      // 「点停止」的用户为一次本该立即完成的动作干等满 3 秒。
+      if (alive.size === 0 || Date.now() >= deadline) break
+      await sleep(100)
+    }
+    for (const pid of alive) {
+      try { process.kill(pid, 'SIGKILL') } catch { /* 已退出 */ }
+    }
+    return pids.length
+  }
+
+  // stop 停止 sidecar（按进程名匹配）。
+  //
+  // **不以 running() 为前提**——这是本次修掉的核心死锁：
+  // 老实现开头就是 `if (!(await this.running())) return`，而 running() 只探
+  // /health。引擎一旦卡死（进程在、端口占着、但不应答），running() 恒为 false，
+  // stop 直接返回、一个进程都不杀——正好是最该被杀的那种状态。
+  // 「要不要停」不该依赖「它是否健康」，只看「有没有进程」。
+  async stop(): Promise<void> {
+    await this.killFound()
   }
 
   // stopAll 杀掉**所有** zcode-proxy 进程，不管它是否在服务端。
   //
-  // 与 stop() 的差别只在「不看 running()」。stop() 只在探活成功时才动手，而
-  // running() 只探 127.0.0.1:8080 的 /health——看不见那些**不在服务**的进程。
-  // 典型就是登录流程：auth login 要等用户授权 5 分钟，它持有 exe 文件句柄，
-  // 但不监听端口。卸载时 Windows 因此报 EPERM「文件被占用」，删不掉。
+  // 历史上它与 stop() 的差别只在「不看 running()」；现在 stop() 也不看了，
+  // 两者语义合一（保留两个入口是为了不改动既有调用方与测试用例）。
+  // 它仍然比 stop() 更宽：命令行不匹配运行时形态的进程（典型是登录流程——
+  // auth login 等授权时持有 exe 文件句柄却不监听端口，卸载时 Windows 因此
+  // 报 EPERM 删不掉）也被覆盖。
   async stopAll(): Promise<void> {
-    const spec = this.killSpec(process.platform)
-    const out = await new Promise<string>((resolve) => {
-      execFile(spec.cmd, spec.args, { encoding: 'utf8', timeout: 10_000 }, (err, stdout) => {
-        resolve(err ? '' : stdout)
-      })
-    })
-    for (const line of out.trim().split('\n')) {
-      const pid = Number.parseInt(line.trim(), 10)
-      if (Number.isInteger(pid) && pid > 0) {
-        try { process.kill(pid, 'SIGTERM') } catch { /* 已退出 */ }
-      }
-    }
+    await this.killFound()
   }
 
-  // running 报告 sidecar 是否在监听并健康。
-  // sidecar 开启鉴权后 /health 也要求 key——从 credKey 现读（凭据热轮换即生效）。
-  async running(): Promise<boolean> {
+  // portListening 探测端口是否有人在监听（只看 TCP，不要求对方健康）。
+  //
+  // 用途是把「进程活着但不服务（卡死）」与「压根没启动」区分开——两者的处置
+  // 完全相反：前者必须先杀掉才能重启，后者直接启动就行。
+  async portListening(): Promise<boolean> {
+    const net = await import('node:net')
+    const port = Number.parseInt(this.port, 10)
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) return false
+    return await new Promise<boolean>((resolve) => {
+      const sock = net.createConnection({ host: '127.0.0.1', port })
+      const done = (ok: boolean): void => {
+        sock.removeAllListeners()
+        try { sock.destroy() } catch { /* 已关 */ }
+        resolve(ok)
+      }
+      sock.setTimeout(1000)
+      sock.once('connect', () => { done(true) })
+      sock.once('timeout', () => { done(false) })
+      sock.once('error', () => { done(false) })
+    })
+  }
+
+  // healthOK 单次 /health 探活。sidecar 开启鉴权后 /health 也要求 key——
+  // 从 credKey 现读（凭据热轮换即生效）。
+  private async healthOK(): Promise<boolean> {
     const headers: Record<string, string> = {}
     try {
       headers.Authorization = 'Bearer ' + readFileSync(this.credKey, 'utf8').trim()
@@ -1147,7 +1275,7 @@ defaultModel: glm-5.3-flash
     try {
       const res = await fetch(`http://127.0.0.1:${this.port}/health`, {
         headers,
-        signal: AbortSignal.timeout(2000),
+        signal: AbortSignal.timeout(Sidecar.HEALTH_TIMEOUT_MS),
       })
       return res.status === 200
     } catch {
@@ -1155,16 +1283,43 @@ defaultModel: glm-5.3-flash
     }
   }
 
+  // probe 区分三种真实状态。running() 只回答「能不能用」，而「端口占着却
+  // 不可用」是最容易被误判的一种——保活守护曾经因此每 20 秒 spawn 一个
+  // 注定 EADDRINUSE 的进程。
+  async probe(): Promise<SidecarProbe> {
+    // 顺序有讲究：先做 1 秒的 TCP 探活分流，再决定要不要花 8 秒等 HTTP。
+    //
+    // 若先做 healthOK：对「能连上但永不回包」的卡死进程要等满 8 秒才返回，
+    // 而 probe 每 20 秒就被保活守护调一次，这个白等会明显拖慢一轮判定；
+    // 更糟的是「没监听」这种最常见情况也要陪着等满 8 秒（connect refused
+    // 虽然快，但卡死不是 refused）。先探 TCP 就能让 down 秒回。
+    if (!(await this.portListening())) return 'down'
+    return (await this.healthOK()) ? 'up' : 'hung'
+  }
+
+  // running 报告 sidecar 是否在监听并健康。语义不变（卡死 ≡ 不可用 ⇒ false）。
+  async running(): Promise<boolean> {
+    return await this.healthOK()
+  }
+
   // status 返回人类可读状态。
-  async status(): Promise<string> {
-    if (await this.running()) {
-      return `running (127.0.0.1:${this.port})`
-    }
-    try {
-      this.findBinary(this.workDir)
-      return 'installed, stopped'
-    } catch {
-      return 'not installed'
+  //
+  // 卡死必须单独说：老实现只回 'installed, stopped'，用户看到的是「没在跑」，
+  // 于是点「启动」→ 端口被占 → 启动失败，而页面上没有任何一处告诉他
+  // 「其实是上一个进程还活着、先把它停掉」。把状态讲准是这轮修复的一半。
+  //
+  // probe 可传入复用：状态页同一次请求里要同时给出 running / status / probe，
+  // 各自探一遍的话，引擎卡死时单次请求会耗到 30 秒以上（实测 16 秒 = 两遍
+  // 8 秒 HTTP 等待）。由调用方探一次、三个字段共用。
+  async status(known?: SidecarProbe): Promise<string> {
+    let installed = true
+    try { this.findBinary(this.workDir) } catch { installed = false }
+    if (!installed) return 'not installed'
+    const p = known ?? await this.probe()
+    switch (p) {
+      case 'up': return `running (127.0.0.1:${this.port})`
+      case 'hung': return `卡死（127.0.0.1:${this.port} 仍在监听，但 /health 无响应）`
+      default: return 'installed, stopped'
     }
   }
 

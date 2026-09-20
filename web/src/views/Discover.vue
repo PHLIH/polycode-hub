@@ -261,6 +261,12 @@ const scHint = computed(() => {
   if (scInstalling.value) return '正在安装 —— 首次需下载约 66MB，进度见下方进度条'
   if (sc.value.custom) return '自定义引擎模式 —— 网关指向你自己运行的程序；内置引擎未安装不影响使用'
   if (!sc.value.hasKey || !sc.value.installed) return '未安装 —— 点「安装引擎」一键下载并配置，或「自定义引擎地址」指向你自己跑的兼容程序'
+  // 卡死必须单独讲：它看起来像「没在跑」，处置却完全不同——直接点「启动」
+  // 必然被端口拦下（EADDRINUSE），得先「停止」清掉那个不服务的进程。
+  if (sc.value.probe === 'hung') {
+    return '引擎卡死 —— 进程还在占着端口，但已不再响应 /health（常见于上游验证码风暴把引擎拖死）。'
+      + '先点「停止」清掉它，再点「启动」'
+  }
   return '已安装已配置，未运行 —— 点「启动」'
 })
 
@@ -274,11 +280,13 @@ const scGuardTip = computed(() => {
   if (!g || sc.value.running) return ''
   if (g.state === 'recovering') {
     const n = g.restarts ? `（已尝试 ${g.restarts} 次）` : ''
-    return `保活守护正在自动拉起引擎${n}…`
+    const r = g.reaped ? `（已自动清场 ${g.reaped} 次）` : ''
+    return `保活守护正在自动拉起引擎${n}${r}…`
   }
   if (g.state === 'failed') {
-    // 已放弃：把真实原因和「要做什么」一起给出，别让用户对着一个红字猜。
-    return `保活守护已停止自动重试 —— ${g.lastError || '原因见引擎日志'}`
+    // 已暂停：把真实原因和「要做什么」一起给出，别让用户对着一个红字猜。
+    // 不再是「永久放弃」——冷却到期后守护会自己再试一轮，这里如实告知。
+    return `保活守护已暂停自动重试（冷却后会再试，也可点「重置保活」立即恢复）—— ${g.lastError || '原因见引擎日志'}`
   }
   if (g.state === 'ok' && g.restarts > 0) {
     return `引擎曾被保活守护自动拉起（本进程累计 ${g.restarts} 次）`
@@ -427,8 +435,14 @@ function gotoProviders() {
       <template v-else-if="sc && sc.installed">
         <button v-if="!sc.running" class="btn" :disabled="scBusy === 'start'"
           @click="scAction('start')">{{ scBusy === 'start' ? '启动中…' : '启动' }}</button>
-        <button v-if="sc.running" class="btn ghost" :disabled="scBusy === 'stop'"
-          @click="scAction('stop', '确定停止 ZCode 本地引擎？停止后免费额度不可用。')">
+        <!-- 「停止」在卡死时也必须可见：running 只表示「能正常服务」，而卡死
+             正是「进程在、端口占着、但不服务」——此时 running=false，按老判据
+             按钮直接消失，用户既启不来又停不掉（实测死锁）。判据改成
+             「运行中 或 卡死」：只要有进程占着，就给一个清掉它的出口。 -->
+        <button v-if="sc.running || sc.probe === 'hung'" class="btn ghost" :disabled="scBusy === 'stop'"
+          @click="scAction('stop', sc.probe === 'hung'
+            ? '引擎已卡死（占着端口但不响应）。停止会强制结束它，随后可重新启动。'
+            : '确定停止 ZCode 本地引擎？停止后免费额度不可用。')">
           {{ scBusy === 'stop' ? '停止中…' : '停止' }}</button>
         <button class="btn ghost" :disabled="scBusy === 'setup'" @click="scAction('setup')">
           {{ scBusy === 'setup' ? '配置中…' : '重新生成配置' }}</button>
@@ -457,6 +471,11 @@ function gotoProviders() {
           @click="scLogin">{{ scBusy === 'login' ? '获取授权链接…' : '登录授权' }}</button>
       </template>
       <button class="btn ghost" @click="rescan">刷新状态</button>
+      <!-- 重置保活：守护连续多次拉起失败后会暂停一段时间（等人处理），
+           默认冷却后自己再试。用户手动处置完现场不必干等——这里给立即入口。 -->
+      <button v-if="sc && sc.guard && sc.guard.state === 'failed'" class="btn ghost"
+        :disabled="scBusy === 'reset-guard'" @click="scAction('reset-guard')">
+        {{ scBusy === 'reset-guard' ? '重置中…' : '重置保活' }}</button>
     </div>
     <!-- 失败原因常驻（不是会消失的 toast）：切页回来仍看得到，并带出本次走的下载出口 -->
     <p v-if="scError" class="sc-err">

@@ -34,7 +34,7 @@ describe('errorKind 落库（ACCOUNT-HEALTH 步骤 1–3）', () => {
     await store.close()
   })
 
-  test('迁移范本：v1 库（无 error_kind 列）打开后重建到最新形态、数据无损、user_version=4', async () => {
+  test('迁移范本：v1 库（无 error_kind 列）打开后重建到最新形态、数据无损、user_version=5', async () => {
     const path = join(dir, 'legacy.db')
     // 手工造一个 v1 形态的库（模拟 Go 时代产物）：有 source_id 列、provider_id 还是 TEXT
     const raw = new DatabaseSync(path)
@@ -67,7 +67,7 @@ describe('errorKind 落库（ACCOUNT-HEALTH 步骤 1–3）', () => {
     await store.close()
 
     const after = new DatabaseSync(path)
-    expect((after.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(4)
+    expect((after.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(5)
     // 列清单按最新 schema：source_id（已删概念的残留）不复存在，
     // provider_name 快照存在，provider_id 是 INTEGER（数字内部 id）。
     const cols = after.prepare('PRAGMA table_info(usage_logs)').all() as unknown as
@@ -75,6 +75,7 @@ describe('errorKind 落库（ACCOUNT-HEALTH 步骤 1–3）', () => {
     const names = cols.map((c) => c.name)
     expect(names).not.toContain('source_id')
     expect(names).toContain('provider_name')
+    expect(names).toContain('sem') // v5：缓存语义列（CACHE-SEMANTICS）
     expect(cols.find((c) => c.name === 'provider_id')!.type.toUpperCase()).toBe('INTEGER')
     after.close()
   })

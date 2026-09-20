@@ -101,6 +101,33 @@ providers:
     expect((p.models[0] as { providerId?: unknown }).providerId).toBeUndefined()
   })
 
+  test('两个模型都带 provider_id → 全部被清理，进程能起（break 缺陷回归）', () => {
+    // 真实缺陷（扫描实证）：迁移循环清 models[].provider_id 用了 break，第二个
+    // 模型起的 provider_id 留下来撞严格模式——进程起不来，报错还指向用户没写错
+    // 的 models[1]。
+    const cfg = loadConfig(legacyYaml(`
+providers:
+  - id: p1
+    access_kind: official
+    risk: low
+    stability: stable
+    base_url: https://x.example
+    models:
+      - id: m1
+        provider_id: p1
+      - id: m2
+        provider_id: p1
+      - id: m3
+        provider_id: p1
+        reasoning_min_tokens: 1024
+`))
+    const p = cfg.providers[0]!
+    expect(p.models).toHaveLength(3)
+    for (const m of p.models) {
+      expect((m as { providerId?: unknown }).providerId).toBeUndefined()
+    }
+  })
+
   test('account.source_id → provider（值命中 Provider 名）', () => {
     const cfg = loadConfig(legacyYaml(`
 providers:
@@ -214,6 +241,22 @@ providers:
     expect(() => loadConfig(path)).toThrow(/egress/)
   })
 
+  test('egress kind 非法（如 socks5）→ 加载期报错，不拖到启动期', () => {
+    // 回归：kind 曾是唯一没有运行时校验的枚举。写错后进程能进启动，
+    // 到 syncEgresses 才抛 `egress kind "socks5" 暂不支持`，且不报是哪条配置。
+    const path = write('egress-kind-bad.yaml', `
+egresses:
+  - id: socks
+    kind: socks5
+    addr: 127.0.0.1:1080
+providers:
+  - name: zen
+    base_url: https://x.example
+    egress: socks
+`)
+    expect(() => loadConfig(path)).toThrow(/kind.*socks5|socks5.*kind/)
+  })
+
   test('顶层 egresses 解析 + model.egress 引用', () => {
     const path = write('egress.yaml', `
 egresses:
@@ -282,8 +325,48 @@ providers:
     expect(() => loadConfig(bad)).toThrow(/egress/)
   })
 
-  test('reasoning_min_tokens 从 YAML 解析：键收小写、超 20w 启动即报错', () => {
-    const ok = write('floor.yaml', `
+  test('reasoning_effort / reasoning_max_tokens 从 YAML 解析：键收小写、非法预算启动即报错', () => {
+    const ok = write('cap.yaml', `
+providers:
+  - name: zen
+    base_url: https://x.example
+    models:
+      - id: muse-spark-1.3
+        reasoning_effort: HIGH
+        reasoning_max_tokens: {XHIGH: 65536, max: 1000000}
+`)
+    const cfg = loadConfig(ok)
+    expect(cfg.providers[0]!.models[0]!.reasoningEffort).toBe('high')
+    expect(cfg.providers[0]!.models[0]!.reasoningMaxTokens).toEqual({ xhigh: 65536, max: 1000000 })
+
+    const bad = write('cap-bad.yaml', `
+providers:
+  - name: zen
+    base_url: https://x.example
+    models:
+      - id: muse-spark-1.3
+        reasoning_max_tokens: {xhigh: 0}
+`)
+    expect(() => loadConfig(bad)).toThrow(/reasoning_max_tokens/)
+
+    const badEffort = write('cap-bad-effort.yaml', `
+providers:
+  - name: zen
+    base_url: https://x.example
+    models:
+      - id: muse-spark-1.3
+        reasoning_effort: ultra
+`)
+    expect(() => loadConfig(badEffort)).toThrow(/reasoning_effort/)
+  })
+
+  test('旧字段 reasoning_min_tokens 迁移：点名废弃并忽略（不再阻断启动）', () => {
+    const warns: string[] = []
+    const orig = console.warn
+    console.warn = (m: unknown) => { warns.push(String(m)) }
+    let cfg
+    try {
+      const ok = write('floor-legacy.yaml', `
 providers:
   - name: zen
     base_url: https://x.example
@@ -291,17 +374,13 @@ providers:
       - id: muse-spark-1.3
         reasoning_min_tokens: {XHIGH: 128000, max: 200000}
 `)
-    const cfg = loadConfig(ok)
-    expect(cfg.providers[0]!.models[0]!.reasoningMinTokens).toEqual({ xhigh: 128000, max: 200000 })
-
-    const bad = write('floor-bad.yaml', `
-providers:
-  - name: zen
-    base_url: https://x.example
-    models:
-      - id: muse-spark-1.3
-        reasoning_min_tokens: {xhigh: 200001}
-`)
-    expect(() => loadConfig(bad)).toThrow(/reasoning_min_tokens/)
+      cfg = loadConfig(ok)
+    } finally {
+      console.warn = orig
+    }
+    expect(warns.some((w) => w.includes('reasoning_min_tokens'))).toBe(true)
+    const mm = cfg!.providers[0]!.models[0] as unknown as Record<string, unknown>
+    expect(mm.reasoningMinTokens).toBeUndefined()
+    expect(mm.reasoningMaxTokens).toBeUndefined()
   })
 })

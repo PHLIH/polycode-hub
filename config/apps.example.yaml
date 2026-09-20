@@ -41,6 +41,13 @@ providers:
         context_window: 200000    # 未知则不填 → 放行 + warn（默认不做预检）
         max_output_tokens: 8192
         input: [text]             # 纯文本；支持图片须显式 [text, image]
+        # 推理等级预设（可选）：配了就强制覆盖客户端透传的档位，不管上级发的什么都按这里来。
+        # 档位：off | minimal | low | medium | high | xhigh | max | follow
+        #   follow（跟随上游）或留空 = 上级发什么档位就用什么，没发就不注入。
+        # reasoning_effort: high
+        # 按档位推理预算上限（可选）：键 = 档位（小写），该档位生效时 max_tokens 超过上限就压回。
+        # 只压不抬；值须正整数，无上限（上游有硬顶，超了自己报错）。管理台也可在模型行内直接填。
+        # reasoning_max_tokens: {xhigh: 65536, high: 32768}
         enabled: true
 
   # 同一上游若还讲 openai-completions 协议，另建一个 Provider（base_url 含 /v1）：

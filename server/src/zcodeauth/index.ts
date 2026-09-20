@@ -2,7 +2,8 @@
 // docs/zcode-reverse-engineering.md §3.2，来源已登记，独立实现）。
 // 现行流程为官方 CLI 同款轮询流：init 拿授权链接 → 用户浏览器点同意 →
 // 轮询拿到凭证 → access_token 再 resolve 一次换 business JWT（zcodejwttoken）。
-// JWT 只打印一次，不落盘。HTTP 调用用注入的 fetch（默认全局 fetch）。
+// JWT 与 access_token 都只打印一次，不落盘（cli.ts 登录成功后各打印一次供导出；
+// 「只打印一次」指的是每种凭据都只显示这一次，而非整个流程只打一行）。
 
 import { randomBytes } from 'node:crypto'
 
@@ -163,7 +164,15 @@ export class Client {
     const res = await this.fetchImpl(`${this.tokenBase}/api/v1/oauth/cli/poll/${flow.flowID}`, {
       headers: { Authorization: `Bearer ${flow.pollToken}`, 'User-Agent': BROWSER_UA },
     })
+    // 先查 HTTP 状态再解析：上游 WAF/网关故障时返回 502/503 的 HTML 错误页
+    // （本模块开头注释的已知高频故障）。不查状态的话，用户看到的是
+    // 「响应非 JSON: Unexpected token '<'」——被引导去查 JSON 解析，
+    // 而真实原因是 HTTP 502，整个登录流不可诊断。同文件 decodeEnvelope
+    // 与 resolveBusinessToken 都查了，唯独这里漏了（扫描实证）。
     const text = await res.text()
+    if (res.status < 200 || res.status > 299) {
+      throw new Error(`轮询失败: http ${res.status}: ${compact(text)}`)
+    }
     let env: Envelope
     try {
       env = JSON.parse(text) as Envelope

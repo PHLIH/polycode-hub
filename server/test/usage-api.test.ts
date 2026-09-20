@@ -21,7 +21,7 @@ function harness() {
     breakdown: (since, until, accountId) => {
       calls.push({ since, until, accountId })
       return {
-        totals: { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, reasoningTokens: 0, totalTokens: 0, errors: 0, cacheHitRate: 0 },
+        totals: { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, reasoningTokens: 0, totalTokens: 0, errors: 0, cacheHitRate: 0, inputSideTokens: 0 },
         daily: [], byModel: [],
       } satisfies Breakdown
     },
@@ -30,6 +30,7 @@ function harness() {
       return [{
         accountId: 'a1', requests: 2, errors: 1, errorRate: 0.5,
         byKind: { quota: 1 }, totalTokens: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
+        inputSideTokens: 0,
         models: [],
       }] satisfies AccountUsage[]
     },

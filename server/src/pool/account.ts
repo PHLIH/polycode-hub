@@ -18,6 +18,18 @@ export class ErrNoAccount extends Error {
   constructor() { super('pool: no available account') }
 }
 
+// asMs 把冷却截止时间数值化，兼容 Date 与「JSON round-trip 后的 string」。
+//
+// 为什么需要：即使持久层已做 Date revive（adminapi/store.ts reviveAccountDates），
+// 仍可能有旁路构造的 Account（管理面 parse、测试替身、旧版本落盘的库）带着
+// string 类型的 cooldownUntil 进池。`now > "2026-…"`（Date > string）恒为
+// false，冷却永远判不到期——这是扫描实证过的真实缺陷（账号限流一次、重启后
+// 永久停在 cooldown）。所有冷却到期比较必须走这里，禁止裸写 `now > a.cooldownUntil`。
+function asMs(v: Date | string | undefined): number | undefined {
+  if (v === undefined) return undefined
+  return v instanceof Date ? v.getTime() : new Date(v).getTime()
+}
+
 export class AccountPool {
   // 同 Provider 账号的加权轮询与冷却：pick 只给可用者，markResult 按 kind 惩罚，
   // 冷却到期自动复位。惩罚经 Persister 落盘（cli 注入写回 admin_accounts）。
@@ -38,6 +50,13 @@ export class AccountPool {
   // 供调度区分「无账号 → 走 Provider 凭据」与「有账号但全冷却 → 跳过该 Provider」。
   hasFor(providerId: number): boolean {
     return this.accounts.some((a) => a.providerId === providerId)
+  }
+
+  // 该 Provider 名下的账号数：转发层用它定"换号重试"的上界——绝不能用候选
+  // Provider 数（proxy.ts 的 cands.length）顶替，那与账号数毫无关系，会在
+  // 多账号池里提前放弃（真实缺陷，见 proxy.ts 轮换循环注释）。
+  countFor(providerId: number): number {
+    return this.accounts.filter((a) => a.providerId === providerId).length
   }
 
   // 加权轮询返回该 Provider 下一个可用账号（权重按 Account.weight，缺省/<=0 按 1）。
@@ -108,7 +127,10 @@ export class AccountPool {
     this.persist(a)
   }
 
-  // 当前账号快照（深拷贝调用方随意改）。
+  // 当前账号快照：顶层对象是拷贝（改 status/fails 不影响池内），但 credential
+  // 是共享引用（浅拷贝）——改快照里的 credential 会直接改到池内账号的凭据。
+  // 扫描实证过 snapshot[0].credential === accounts[0].credential 为 true。
+  // 调用方若要改凭据，先深拷贝 credential；只读场景（探针取 credential）无影响。
   snapshot(): Account[] {
     return this.accounts.map((a) => ({ ...a }))
   }
@@ -126,7 +148,8 @@ export class AccountPool {
     this.accounts = accounts.map((a) => {
       const old = keep.get(a.id)
       // 落盘时进程可能已停了很久：过期的冷却直接复位，不带着陈年惩罚进池。
-      const stale = a.status === 'cooldown' && a.cooldownUntil && a.cooldownUntil <= now
+      const untilMs = asMs(a.cooldownUntil)
+      const stale = a.status === 'cooldown' && untilMs !== undefined && untilMs <= now.getTime()
       const in_ = stale
         ? { ...a, status: 'available' as AccountStatus, cooldownUntil: undefined }
         : { ...a }
@@ -144,7 +167,7 @@ export class AccountPool {
   private eligible(accounts: Account[], now: Date): Account[] {
     const out: Account[] = []
     for (const a of accounts) {
-      if (a.status === 'cooldown' && a.cooldownUntil && now > a.cooldownUntil) {
+      if (a.status === 'cooldown' && asMs(a.cooldownUntil)! <= now.getTime()) {
         a.status = 'available'
         a.cooldownUntil = undefined
         this.persist(a)
@@ -167,7 +190,7 @@ export class AccountPool {
   private eligibleOne(id: string, now: Date): Account | undefined {
     const a = this.accounts.find((x) => x.id === id)
     if (!a) return undefined
-    if (a.status === 'cooldown' && a.cooldownUntil && now > a.cooldownUntil) {
+    if (a.status === 'cooldown' && asMs(a.cooldownUntil)! <= now.getTime()) {
       a.status = 'available'
       a.cooldownUntil = undefined
       this.persist(a)

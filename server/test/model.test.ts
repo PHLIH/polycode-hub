@@ -3,15 +3,17 @@ import { readFileSync } from 'node:fs'
 import {
   accountEffectiveStatus,
   accountHealth,
-  applyReasoningFloor,
+  applyReasoningPreset,
+  applyReasoningCap,
   capabilitiesFrom,
   credentialResolve,
   looksFree,
   modelEffAPI,
   providerValidate,
-  reasoningFloorFor,
+  reasoningCapFor,
+  REASONING_LEVELS,
   riskAllowed,
-  sanitizeReasoningMinTokens,
+  sanitizeReasoningMaxTokens,
   supportsImage,
   forgetProtocol,
   autoProtocol,
@@ -115,58 +117,88 @@ describe('Model 目录条目', () => {
     expect(supportsImage(m({ input: ['text', 'image'] }))).toBe(true)
   })
 
-  test('sanitizeReasoningMinTokens：键收小写、值须为 1-200000 正整数，空/非法全拒', () => {
-    expect(sanitizeReasoningMinTokens({ XHIGH: 128000, Max: 200000 })).toEqual({ xhigh: 128000, max: 200000 })
-    expect(sanitizeReasoningMinTokens({})).toBeUndefined()
-    expect(sanitizeReasoningMinTokens(undefined)).toBeUndefined()
-    expect(sanitizeReasoningMinTokens([])).toBeUndefined()
-    expect(sanitizeReasoningMinTokens({ xhigh: 0 })).toBeUndefined()
-    expect(sanitizeReasoningMinTokens({ xhigh: 200001 })).toBeUndefined()
-    expect(sanitizeReasoningMinTokens({ xhigh: -5 })).toBeUndefined()
-    expect(sanitizeReasoningMinTokens({ xhigh: 1.5 })).toBeUndefined()
-    expect(sanitizeReasoningMinTokens({ xhigh: '8000' })).toBeUndefined()
-    expect(sanitizeReasoningMinTokens({ '': 100 })).toBeUndefined()
+  test('sanitizeReasoningMaxTokens：键收小写、值须为正整数（无上限），空/非法全拒', () => {
+    expect(sanitizeReasoningMaxTokens({ XHIGH: 65536, Max: 1000000 })).toEqual({ xhigh: 65536, max: 1000000 })
+    expect(sanitizeReasoningMaxTokens({})).toBeUndefined()
+    expect(sanitizeReasoningMaxTokens(undefined)).toBeUndefined()
+    expect(sanitizeReasoningMaxTokens([])).toBeUndefined()
+    expect(sanitizeReasoningMaxTokens({ xhigh: 0 })).toBeUndefined()
+    expect(sanitizeReasoningMaxTokens({ xhigh: -5 })).toBeUndefined()
+    expect(sanitizeReasoningMaxTokens({ xhigh: 1.5 })).toBeUndefined()
+    expect(sanitizeReasoningMaxTokens({ xhigh: '8000' })).toBeUndefined()
+    expect(sanitizeReasoningMaxTokens({ '': 100 })).toBeUndefined()
+    // 无 200000 上限：超大预算合法（用户自己的判断，超了由上游报错）
+    expect(sanitizeReasoningMaxTokens({ max: 99999999 })).toEqual({ max: 99999999 })
   })
 
-  test('applyReasoningFloor：只管 xhigh/max，只托底不封顶，没给值的不动', () => {
-    const mm = m({ reasoningMinTokens: { xhigh: 128000, max: 200000 } })
-    // 低于下限 → 抬到下限（返回副本，原对象不动）
-    const req = { reasoningEffort: 'xhigh', maxTokens: 32768 }
-    expect(applyReasoningFloor(req, mm)).toEqual({ reasoningEffort: 'xhigh', maxTokens: 128000 })
-    expect(req).toEqual({ reasoningEffort: 'xhigh', maxTokens: 32768 })
-    // 大小写不敏感；max 档同样托底
-    expect(applyReasoningFloor({ reasoningEffort: 'XHigh', maxTokens: 1 }, mm)).toEqual({ reasoningEffort: 'XHigh', maxTokens: 128000 })
-    expect(applyReasoningFloor({ reasoningEffort: 'max', maxTokens: 100 }, mm)).toEqual({ reasoningEffort: 'max', maxTokens: 200000 })
-    // 高于下限 → 同一引用（没动过）
-    const ok = { reasoningEffort: 'xhigh', maxTokens: 200000 }
-    expect(applyReasoningFloor(ok, mm)).toBe(ok)
+  test('applyReasoningPreset：预设定了档位就覆盖客户端（follow/未设置透传）', () => {
+    const mm = m({ reasoningEffort: 'high' })
+    // 客户端发的 xhigh 被替换成预设 high（不管上级发的什么，都按这里来）
+    expect(applyReasoningPreset({ reasoningEffort: 'xhigh' }, mm)).toEqual({ reasoningEffort: 'high' })
+    // 客户端没带档位：注入预设档位
+    expect(applyReasoningPreset({}, mm)).toEqual({ reasoningEffort: 'high' })
+    // 大小写在配置收敛层处理，应用侧按原样替换
+    expect(applyReasoningPreset({ reasoningEffort: 'off', thinkingBudget: 1024 }, m({ reasoningEffort: 'off' })))
+      .toEqual({ reasoningEffort: 'off', thinkingBudget: undefined })
+    // 预设同时清掉客户端 budget：否则 Anthropic 旧式 budget 会把预设架空
+    expect(applyReasoningPreset({ reasoningEffort: 'low', thinkingBudget: 2048 }, mm))
+      .toEqual({ reasoningEffort: 'high', thinkingBudget: undefined })
+    // follow（跟随上游）：原引用透传，客户端没发就不注入
+    const follow = m({ reasoningEffort: 'follow' })
+    const sent = { reasoningEffort: 'max' }
+    expect(applyReasoningPreset(sent, follow)).toBe(sent)
+    expect(applyReasoningPreset({}, follow)).toEqual({})
+    // 未设置：同 follow
+    const unset = { reasoningEffort: 'low' }
+    expect(applyReasoningPreset(unset, m({}))).toBe(unset)
+  })
+
+  test('applyReasoningCap：只压不抬，按生效档位查键，没给值的不动', () => {
+    const mm = m({ reasoningMaxTokens: { xhigh: 65536, high: 32768 } })
+    // 高于上限 → 压到上限（返回副本，原对象不动）
+    const req = { reasoningEffort: 'xhigh', maxTokens: 200000 }
+    expect(applyReasoningCap(req, mm)).toEqual({ reasoningEffort: 'xhigh', maxTokens: 65536 })
+    expect(req).toEqual({ reasoningEffort: 'xhigh', maxTokens: 200000 })
+    // 大小写不敏感
+    expect(applyReasoningCap({ reasoningEffort: 'XHigh', maxTokens: 100000 }, mm)).toEqual({ reasoningEffort: 'XHigh', maxTokens: 65536 })
+    // 低于上限 → 同一引用（没动过）；等于上限也不动
+    const ok = { reasoningEffort: 'xhigh', maxTokens: 1000 }
+    expect(applyReasoningCap(ok, mm)).toBe(ok)
+    expect(applyReasoningCap({ reasoningEffort: 'xhigh', maxTokens: 65536 }, mm))
+      .toEqual({ reasoningEffort: 'xhigh', maxTokens: 65536 })
     // 没给值 → 不动（保持省略语义）
     const bare = { reasoningEffort: 'xhigh' }
-    expect(applyReasoningFloor(bare, mm)).toBe(bare)
-    // 其他档位一律不动（low/high/off/没传）
-    expect(applyReasoningFloor({ reasoningEffort: 'high', maxTokens: 100 }, mm)).toEqual({ reasoningEffort: 'high', maxTokens: 100 })
-    expect(applyReasoningFloor({ reasoningEffort: 'low', maxTokens: 100 }, mm)).toEqual({ reasoningEffort: 'low', maxTokens: 100 })
-    expect(applyReasoningFloor({ reasoningEffort: 'off', maxTokens: 100 }, mm)).toEqual({ reasoningEffort: 'off', maxTokens: 100 })
-    expect(applyReasoningFloor({ maxTokens: 100 }, mm)).toEqual({ maxTokens: 100 })
+    expect(applyReasoningCap(bare, mm)).toBe(bare)
+    // 键没命中的档位不动（low / off / 没传）
+    expect(applyReasoningCap({ reasoningEffort: 'low', maxTokens: 999999 }, mm)).toEqual({ reasoningEffort: 'low', maxTokens: 999999 })
+    expect(applyReasoningCap({ reasoningEffort: 'off', maxTokens: 999999 }, mm)).toEqual({ reasoningEffort: 'off', maxTokens: 999999 })
+    expect(applyReasoningCap({ maxTokens: 999999 }, mm)).toEqual({ maxTokens: 999999 })
     // 无映射表 → 不动
-    expect(applyReasoningFloor({ reasoningEffort: 'xhigh', maxTokens: 100 }, m({}))).toEqual({ reasoningEffort: 'xhigh', maxTokens: 100 })
+    expect(applyReasoningCap({ reasoningEffort: 'xhigh', maxTokens: 100 }, m({}))).toEqual({ reasoningEffort: 'xhigh', maxTokens: 100 })
   })
 
-  test('reasoningFloorFor：只认 xhigh/max（大小写不敏感），其他档返回 undefined', () => {
-    const mm = m({ reasoningMinTokens: { xhigh: 128000, max: 200000 } })
-    expect(reasoningFloorFor('xhigh', mm)).toBe(128000)
-    expect(reasoningFloorFor('MAX', mm)).toBe(200000)
-    expect(reasoningFloorFor('high', mm)).toBeUndefined()
-    expect(reasoningFloorFor('low', mm)).toBeUndefined()
-    expect(reasoningFloorFor('off', mm)).toBeUndefined()
-    expect(reasoningFloorFor(undefined, mm)).toBeUndefined()
-    expect(reasoningFloorFor('xhigh', m({}))).toBeUndefined()
+  test('reasoningCapFor：档位参数大小写不敏感（映射键由写入路径收小写）', () => {
+    const mm = m({ reasoningMaxTokens: { xhigh: 65536, high: 32768 } })
+    expect(reasoningCapFor('xhigh', mm)).toBe(65536)
+    expect(reasoningCapFor('HIGH', mm)).toBe(32768)
+    expect(reasoningCapFor('low', mm)).toBeUndefined()
+    expect(reasoningCapFor(undefined, mm)).toBeUndefined()
+    expect(reasoningCapFor('xhigh', m({}))).toBeUndefined()
   })
 
-  test('providerValidate 点名非法档位下限（含超 20w 上限）', () => {
-    expect(providerValidate(p({ models: [m({ reasoningMinTokens: { xhigh: 128000 } })] }))).toBeUndefined()
-    expect(providerValidate(p({ models: [m({ id: 'm9', reasoningMinTokens: { xhigh: 0 } })] }))).toMatch(/m9/)
-    expect(providerValidate(p({ models: [m({ id: 'm9', reasoningMinTokens: { xhigh: 200001 } })] }))).toMatch(/m9/)
+  test('REASONING_LEVELS：含 follow 与全部 DSH 档位', () => {
+    expect(REASONING_LEVELS).toContain('follow')
+    expect(REASONING_LEVELS).toContain('off')
+    expect(REASONING_LEVELS).toContain('max')
+  })
+
+  test('providerValidate 点名非法等级与非法预算映射', () => {
+    expect(providerValidate(p({ models: [m({ reasoningEffort: 'high' })] }))).toBeUndefined()
+    expect(providerValidate(p({ models: [m({ reasoningEffort: 'follow' })] }))).toBeUndefined()
+    expect(providerValidate(p({ models: [m({ id: 'm9', reasoningEffort: 'ultra' })] }))).toMatch(/m9/)
+    expect(providerValidate(p({ models: [m({ reasoningMaxTokens: { xhigh: 65536 } })] }))).toBeUndefined()
+    expect(providerValidate(p({ models: [m({ id: 'm9', reasoningMaxTokens: { xhigh: 0 } })] }))).toMatch(/m9/)
+    expect(providerValidate(p({ models: [m({ id: 'm9', reasoningMaxTokens: { xhigh: 1.5 } })] }))).toMatch(/m9/)
   })
 
   test('capabilitiesFrom：modalities 优先、vision 收敛为 image、无声明返回 null', () => {

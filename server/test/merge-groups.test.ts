@@ -11,10 +11,14 @@ describe('归因表手动合并（纯函数）', () => {
     expect(rowKey({ providerName: 'zen', modelId: 'm' })).toBe('zen/m')
   })
 
-  test('denomOf：按命中率反推分母；率为 0/null 返回 0', () => {
+  test('denomOf：优先 inputSideTokens；缺了按命中率反推；再缺按 input', () => {
+    // CACHE-SEMANTICS：后端逐行下发输入侧（separate 行 ≠ input），优先用
+    expect(denomOf({ cacheReadTokens: 90, cacheHitRate: 0.9, inputSideTokens: 300 })).toBe(300)
     expect(denomOf({ cacheReadTokens: 90, cacheHitRate: 0.9 })).toBeCloseTo(100)
     expect(denomOf({ cacheReadTokens: 0, cacheHitRate: 0 })).toBe(0)
     expect(denomOf({ cacheReadTokens: 50, cacheHitRate: null })).toBe(0)
+    // rate=0 但有 input：兜底 input（旧实现直接 0，零命中的输入进不了分母）
+    expect(denomOf({ cacheReadTokens: 0, cacheHitRate: 0, inputTokens: 500 })).toBe(500)
   })
 
   test('mergeRows：zen + zen-auto 合成一行（真实场景）', () => {
@@ -44,6 +48,14 @@ describe('归因表手动合并（纯函数）', () => {
     const a = row({ inputTokens: 100, cacheReadTokens: 30, cacheHitRate: null })
     const m = mergeRows([a], 'g')
     expect(m.cacheHitRate).toBeCloseTo(0.3)
+  })
+
+  test('mergeRows：separate 行按 inputSideTokens 计入分母（不反推出错值）', () => {
+    // anthropic 行：input=952 只是未命中部分，输入侧 53560 由后端下发
+    const a = row({ inputTokens: 952, cacheReadTokens: 52608, cacheHitRate: 52608 / 53560, inputSideTokens: 53560 })
+    const m = mergeRows([a], 'g')
+    expect(m.cacheHitRate).toBeCloseTo(52608 / 53560)
+    expect(m.inputSideTokens).toBe(53560)
   })
 
   test('mergeRows：全无输入 → null（不产出 0.0）', () => {

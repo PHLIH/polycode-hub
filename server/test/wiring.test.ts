@@ -289,9 +289,10 @@ describe('sidecar 适配器（对齐 Go adminapi/sidecar_api.go）', () => {
   test('POST 未知动作 → 404 带支持动作列表', async () => {
     const res = await sidecarHarness().request('/admin/api/sidecar/frob', { method: 'POST' })
     expect(res.status).toBe(404)
-    // login/pause/cancel 均已进 HTTP（只有 install 仍走 CLI）
+    // login/pause/cancel 均已进 HTTP（只有 install 仍走 CLI）；
+    // reset-guard 是「人工介入后立刻恢复自动保活」的入口，也在列表里。
     expect((await res.json() as { error: { message: string } }).error.message)
-      .toContain('start|stop|login|pause|cancel|setup|uninstall|ensure|port|endpoint')
+      .toContain('start|stop|reset-guard|login|pause|cancel|setup|uninstall|ensure|port|endpoint')
   })
 })
 

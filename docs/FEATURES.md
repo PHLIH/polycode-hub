@@ -129,7 +129,7 @@
 - egresses：`GET /admin/api/egresses`，`PUT /admin/api/egresses/:id`（body `{kind:http|https, addr}`），`DELETE`（`api.ts:146-170`）。
 - providers：`GET` 列表，`POST` 新建（`parse.ts` 收敛解析 + `providerValidate`，冲突 409），`PATCH /:id`（白名单 `enabled/priority/streamOnly/displayName/riskNote/credential/models/probeModel/egress/headers`，models 只增不减，headers 整包替换/空对象清空），`DELETE /:id`（builtin 禁删 403，成功 204）。
 - accounts：`GET /admin/api/accounts`（DB + 池内冷却/连败合并，过期冷却复位），`POST` 新建（id/providerId 必填，归属 Provider 必须存在；重名 409；新建只许 available/disabled），`PATCH /:id`（白名单 status/displayName/credential/weight），`DELETE /:id`，`POST /:id/recheck`（零上游成本，只清惩罚），`POST /:id/test`（真实请求，可传 `{model}`，成功清冷却归零），`POST /:id/checkin`（WorkBuddy 自动登录：账号页「签到」按钮，只认一键导入/import-account 打标的 importSource=workbuddy 账号；用导入登录态调上游每日签到，一天一次，不自动重试）。
-- 模型：`POST /providers/:id/test`（最小真实请求），`POST /providers/:id/scan`（探到协议写回），`POST /providers/:id/refresh-fingerprint`（Zen 指纹刷新：读本机新鲜会话写回静态头；本地无新鲜会话时返回 next 重登指引，见 `discover/zen_refresh.ts`），`PUT /providers/:id/models/:model/{protocol,egress,note,enabled,reasoning-min-tokens}`（note 限 200 字，空串删字段；reasoning-min-tokens 为高档位最低预算，只管 xhigh/max 两档，值域 1-200000，`{}` 清掉整张映射），`DELETE /providers/:id/models/:model`（PATCH 删不掉故独立端点），`GET /providers/:id/models`（lister 报错转 502）。
+- 模型：`POST /providers/:id/test`（最小真实请求），`POST /providers/:id/scan`（探到协议写回），`POST /providers/:id/refresh-fingerprint`（Zen 指纹刷新：读本机新鲜会话写回静态头；本地无新鲜会话时返回 next 重登指引，见 `discover/zen_refresh.ts`），`PUT /providers/:id/models/:model/{protocol,egress,note,enabled,reasoning-effort,reasoning-max-tokens}`（note 限 200 字，空串删字段；reasoning-effort 为模型推理等级预设，档位见第 14 节；reasoning-max-tokens 为按档位推理预算上限，`{"档位": 正整数}` 无值域上限，`{}` 清掉整张映射），`DELETE /providers/:id/models/:model`（PATCH 删不掉故独立端点），`GET /providers/:id/models`（lister 报错转 502）。
 - stats：`GET /admin/api/stats`（全量），`GET /admin/api/breakdown?days|since|until&account_id`（默认 365 天），`GET /admin/api/usage/accounts`（账号维度）。
 - discover（`discover_api.ts`）：`GET /admin/api/discover`（未接线返回空列表），`POST /discover/adopt {key,id?}`（须 ready 否则 400，幂等），`POST /discover/import-account`（必填 key/tokenPath/accountId/credentialFile，服务端 0600 落盘，token 不经前端；workbuddy 导入打 `importSource` + uid + token 指纹标记，账号页才显示「签到」），`POST /discover/quick-import {key}`（全量导入存活登录态，同样打标记）。
 - sidecar / projects 以 Hono 子应用注入（`api.ts:646-653`），未注入对应端点 501。
@@ -188,9 +188,12 @@
 
 SQLite 持久化（`usage/store.ts`，schema v2，`user_version` 前向迁移，建表恒最新、缺列 ALTER 且幂等，`:1-8`）。硬规则：`cacheRead / cacheCreation` 独立字段存储，绝不混入 input；accuracy 原样保存，估算值仅展示不可计费；P0 不记金额（`:2-4`）。
 
-- **total**：`totalOf`，`total = input + output`（上游 wire 总量；reasoning 已含 output 不重复计；cacheCreation/miss 是 input 子集不另加；读时重算不读存量列）。
+- **total / 命中率按缓存语义分流（CACHE-SEMANTICS，schema v5 的 `sem` 列）**：
+  - `subset`（OpenAI 系，prompt 已含 cached 全量）：`total = input + output`，输入侧 = input；
+  - `separate`（anthropic-messages，input 只含未命中，三桶互斥）：`total = input + output + read + creation`（同 `ir/types.ts usageTotal` 的 separate 分支），输入侧 = 三桶之和；
+  - 写入时随实际协议落 `sem`（proxy / probe）；历史行由 `backfillSemantics` 回填（协议权威 → `read > input` 启发式 → 剩余钉 subset）。
+- **缓存命中率**：`hitRate = read / 输入侧`（`Summary.inputSideTokens` 下发分母；聚合内分流见 `usage/store.ts totalOf/hitRate/inputSideOf`），无输入返回 null；零命中源计入分母。
 - **TPS**：总输出 / 总“生成段”耗时（tok/s）。SQL：`avgTps = SUM(守卫内 output) * 1000 / SUM(守卫内 latency_ms - first_token_ms)`，分母已扣 TTFT（decode 段）。守卫：`status='ok' AND stream=1 AND first_token_ms>0 AND latency_ms>first_token_ms`（缺失字段行被排除）；无样本时 `avgTps / avgTtftMs` 为 null，前端显示 —（`usage/store.ts:58-63,347-364`，`Dashboard.vue:412-420`）。
-- **缓存命中率**：`hitRate = read / input`（缓存命中 / 总输入；OpenAI 系 input 已含 cached，`usage/store.ts`），无输入返回 null；零命中源计入分母。总量公式见 `ir/types.ts usageTotal`。
 - **账号维度**：哪个号被限额一眼认出（`usage/store.ts:72-96 AccountUsage`：requests / errors / errorRate / byKind{quota/rate_limit/auth/…} / tokens / lastErrorAt / models 明细）。
 
 ## 10. ZCode sidecar（本地引擎托管，胶水层）
@@ -257,7 +260,9 @@ npm run typecheck  # tsc --noEmit
 - **未声明 models 的 Provider 视为透明代理**，接受任意模型（`scheduler.ts:36-40`）。
 - **手填模型默认纯文本**：`input` 缺省 `['text']`（`config/index.ts:271`）；支持图片须显式声明，未声明时发出请求前拒绝并点名。
 - **失败账**：全部候选失败记一笔 tokens 为 0 的失败账，这是流式失败唯一的落账点（`proxy.ts:246-258`）。
-- **高档位最低预算**：模型 `reasoning_min_tokens: {"xhigh": 128000, "max": 200000}`（`PUT /admin/api/providers/:id/models/:model/reasoning-min-tokens`，值域 1-200000）。只管 xhigh/max 两档、只托底不封顶——客户端值低于该档下限时抬到下限（防推理吃光预算导致截断/无工具），高于下限或没给值时不动，其他档位一律不动；探针同样走下限，避免把“预算不足”误报成“源不可用”。托底时记 `[floor]` 日志，入站原文记 `[inbound]` 日志（含 `maxTokens/tools/toolChoice/reasoning`，不记正文）。
+- **模型推理等级预设（强制覆盖）**：模型 `reasoning_effort: high`（`PUT /admin/api/providers/:id/models/:model/reasoning-effort`）。档位词汇 `ir/types.ts:REASONING_LEVELS`：`off / minimal / low / medium / high / xhigh / max / follow`。配了具体档位就**强制覆盖**客户端（上级）透传的档位——不管上级发的什么，都按模型配置来（客户端没带档位时注入预设档位，同时清掉客户端 thinkingBudget 防止 Anthropic 旧式 budget 架空预设，`model.applyReasoningPreset`）；`follow`（跟随上游）或留空 = 不覆盖，上级发什么档位就用什么、没发就不注入（上游默认档生效）。改写记 `[effort]` 日志。
+- **按档位推理预算上限**：模型 `reasoning_max_tokens: {"xhigh": 65536, "high": 32768}`（`PUT /admin/api/providers/:id/models/:model/reasoning-max-tokens`，值须正整数、无值域上限——上游有硬顶，写多大由用户自己判断，超出由上游报错并按事实归因）。键 = 档位名（小写），查的是**实际生效**档位（预设覆盖后），只压不抬——该档位下客户端 maxTokens 高于上限时压到上限（`model.applyReasoningCap`），低于/没给值/键没命中一律不动；与等级预设解耦，两者可并存（先覆盖档位再压预算）。压预算记 `[cap]` 日志，入站原文记 `[inbound]` 日志（含 `maxTokens/tools/toolChoice/reasoning`，不记正文）。探针带等级预设（按模型配置形态探测，顺带验证上游认不认该档位）但不做预算上限（16 是探测专用小预算）。
+- **旧字段迁移**：`reasoning_min_tokens`（高档位最低预算，只托底 xhigh/max，2026-09-19 废弃）与 presets/上限语义相反（抬下限 vs 压上限），无法静默换算——config 严格模式启动时点名忽略（`config/index.ts` migrateLegacy），库里存量字段由存储层白名单洗掉。
 
 ## 15. 许可证
 

@@ -32,6 +32,7 @@ import {
   type ToolChoice,
   type ToolDef,
   type Usage,
+  normalizeUsageSem,
 } from '../ir/index.ts'
 
 const PROTOCOL = 'openai-completions'
@@ -96,6 +97,10 @@ interface WirePromptDetails {
   cached_tokens: number
 }
 
+interface WireCompletionDetails {
+  reasoning_tokens: number
+}
+
 // OpenRouter/Tencent 系上游在 usage 顶层另给的缓存字段（非标准 OpenAI，
 // 但 CodeBuddy/hy4 这条链路确实在发）。prompt_cache_miss_tokens 是「本次真正
 // 新写入缓存」的量，也就是 anthropic 口径的 cache_creation_input_tokens。
@@ -111,6 +116,10 @@ interface WireUsage extends WireCacheExtras {
   completion_tokens: number
   total_tokens: number
   prompt_tokens_details?: WirePromptDetails
+  // GLM/DeepSeek/官方 OpenAI 都在 completion 侧给 reasoning 用量
+  // （实抓载荷：reasoning_tokens:97）。不抽的话 reasoning 在 completions
+  // 链路恒 0，reasoning 成本不可见。
+  completion_tokens_details?: WireCompletionDetails
 }
 
 interface WireMessage {
@@ -198,6 +207,10 @@ function outStopReason(fr: string): StopReason {
 // 与上游 wire 语义一致，见夹具 12+34=46）；cached_tokens 来自 IR 独立字段
 // cacheReadTokens，绝不混入 prompt_tokens。
 function wireUsage(u: Usage): WireUsage {
+  // 语义归一（CACHE-SEMANTICS）：Usage 可能来自 anthropic 上游（separate：
+  // input 只含未命中）。openai 客户端按 subset 读（cached ⊆ prompt），不归一
+  // 会输出 input=105 + cached_tokens=320 的自相矛盾包（命中数 > 父集）。
+  u = normalizeUsageSem(u, 'subset')
   const prompt = u.inputTokens ?? 0
   return {
     prompt_tokens: prompt,
@@ -224,13 +237,24 @@ function irUsageOf(w: WireUsage | undefined): Usage | undefined {
   if (prompt === 0 && completion === 0 && total === 0 && details === undefined) return undefined
   const u: Usage = { outputTokens: completion, accuracy: 'exact' }
   if (prompt !== 0) u.inputTokens = prompt
-  if (details !== undefined && details.cached_tokens !== 0) u.cacheReadTokens = details.cached_tokens
+  if (details !== undefined && details.cached_tokens !== 0) {
+    u.cacheReadTokens = details.cached_tokens
+  } else {
+    // 顶层 cache_read_input_tokens 兜底：有的上游只发顶层字段不发 details。
+    // WireCacheExtras 声明了该字段却从不读取（死字段），直到这里才真正消费它。
+    const top = w?.cache_read_input_tokens
+    if (top !== undefined && top !== 0) u.cacheReadTokens = top
+  }
+  // reasoning 已含于 outputTokens（ir/types.ts 口径），单独记账只做展示归因。
+  const cdetails = w?.completion_tokens_details
+  if (cdetails !== undefined && cdetails.reasoning_tokens !== 0) u.reasoningTokens = cdetails.reasoning_tokens
   // 取第一个 >0 的字段，不能写 `a ?? b ?? c`：上游常把不支持的字段填 0
   // 占位（真实载荷里 cache_creation_input_tokens:0 与 prompt_cache_miss_tokens:23
   // 同时出现），`??` 会被那个 0 短路掉，真正有值的字段反而读不到。
   const write = [w?.cache_creation_input_tokens, w?.prompt_cache_write_tokens, w?.prompt_cache_miss_tokens]
     .find((v) => v !== undefined && v > 0)
   if (write !== undefined) u.cacheCreationTokens = write
+  u.sem = 'subset' // openai 系 wire：prompt 已含 cached（CACHE-SEMANTICS）
   return u
 }
 
@@ -926,8 +950,14 @@ class OutStreamParser implements StreamParser {
       })
     }
     if (ch.usage !== undefined && ch.usage !== null) {
-      // usage chunk（choices 为空）→ 暂存，收尾时并入 message_delta
-      this.usage = irUsageOf(ch.usage)
+      // usage chunk（choices 为空）→ 字段级合并进暂存，收尾时并入 message_delta。
+      //
+      // 不能直接赋值：irUsageOf 对「全零 usage」返回 undefined，而有的上游会在
+      // 真 usage 之后**再发一个全零 usage chunk**——直接赋值会把已暂存的用量
+      // 抹掉（实测：message_delta 完全不带 usage，计费侧记 0）。
+      // mergeUsage 是「字段级最新非零优先」，与 proxy.ts 的 mergeStreamUsage 同策略。
+      const u = irUsageOf(ch.usage)
+      if (u !== undefined) this.usage = mergeUsage(this.usage, u)
     }
     for (const choice of ch.choices ?? []) {
       if ((choice.index ?? 0) !== 0) continue // P0 只处理首选

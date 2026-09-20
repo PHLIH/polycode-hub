@@ -137,9 +137,18 @@ function migrateLegacy(top: Record<string, unknown>): void {
           if (!m || typeof m !== 'object' || Array.isArray(m)) continue
           if ('provider_id' in m) {
             // 模型嵌在 Provider 下，反向引用冗余，直接丢掉。只在真删掉时告警，避免新配置每次启动刷屏。
+            // 必须继续处理后续模型（不能用 break）：旧配置普遍 ≥2 个模型，break
+            // 会让第二个模型起的 provider_id 留下来，被严格模式拒绝——进程起不来，
+            // 且报错指向用户没写错的 models[N]（扫描实证）。
             console.warn(`配置兼容：provider ${pname} 下 models[].provider_id 已废弃（嵌套即归属），已忽略`)
             delete m.provider_id
-            break
+          }
+          // 旧「高档位最低预算」只托底 xhigh/max（2026-09-19 被「推理等级预设 +
+          // 按档位预算上限」取代）：语义完全不同（抬下限 vs 压上限），无法静默
+          // 换算，点名让用户重配，否则旧字段被严格模式拒绝而进程起不来。
+          if ('reasoning_min_tokens' in m) {
+            console.warn(`配置兼容：provider ${pname} 模型 ${String(m.id ?? '?')} 的 reasoning_min_tokens（高档位最低预算）已废弃，请改用 reasoning_max_tokens（按档位预算上限，只压不抬）；旧字段本次忽略`)
+            delete m.reasoning_min_tokens
           }
         }
       }
@@ -203,7 +212,7 @@ type FieldSpec =
   | { kind: 'string' | 'number' | 'boolean' }
   | { kind: 'array'; item: FieldSpec }
   | { kind: 'map' } // 自由键值（provider.headers，值收敛成字符串）
-  | { kind: 'nummap' } // 高档位→预算映射（model.reasoning_min_tokens，值收敛成数字）
+  | { kind: 'nummap' } // 档位→预算映射（model.reasoning_max_tokens，值收敛成数字）
   | { kind: 'object'; spec: Record<string, [string, FieldSpec]> }
 
 // [tsKey, spec]
@@ -227,7 +236,8 @@ const MODEL: Record<string, [string, FieldSpec]> = {
   input: ['input', { kind: 'array', item: { kind: 'string' } }],
   api: ['api', { kind: 'string' }],
   egress: ['egress', { kind: 'string' }],
-  reasoning_min_tokens: ['reasoningMinTokens', { kind: 'nummap' }],
+  reasoning_effort: ['reasoningEffort', { kind: 'string' }],
+  reasoning_max_tokens: ['reasoningMaxTokens', { kind: 'nummap' }],
   note: ['note', { kind: 'string' }],
   manual: ['manual', { kind: 'boolean' }],
   enabled: ['enabled', { kind: 'boolean' }],
@@ -406,14 +416,18 @@ function applyDefaults(c: Config): void {
     p.models ??= [] // Go 侧 nil 切片语义等价空目录
     for (const m of p.models) {
       if (!m.input || m.input.length === 0) m.input = ['text'] // 手动添加的模型默认纯文本
-      // 高档位下限的键收敛成小写（应用侧按小写查）；值非法留给
+      // 推理等级预设收敛小写（follow 同义收敛；非法值留给 validate() 点名报错）。
+      if (typeof m.reasoningEffort === 'string' && m.reasoningEffort.trim() !== '') {
+        m.reasoningEffort = m.reasoningEffort.trim().toLowerCase()
+      }
+      // 档位预算上限的键收敛成小写（应用侧按小写查）；值非法留给
       // validate() 点名报错，不在这里静默吞掉。
-      if (m.reasoningMinTokens !== undefined && m.reasoningMinTokens !== null && typeof m.reasoningMinTokens === 'object') {
+      if (m.reasoningMaxTokens !== undefined && m.reasoningMaxTokens !== null && typeof m.reasoningMaxTokens === 'object') {
         const norm: Record<string, number> = {}
-        for (const [k, val] of Object.entries(m.reasoningMinTokens)) {
+        for (const [k, val] of Object.entries(m.reasoningMaxTokens)) {
           norm[k.trim().toLowerCase()] = val
         }
-        m.reasoningMinTokens = norm
+        m.reasoningMaxTokens = norm
       }
     }
   }
@@ -438,6 +452,14 @@ function validate(c: Config): void {
     throw new Error(`gateway.port ${c.gateway.port} 非法（须为 1-65535 的整数）`)
   }
   const egressIDs = new Set(c.egresses.map((e) => e.id))
+  // egress kind 枚举校验（此前 YAML 路径漏了，管理面 PUT 有）：kind 写错
+  // （如 socks5）时不拦，错误推迟到启动期 syncEgresses → egressProxyURI 才抛
+  // `egress kind "socks5" 暂不支持`，且不报是哪条配置。
+  for (const e of c.egresses) {
+    if (e.kind !== 'http' && e.kind !== 'https') {
+      throw new Error(`egress "${e.id}" 的 kind "${e.kind}" 非法（仅 http | https）`)
+    }
+  }
   const providers = new Set<string>()
   for (const p of c.providers) {
     if (p.egress && !egressIDs.has(p.egress)) {

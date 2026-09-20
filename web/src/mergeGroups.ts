@@ -1,5 +1,5 @@
 // 归因表手动合并：纯函数（Dashboard.vue 的合并组逻辑抽出来，可单测）。
-// 口径与 Dashboard.vue byModel 一致：数字字段相加；命中率按总命中/总输入重算；
+// 口径与 Dashboard.vue byModel 一致：数字字段相加；命中率按总命中/输入侧重算；
 // TPS/TTFT 按 sampled 加权平均。
 
 export interface MergeRow {
@@ -16,6 +16,10 @@ export interface MergeRow {
   totalTokens?: number
   errors?: number
   cacheHitRate?: number | null
+  // 输入侧总量（命中率分母，CACHE-SEMANTICS）：subset 行 = input，
+  // separate 行（anthropic 协议，input 只含未命中）= input+read+creation。
+  // 后端逐行下发；旧数据可能缺 → 回退到「命中率反推 / input」。
+  inputSideTokens?: number
   avgTps?: number | null
   avgTtftMs?: number | null
   sampled?: number
@@ -30,22 +34,25 @@ export interface MergeGroup {
 export const rowKey = (r: Pick<MergeRow, 'providerName' | 'modelId'>): string =>
   `${r.providerName}/${r.modelId}`
 
-/** 反推一行的输入侧分母（命中数 / 命中率；率为 0 或 null 时分母为 0）。 */
-export function denomOf(r: Pick<MergeRow, 'cacheReadTokens' | 'cacheHitRate'>): number {
+/** 一行的输入侧分母（命中率分母）：优先后端下发的 inputSideTokens，缺了再反推。 */
+export function denomOf(r: Pick<MergeRow, 'cacheReadTokens' | 'cacheHitRate' | 'inputSideTokens' | 'inputTokens'>): number {
+  const side = r.inputSideTokens
+  if (side != null && side > 0) return side
   const rate = r.cacheHitRate
-  return rate != null && rate > 0 ? (r.cacheReadTokens || 0) / rate : 0
+  if (rate != null && rate > 0) return (r.cacheReadTokens || 0) / rate
+  return r.inputTokens || 0
 }
 
 const NUM_FIELDS = ['requests', 'inputTokens', 'outputTokens', 'cacheReadTokens',
-  'cacheCreationTokens', 'reasoningTokens', 'totalTokens', 'errors'] as const
+  'cacheCreationTokens', 'reasoningTokens', 'totalTokens', 'errors', 'inputSideTokens'] as const
 
-/** 多行合成一行：数字相加，命中率按总命中/总输入，TPS 按 sampled 加权。 */
+/** 多行合成一行：数字相加，命中率按总命中/输入侧，TPS 按 sampled 加权。 */
 export function mergeRows(rows: MergeRow[], name: string): MergeRow {
   const acc: MergeRow = {
     providerName: name, modelId: '',
     requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
     cacheCreationTokens: 0, reasoningTokens: 0, totalTokens: 0, errors: 0,
-    cacheHitRate: null, avgTps: null, avgTtftMs: null, sampled: 0,
+    inputSideTokens: 0, cacheHitRate: null, avgTps: null, avgTtftMs: null, sampled: 0,
   }
   let num = 0
   let denom = 0
@@ -61,7 +68,7 @@ export function mergeRows(rows: MergeRow[], name: string): MergeRow {
     if (m.avgTps != null) { tpsNum += m.avgTps * (m.sampled || 0); tpsDen += m.sampled || 0 }
     if (m.avgTtftMs != null) { ttftNum += m.avgTtftMs * (m.sampled || 0); ttftDen += m.sampled || 0 }
   }
-  // 命中率 = 总命中 / 总输入（与后端 hitRate 同口径 read/input；denomOf 反推即 input）
+  // 命中率 = 总命中 / 输入侧（与后端同口径；denomOf 优先 inputSideTokens，反推兜底）
   acc.cacheHitRate = denom > 0 ? num / denom : null
   acc.avgTps = tpsDen > 0 ? tpsNum / tpsDen : null
   acc.avgTtftMs = ttftDen > 0 ? ttftNum / ttftDen : null

@@ -23,6 +23,7 @@ import {
   SidecarCancelledError,
   startupFailureHint,
   logTailHint,
+  isPortInUseError,
   validatePort,
 } from '../src/sidecar/sidecar.ts'
 import type { SidecarProgress } from '../src/sidecar/sidecar.ts'
@@ -1035,6 +1036,65 @@ describe('启动失败提示 startupFailureHint', () => {
     }
   })
 
+  // Bun 口径（回归锚点，真实故障 2026-09-19）：引擎是 Bun 打的二进制，bind 失败
+  // 时**不打** Go/Node 那句 "address already in use"，而是下面的措辞。老正则
+  // 匹配不上 → 落到「最后一行」兜底 → 用户看到的是 Bun 的版本脚注，真正的
+  // 根因（端口被僵死的旧进程占着）被完全盖住。这是当时页面上报错的原句。
+  test('Bun 的端口占用措辞要被认出来（不能退化成版本脚注）', () => {
+    const dir = makeTemp('polycode-shbun-')
+    try {
+      const bun = [
+        'error: Failed to start server. Is port 8080 in use?',
+        ' syscall: "listen",',
+        '   errno: 0,',
+        '    code: "EADDRINUSE"',
+        '',
+        'Bun v1.4.0 (macOS arm64)',
+      ].join('\n') + '\n'
+      const hint = startupFailureHint(writeLog(dir, bun))
+      expect(hint).toContain('端口已被占用')
+      expect(hint).not.toContain('Bun v1.4.0')
+      // 单独出现 EADDRINUSE（别的 runtime 措辞）同样要认得
+      expect(startupFailureHint(writeLog(dir + '-2', 'Error: listen EADDRINUSE: address already in use\n')))
+        .toContain('端口已被占用')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+      rmSync(dir + '-2', { recursive: true, force: true })
+    }
+  })
+
+  // 「没人认得 + 最后一行是 Bun 版本脚注」= 那句让用户完全摸不着头脑的报错。
+  // 宁可退回「启动超时」，也不要把与故障无关的版本号端给用户。
+  test('Bun 版本脚注不该被当成「最后一行」报给用户', () => {
+    const dir = makeTemp('polycode-shbun2-')
+    try {
+      const work = writeLog(dir, '359 | };\n360 | Server.prototype[kRealListen] = function() {\n\nBun v1.4.0 (macOS arm64)\n')
+      expect(startupFailureHint(work)).toBe('')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('认得原因时跳过脚注行，取最后一行有意义的原文', () => {
+    const dir = makeTemp('polycode-shbun3-')
+    try {
+      // 脚注在最后，但它上面那行才是真实信息
+      const work = writeLog(dir, 'something went quite wrong\nBun v1.4.0 (macOS arm64)\n')
+      expect(startupFailureHint(work)).toContain('something went quite wrong')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('isPortInUseError 认三种口径（含 hint 翻好的中文）', () => {
+    expect(isPortInUseError(new Error('sidecar: 启动失败 —— 端口已被占用。'))).toBe(true)
+    expect(isPortInUseError(new Error('listen tcp: bind: address already in use'))).toBe(true)
+    expect(isPortInUseError(new Error('Failed to start server. Is port 8080 in use? EADDRINUSE'))).toBe(true)
+    // 别的失败原因不能被误判成端口问题——否则守护会对着「未登录」反复清场
+    expect(isPortInUseError(new Error('Not logged in. Run: zcode-proxy auth login zai'))).toBe(false)
+    expect(isPortInUseError(new Error('permission denied'))).toBe(false)
+  })
+
   test('认不出的失败：带出日志最后一行，总比只说「超时」有用', () => {
     const dir = makeTemp('polycode-shint3-')
     try {
@@ -1939,13 +1999,23 @@ describe('测试杀伤半径为零', () => {
       const cred = join(dir, 'k')
       writeFileSync(cred, 'x', { mode: 0o600 })
       const tokenProc = spawn(process.execPath, ['-e', `setTimeout(()=>{},30000) // ${TEST_TOKEN}`])
+      // 退出监听必须在 stopAll **之前**挂上：stop 是异步的，等它返回后再挂
+      // 会漏掉已经发生的 exit 事件（spawn 后立即被杀时尤其明显）——
+      // 于是「明明杀掉了」却观测不到退出，是测试的观测竞态，不是 stop 失效。
+      let exited = false
+      tokenProc.on('exit', () => { exited = true })
       const s = testSidecar(cred)
       await s.stopAll()
-      // 令牌进程应已被杀（stop 后很快退出）
-      const stillAlive = await new Promise<boolean>((resolve) => {
-        const t = setTimeout(() => resolve(true), 2000)
-        tokenProc.on('exit', () => { clearTimeout(t); resolve(false) })
-      })
+      // 令牌进程应已被杀：等真实 exit 事件，并以「进程号已不存在」兜底判定。
+      await vi.waitUntil(() => exited, { timeout: 3000, interval: 50 }).catch(() => {})
+      let stillAlive = !exited
+      if (stillAlive) {
+        const pid = tokenProc.pid
+        if (pid === undefined || pid <= 0) stillAlive = false
+        else {
+          try { process.kill(pid, 0) } catch { stillAlive = false }
+        }
+      }
       expect(stillAlive).toBe(false)
     } finally {
       rmSync(dir, { recursive: true, force: true })

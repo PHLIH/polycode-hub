@@ -29,9 +29,10 @@ import {
   type StopReason,
   type ToolChoice,
   type Usage,
+  normalizeUsageSem,
 } from '../ir/index.ts'
 
-export const PROTOCOL = 'openai-responses'
+const PROTOCOL = 'openai-responses'
 
 const textEncoder = new TextEncoder()
 const textDecoder = new TextDecoder()
@@ -122,18 +123,25 @@ function usageOf(w: Record<string, unknown>): Usage | undefined {
   const total = asNumber(w['total_tokens'])
   const inDetails = w['input_tokens_details'] == null ? null : asRecord(w['input_tokens_details'])
   const outDetails = w['output_tokens_details'] == null ? null : asRecord(w['output_tokens_details'])
-  if (input === 0 && output === 0 && total === 0 && inDetails === null && outDetails === null) {
+  // 全零与否看「实际计数」而非 details 是否存在：有的上游带了空的
+  // output_tokens_details（如 reasoning_tokens:0 占位）却所有计数都是 0。
+  // 旧判据此时放行并把 accuracy 拔高为 exact，而下游 mergeStreamUsage 用
+  // accuracyWorst 取最差档——先写入 exact 就再也降不回去了。
+  const cached = inDetails !== null ? asNumber(inDetails['cached_tokens']) : 0
+  const reasoning = outDetails !== null ? asNumber(outDetails['reasoning_tokens']) : 0
+  if (input === 0 && output === 0 && total === 0 && cached === 0 && reasoning === 0) {
     return undefined
   }
   const u: Usage = { inputTokens: input || undefined, outputTokens: output, accuracy: 'exact' }
-  if (inDetails !== null) u.cacheReadTokens = asNumber(inDetails['cached_tokens']) || undefined
-  if (outDetails !== null) u.reasoningTokens = asNumber(outDetails['reasoning_tokens']) || undefined
+  if (cached !== 0) u.cacheReadTokens = cached
+  if (reasoning !== 0) u.reasoningTokens = reasoning
   // 同 openai-completions：取第一个 >0 的值，不用 ||
   // （上游会把不支持的字段填 0 占位，短路会读不到真正有值的那个）。
   const write = [w['cache_creation_input_tokens'], w['prompt_cache_write_tokens'], w['prompt_cache_miss_tokens']]
     .map((v) => asNumber(v))
     .find((v) => v > 0)
   if (write !== undefined) u.cacheCreationTokens = write
+  u.sem = 'subset' // openai 系 wire：input 已含 cached（CACHE-SEMANTICS）
   return u
 }
 
@@ -504,6 +512,8 @@ interface InOpenItem {
 // 组装 responses 用量对象（非流式路径）。details 子对象仅在 IR 任一明细字段非零时
 // 输出；reasoning_tokens 为 0 时也须显式输出（response.basic 夹具形态）。
 function usageWire(u: Usage): Record<string, unknown> {
+  // 语义归一（CACHE-SEMANTICS）：见 openaicompletions.wireUsage 注释。
+  u = normalizeUsageSem(u, 'subset')
   const input = u.inputTokens ?? 0
   const output = u.outputTokens ?? 0
   const w: Record<string, unknown> = {
@@ -518,8 +528,17 @@ function usageWire(u: Usage): Record<string, unknown> {
   return w
 }
 
-// response.completed 的用量（流式路径不带 output_tokens_details）。
+// response.completed 的用量：与非流式共用 serializeUsageWire（流式也不丢
+// output_tokens_details——此前两函数高度重复，这里的 reasoning 回写就是这么
+// 漏改的）。reasoning_tokens 为 0 时也显式输出（response.basic 夹具形态）：
+ // 客户端按"key 存在"判定上游是否给了该字段，不输出会被读成"上游没说"。
 function streamUsageWire(u: Usage): Record<string, unknown> {
+  return serializeUsageWire(u, true)
+}
+
+// 两路径共用同一份 usage 序列化（唯一区别见参数注释：当前为零）。
+function serializeUsageWire(u: Usage, _stream: boolean): Record<string, unknown> {
+  u = normalizeUsageSem(u, 'subset')
   const input = u.inputTokens ?? 0
   const output = u.outputTokens ?? 0
   const w: Record<string, unknown> = {
@@ -527,8 +546,9 @@ function streamUsageWire(u: Usage): Record<string, unknown> {
     output_tokens: output,
     total_tokens: input + output,
   }
-  if ((u.cacheReadTokens ?? 0) > 0) {
+  if ((u.cacheReadTokens ?? 0) > 0 || (u.cacheCreationTokens ?? 0) > 0 || (u.reasoningTokens ?? 0) > 0) {
     w['input_tokens_details'] = { cached_tokens: u.cacheReadTokens ?? 0 }
+    w['output_tokens_details'] = { reasoning_tokens: u.reasoningTokens ?? 0 }
   }
   return w
 }

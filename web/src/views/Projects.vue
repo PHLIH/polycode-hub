@@ -54,7 +54,13 @@ onMounted(() => {
   load(false)
   timer = setInterval(load, 8000) // 运行时长/状态轮询
 })
-onUnmounted(() => clearInterval(timer))
+onUnmounted(() => {
+  clearInterval(timer)
+  // 日志弹窗的 2s 轮询也要停：弹窗开着时切页，logTimer 只挂在
+  // logOpen/logAuto 的 watch 和弹窗关闭回调上，组件卸载不会触发它们——
+  // 不清就成了僵尸轮询（继续打 /logs、持有已卸载组件的 ref）。
+  stopLogPoll()
+})
 
 // —— 启停 ——
 async function serviceAction(p, s, action) {

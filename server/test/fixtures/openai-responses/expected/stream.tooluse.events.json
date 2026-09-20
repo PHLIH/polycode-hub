@@ -56,7 +56,8 @@
     "usage": {
       "inputTokens": 20,
       "outputTokens": 30,
-      "accuracy": "exact"
+      "accuracy": "exact",
+      "sem": "subset"
     }
   },
   {

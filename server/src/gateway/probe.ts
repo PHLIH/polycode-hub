@@ -3,7 +3,7 @@
 
 import { getOutbound, UpstreamError, UPSTREAM, type IrRequest, type StreamEvent } from '../ir/index.ts'
 import {
-  autoProtocol, rememberProtocol, looksFree, accountEffectiveStatus, applyReasoningFloor,
+  autoProtocol, rememberProtocol, looksFree, accountEffectiveStatus, applyReasoningPreset,
   type Provider, type UsageLog,
 } from '../model/index.ts'
 import { validProtocol } from '../ir/index.ts'
@@ -61,7 +61,9 @@ const PROBE_CONCURRENCY = 4
 
 function retryableProbeErr(err: unknown): boolean {
   const kind = (err as { kind?: string }).kind
-  return kind === 'rate_limit' || kind === 'quota' || kind === 'server' || kind === 'network'
+  // quota（402/额度用尽）不重试：upstream 已确立「换谁都没用」的语义——充值前
+  // 换源只是烧调用。探针同样：打一次就知道没额度，白打 3 次真实请求还多等 1.5s。
+  return kind === 'rate_limit' || kind === 'server' || kind === 'network'
 }
 
 // 非法 providerId 的最后一道防线（NaN / undefined / 非正整数）。
@@ -266,8 +268,13 @@ export class Probe {
     return { model: modelID, ok: false, error: errText, kind: errKind }
   }
 
-  // 返回该 Provider 用于探测的副本：同源有可用账号则用账号凭据（与真实转发同路径），
-  // 否则用 Provider 级凭据。不写 MarkResult，不污染冷却。
+  // 返回该 Provider 用于探测的副本：同源有可用账号则用**首个**可用账号的凭据，
+  // 否则用 Provider 级凭据。不写 MarkResult，不污染冷却；也不推进 pick 的轮询
+  // 游标（探针是只读观察，不能偷走转发的轮询位置）。
+  //
+  // 注意：这里**不等价**于真实转发——转发走 pick() 加权轮询，可能轮到第 2/3 个
+  // 账号。「测试通过」只证明"首个可用账号能用"，不证明轮询到的账号能用。
+  // 排障时若测试通过但请求失败，先看失败日志里实际用的 accountId 再下结论。
   private probeCredential(p: Provider): Provider {
     if (!this.accounts) return p
     const now = new Date()
@@ -279,8 +286,8 @@ export class Probe {
   // 对指定模型打一次最小真实流式请求。不抛错，失败如实返回。
   // 注意与 Stream 的协议解析不完全一致：此处只看模型级/ Provider 级声明，
   // 不读 autoProtocol 进程内缓存（探测即重探，避免缓存掩盖真相）。
-  // 探针不带推理档位（最小请求只测连通，不测档位枚举），但同样走档位下限：
-  // 万一模型配了 xhigh/max 下限，16 预算会被抬起，避免把“预算不足”误报成“源不可用”。
+  // 探针预算恒 16，不走档位预算上限；模型配了推理等级预设（非 follow）时
+  // 会带上该档位（见 probeOne），等价于按模型配置形态探测。
   private async probeOne(pv: Provider, bare: string): Promise<ProbeOutcome> {
     const m = pv.models.find((x) => x.id === bare)
     const proto = m?.api || pv.api
@@ -291,15 +298,21 @@ export class Probe {
       providerId: pv.providerId, providerName: pv.name, modelId: bare, stream: true,
       inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0,
       reasoningTokens: 0, totalTokens: 0, accuracy: 'unknown', latencyMs: 0, status: 'ok',
+      // 探针也是一行用量：缓存语义随探测协议走（CACHE-SEMANTICS）。
+      sem: proto === 'anthropic-messages' ? 'separate' : 'subset',
     }
     // 探测专用：关闭协议自动回退，确保观察到的是「这个协议」的真实结果。
     const probeUp = this.up.withOpts({ noAutoProtocol: true })
     let stream: ReadableStream<Uint8Array> | undefined
     let err: unknown
-    const probeReq: IrRequest = applyReasoningFloor({
+    // 探针不带预算上限（16 是探测专用小预算，托底/封顶语义都不适用），
+    // 但要带上模型推理等级预设：探测就该按模型实际配置的形态打——
+    // 配了 off/high 之类时，能顺带验证上游认不认这个档位，把「档位不被上游
+    // 接受」暴露成探测失败，而不是转发时才发现。follow/未配置 = 不带档位。
+    const probeReq: IrRequest = applyReasoningPreset({
       model: bare, stream: true, maxTokens: 16,
       messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
-    }, pv.models.find((x) => x.id === bare))
+    } as IrRequest, pv.models.find((x) => x.id === bare))
     // 上游抖动重试：免费档会间歇 503（限流按会话算，见 docs/FEATURES.md），
     // 打一次就报「不通」会误判成配置错误。
     for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
@@ -332,18 +345,27 @@ export class Probe {
       }
     }
     const reader = stream.getReader()
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      if (value) {
-        let evs: StreamEvent[]
-        try {
-          evs = parser.feed(value)
-        } catch (ferr) {
-          return { ok: false, text: '', latencyMs: ms(), error: '解析上游响应失败: ' + (ferr as Error).message, ul, firstMs: 0 }
+    // 读流循环整体包 try/catch：reader.read() 本身也会抛（上游中途断连、RST），
+    // 而函数内只有 parser.feed 和 streamWithTimeout 两处有 catch。裸跑的话，
+    // 异常会穿透 probeWithProtocols → probeProvider（无 try/catch）→ 管理端点
+    // 直接 500 + 原始栈。探针的契约是「不抛错、失败如实返回」。
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (value) {
+          let evs: StreamEvent[]
+          try {
+            evs = parser.feed(value)
+          } catch (ferr) {
+            return { ok: false, text: '', latencyMs: ms(), error: '解析上游响应失败: ' + (ferr as Error).message, ul, firstMs: 0 }
+          }
+          collect(evs)
         }
-        collect(evs)
       }
+    } catch (rerr) {
+      try { reader.releaseLock() } catch { /* 读已失败，锁释放尽力即可 */ }
+      return { ok: false, text, latencyMs: ms(), error: '读取上游流失败: ' + (rerr as Error).message, ul, firstMs: 0 }
     }
     collect(parser.finish())
     if (firstMs === 0) firstMs = ms()

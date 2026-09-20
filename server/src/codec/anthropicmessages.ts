@@ -7,6 +7,7 @@
 import {
   ERR,
   irError,
+  normalizeUsageSem,
   registerInbound,
   registerOutbound,
   type Block,
@@ -263,6 +264,10 @@ function isOffEffort(effort: string): boolean {
 // usage 是 wire 侧用量；accuracy 是 IR 内部记账词汇，不上 wire。全字段 omitempty。
 function usageToWire(u: Usage | undefined): Obj | undefined {
   if (!u) return undefined
+  // 语义归一（CACHE-SEMANTICS）：Usage 可能来自 openai 系上游（subset：prompt
+  // 已含 cached）。anthropic 客户端按 separate 读（input 只含未命中），不归一
+  // 会把 425 的 prompt 当"未命中"再叠 320 的 cached 重复计。
+  u = normalizeUsageSem(u, 'separate')
   return {
     input_tokens: u.inputTokens || undefined,
     output_tokens: u.outputTokens || undefined,
@@ -482,12 +487,14 @@ function outImageSourceToWire(s: ImageSource): Obj {
 
 // 缓存两项映射到 IR 独立字段，绝不混入 InputTokens（硬约束）；上游明示 usage → exact。
 function usageFromWire(u: Obj): Usage {
+  // 出站解析打语义标签（CACHE-SEMANTICS）：anthropic wire 三桶互斥。
   return {
     inputTokens: num(u.input_tokens) || undefined,
     outputTokens: num(u.output_tokens) ?? 0,
     cacheReadTokens: num(u.cache_read_input_tokens) || undefined,
     cacheCreationTokens: num(u.cache_creation_input_tokens) || undefined,
     accuracy: 'exact',
+    sem: 'separate',
   }
 }
 

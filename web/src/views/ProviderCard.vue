@@ -14,6 +14,20 @@ const emit = defineEmits(['test', 'reload', 'models', 'edit', 'remove'])
 const open = ref(false)
 
 const PROTOCOLS = ['openai-completions', 'openai-responses', 'anthropic-messages']
+// 推理等级预设档位：follow = 跟随上游（上级发什么档位就用什么，上级没发就不注入），
+// 其余档位配上了就强制覆盖上级的档位（off = 强制关闭思考）。与后端 REASONING_LEVELS 同源。
+// 选项直接展示档位英文名（发上游的就是这些值，选错一眼能对上日志），follow 例外。
+const REASONING_LEVELS = ['follow', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+const REASONING_TITLES = {
+  follow: '跟随上游：上级发什么档位就用什么',
+  off: '强制关闭思考',
+  minimal: '强制 minimal 档',
+  low: '强制 low 档',
+  medium: '强制 medium 档',
+  high: '强制 high 档',
+  xhigh: '强制 xhigh 档',
+  max: '强制 max 档',
+}
 const KIND_LABELS = {
   official: '官方 API',
   'session-reuse': '复用登录态',
@@ -172,44 +186,57 @@ async function setModelEgress(p, id, eg) {
   } catch (e) { ElMessage.error(e.message) }
 }
 
-// 高档位最低预算（只管 xhigh/max）：xhigh/max 档的 maxTokens 低于下限时抬到下限，
-// 其他档位不动。输入 "xhigh:128000,max:200000" 这种逗号分隔的 档位:预算 对，清空则删掉整张映射。
-function floorText(p, id) {
+// 推理等级预设（强制覆盖语义）：'follow' 或空 = 跟随上游；其余档位配上了就听模型的，
+// 不管上级发的什么档位都按这里来。下拉选项直接展示档位英文名。
+function effortValue(p, id) {
   const m = modelOf(p, id)
-  const t = m && m.reasoningMinTokens
-  if (!t || typeof t !== 'object') return ''
-  return Object.entries(t).map(([k, v]) => `${k}:${v}`).join(',')
+  return (m && m.reasoningEffort) || 'follow'
 }
-const floorEdit = ref('')
-const floorDraft = ref('')
-function startFloor(p, id) {
-  floorEdit.value = keyOf(p, id)
-  floorDraft.value = floorText(p, id)
+async function setModelEffort(p, id, effort) {
+  const v = effort === 'follow' ? '' : effort
+  try {
+    await api.updateProviderModelReasoningEffort(p.providerId, id, v)
+    patchRowModel(p, id, 'reasoningEffort', v)
+    ElMessage.success(`${id} 推理等级 → ${effort}`)
+  } catch (e) { ElMessage.error(e.message) }
 }
-async function saveFloor(p, id) {
+
+// 按档位的推理预算上限：该档位生效时 maxTokens 高于上限就压到上限（只压不抬）。
+// 行内直接在等级旁输入数字；跟随上游时禁用（生效档位随上级变，上限无从绑定）。
+function capValue(p, id, effort) {
+  const m = modelOf(p, id)
+  const t = m && m.reasoningMaxTokens
+  return (t && typeof t === 'object' && t[effort]) || ''
+}
+const capEdit = ref({}) // 档位 → 正在编辑的草稿（仅当前编辑中的档位有键）
+const capDirty = ref('') // 正在编辑的档位名（空 = 没有编辑中）
+function startCap(p, id, effort) {
+  capDirty.value = effort
+  capEdit.value = { [effort]: String(capValue(p, id, effort) || '') }
+}
+async function saveCap(p, id, effort) {
+  if (capDirty.value !== effort) return
+  capDirty.value = ''
   const m = modelOf(p, id)
   if (!m) return
-  const raw = floorDraft.value.trim()
-  if (raw === floorText(p, id)) { floorEdit.value = ''; return } // 没改就不打接口
-  try {
-    if (raw === '') {
-      await api.updateProviderModelReasoningMinTokens(p.providerId, id, {})
-      patchRowModel(p, id, 'reasoningMinTokens', '')
-    } else {
-      const map = {}
-      for (const part of raw.split(',')) {
-        const i = part.indexOf(':')
-        if (i < 0) throw new Error(`「${part.trim()}」须为 档位:预算 形态（如 xhigh:128000）`)
-        const k = part.slice(0, i).trim().toLowerCase()
-        const v = Number(part.slice(i + 1).trim())
-        if (!k || !Number.isSafeInteger(v) || v <= 0) throw new Error(`「${part.trim()}」预算须为正整数`)
-        map[k] = v
-      }
-      await api.updateProviderModelReasoningMinTokens(p.providerId, id, map)
-      patchRowModel(p, id, 'reasoningMinTokens', map)
+  const raw = String(capEdit.value[effort] ?? '').trim()
+  const old = capValue(p, id, effort)
+  if (raw === String(old || '')) return // 没改就不打接口
+  // 在整张映射上只动当前档位这一键：其他档位的已存值原样保留。
+  const map = { ...(m.reasoningMaxTokens || {}) }
+  if (raw === '') delete map[effort]
+  else {
+    const v = Number(raw)
+    if (!Number.isSafeInteger(v) || v <= 0) {
+      ElMessage.error('预算须为正整数（留空 = 清除该档上限）')
+      return
     }
-    floorEdit.value = ''
-    ElMessage.success(raw ? '预算下限已保存' : '预算下限已清除')
+    map[effort] = v
+  }
+  try {
+    await api.updateProviderModelReasoningMaxTokens(p.providerId, id, map)
+    patchRowModel(p, id, 'reasoningMaxTokens', Object.keys(map).length ? map : '')
+    ElMessage.success(raw ? `${id} ${effort} 档预算上限 → ${raw}` : `${id} ${effort} 档预算上限已清除`)
   } catch (e) { ElMessage.error(e.message) }
 }
 
@@ -450,16 +477,28 @@ async function toggle() {
             <el-option v-for="e in egresses" :key="e.id" :value="e.id" :label="e.id" />
           </el-select>
 
-          <span class="lane-note">
-            <input v-if="floorEdit === keyOf(p, m.id)" v-model="floorDraft"
-              class="note-input" placeholder="如 xhigh:128000,max:200000"
-              @keyup.enter="saveFloor(p, m.id)" @keyup.esc="floorEdit = ''" @blur="saveFloor(p, m.id)">
-            <template v-else>
-              <button class="note-btn" :class="{ has: floorText(p, m.id) }"
-                :title="floorText(p, m.id) || '只管 xhigh/max 两档：低于下限抬预算，其他档不动'"
-                @click="startFloor(p, m.id)">{{ floorText(p, m.id) ? '预算' : '＋预算' }}</button>
-              <span v-if="floorText(p, m.id)" class="note-text mono" :title="floorText(p, m.id)">{{ floorText(p, m.id) }}</span>
-            </template>
+          <!-- 推理等级：配了就强制覆盖上级档位（follow = 跟随上游）。
+               选项展示档位英文名（发上游的就是这些值）；预算上限输入框常驻，
+               跟随上游时禁用（生效档位随上级变，上限无从绑定）。 -->
+          <span class="lane-effort">
+            <el-select :model-value="effortValue(p, m.id)" size="small" class="lane-sel effort"
+              placeholder="follow"
+              :title="REASONING_TITLES[effortValue(p, m.id)] || effortValue(p, m.id)"
+              @change="v => setModelEffort(p, m.id, v || 'follow')">
+              <el-option v-for="e in REASONING_LEVELS" :key="e" :value="e"
+                :label="e === 'follow' ? '跟随上游' : e" :title="REASONING_TITLES[e] || e" />
+            </el-select>
+            <input class="cap-input" :class="{ set: capValue(p, m.id, effortValue(p, m.id)) !== '' }"
+              inputmode="numeric" placeholder="预算"
+              :disabled="effortValue(p, m.id) === 'follow'"
+              :title="effortValue(p, m.id) === 'follow'
+                ? '跟随上游时不限预算：先选一个具体档位，再填该档的 max_tokens 上限'
+                : `${effortValue(p, m.id)} 档的推理预算上限（max_tokens 超过就压回）；留空 = 不限`"
+              :value="capEdit[effortValue(p, m.id)] ?? capValue(p, m.id, effortValue(p, m.id))"
+              @focus="startCap(p, m.id, effortValue(p, m.id))"
+              @input="capEdit[effortValue(p, m.id)] = $event.target.value"
+              @keyup.enter="$event.target.blur()"
+              @blur="saveCap(p, m.id, effortValue(p, m.id))">
           </span>
 
           <span class="lane-detect">
@@ -663,8 +702,21 @@ async function toggle() {
 /* 安静下拉：无边框无底色，只留文字；hover/focus 才显形。
    协议/出口是配一次长期不动的，不配拥有两个常驻框。 */
 .lane-sel { flex: 0 0 176px; width: 176px; }
-/* 强度下拉只放 7 个短档位，不需要协议下拉那么宽 */
-.lane-sel.sm { flex-basis: 128px; width: 128px; }
+/* 推理等级组：等级下拉（窄）+ 预算输入框，两者只在该模型行内出现 */
+.lane-effort { flex: none; display: flex; align-items: center; gap: 0; }
+.lane-sel.effort { flex-basis: 96px; width: 96px; }
+/* 预算上限输入：未设值时几乎隐形（浅色虚线占位），hover/有值才显形；
+   无上限硬拦——留空即不限，负数/小数由保存时点名。 */
+.cap-input {
+  width: 64px; background: none; color: var(--text);
+  border: 1px dashed var(--line); border-radius: var(--r-ctl);
+  padding: 2px 6px; font-size: 11px; font-family: var(--mono); font-variant-numeric: tabular-nums;
+}
+.cap-input::placeholder { color: var(--dim); opacity: .55; }
+.cap-input:hover { border-color: var(--accent); }
+.cap-input:focus { outline: none; border-style: solid; border-color: var(--accent); background: var(--bg); }
+.cap-input.set { border-style: solid; border-color: color-mix(in srgb, var(--accent) 40%, transparent); }
+.cap-input:disabled { opacity: .35; cursor: not-allowed; }
 .lane-sel :deep(.el-select__wrapper) {
   background: none; box-shadow: none; border: 1px solid transparent;
   border-radius: var(--r-ctl); min-height: 26px; padding: 0 8px;
@@ -725,7 +777,7 @@ async function toggle() {
 @media (max-width: 1100px) {
   .lane-note { width: 120px; }
   .lane-sel { flex-basis: 140px; width: 140px; }
-  .lane-sel.sm { flex-basis: 112px; width: 112px; }
+  .lane-sel.effort { flex-basis: 84px; width: 84px; }
   .url, .proto { max-width: 20ch; }
 }
 @media (max-width: 820px) {

@@ -12,6 +12,7 @@
     "inputTokens": 12,
     "outputTokens": 34,
     "cacheReadTokens": 8,
-    "accuracy": "exact"
+    "accuracy": "exact",
+    "sem": "separate"
   }
 }

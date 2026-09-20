@@ -48,6 +48,7 @@ const statsStub = {
     totals: {
       requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
       cacheCreationTokens: 0, reasoningTokens: 0, totalTokens: 0, errors: 0, cacheHitRate: 0,
+      inputSideTokens: 0,
     },
     daily: [], byModel: [],
   }),

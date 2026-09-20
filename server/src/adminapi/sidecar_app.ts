@@ -308,12 +308,18 @@ export function createSidecarApp(
     // 下载会走哪个代理（脱敏）：前端据此显示「下载走 clash（127.0.0.1:7897）」，
     // 让「装了老半天」有个可解释的出处，而不是一个转圈。
     const dl = downloadProxy()
-    const running = await svc.running()
-    const status = await svc.status()
+    // 一次探活，三个字段共用：引擎卡死时单次探测要等满 HTTP 超时，
+    // 重复探会让状态页慢到十几秒（实测）。
+    const probe = typeof svc.probe === 'function'
+      ? await svc.probe()
+      : ((await svc.running()) ? 'up' : 'down')
+    const running = probe === 'up'
+    const status = await svc.status(probe)
     const g = guard?.status()
     return c.json({
       running,
       status,
+      probe,
       installed: sidecarInstalled(svc),
       // guard：保活守护的如实状态。为什么必须暴露出来——引擎掉线时
       // 它只是「不在」，页面看不出「正在自动恢复」还是「已经放弃等人工」，
@@ -360,8 +366,20 @@ export function createSidecarApp(
         try { await svc.start(dir()) } catch (e) { return err(c, 500, '启动失败: ' + (e as Error).message) }
         return c.json({ ok: true, status: await svc.status() })
       case 'stop':
+        // 停止不再以「引擎健康」为前提（真实故障，2026-09-19 取证）：
+        // 老实现开头是 `if (!(await running())) return`，而引擎被上游验证码
+        // 重试风暴拖死时 /health 永不返回 → running() 恒 false → 一个进程都不杀。
+        // 于是「点停止没反应、点启动必失败（EADDRINUSE）」成了死锁。
+        // stop() 现在只看「有没有进程」，并会在优雅退出失败时升级到 SIGKILL。
         try { await svc.stop() } catch (e) { return err(c, 500, '停止失败: ' + (e as Error).message) }
-        return c.json({ ok: true, status: await svc.status() })
+        // 停完把保活守护的额度清零：用户已经手动处置过，不该再按「连续失败」
+        // 的老账停手，也不必等冷却。
+        guard?.reset()
+        return c.json({ ok: true, status: await svc.status(), probe: await svc.probe() })
+      case 'reset-guard':
+        // 人工介入后立刻恢复自动保活（不用等守护的冷却期）。
+        guard?.reset()
+        return c.json({ ok: true, guard: guard?.status() ?? null })
       case 'login':
         // 登录授权：返回引擎给的 OAuth 授权链接。引擎自己会弹默认浏览器，
         // 前端只把链接当「没弹出来时的兜底入口」展示，不自动打开。
@@ -509,7 +527,7 @@ export function createSidecarApp(
       }
       default:
         return err(c, 404, '未知动作 ' + action +
-          '（支持: start|stop|login|pause|cancel|setup|uninstall|ensure|port|endpoint；install 走 CLI: polycode-hub zcode sidecar …）')
+          '（支持: start|stop|reset-guard|login|pause|cancel|setup|uninstall|ensure|port|endpoint；install 走 CLI: polycode-hub zcode sidecar …）')
     }
   })
 

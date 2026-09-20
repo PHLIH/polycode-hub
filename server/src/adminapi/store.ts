@@ -2,7 +2,7 @@
 // admin.db 两表：admin_providers / admin_accounts（id TEXT PRIMARY KEY + data TEXT JSON blob），
 // schema 与 Go 版完全一致，可互开对方写出的库。内存实现供测试与缺省装配。
 
-import { mkdirSync } from 'node:fs'
+import { chmodSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { createRequire } from 'node:module'
 // node:sqlite 经 createRequire 加载（vite-node 不认识该内置模块，见 usage/store.ts）。
@@ -41,16 +41,20 @@ function cleanModel(m: Model): Model {
   if (typeof m.displayName === 'string') out.displayName = m.displayName
   if (typeof m.note === 'string' && m.note !== '') out.note = m.note
   if (typeof m.egress === 'string' && m.egress !== '') out.egress = m.egress
-  // 高档位下限：只收 (0, 200000] 正整数值（防脏数据；键大小写由写入入口收敛，
-  // 非法整体由 providerValidate 点名）。白名单与 parse.ts 的 parseModel 保持一致。
-  if (m.reasoningMinTokens !== undefined && m.reasoningMinTokens !== null && typeof m.reasoningMinTokens === 'object' && !Array.isArray(m.reasoningMinTokens)) {
+  // 推理等级预设：小写收敛（应用侧按小写比）。非法值由 providerValidate 点名。
+  if (typeof m.reasoningEffort === 'string' && m.reasoningEffort.trim() !== '') {
+    out.reasoningEffort = m.reasoningEffort.trim().toLowerCase()
+  }
+  // 档位预算上限：只收正整数值（防脏数据；键大小写由写入入口收敛）。
+  // 白名单与 parse.ts 的 parseModel 保持一致。
+  if (m.reasoningMaxTokens !== undefined && m.reasoningMaxTokens !== null && typeof m.reasoningMaxTokens === 'object' && !Array.isArray(m.reasoningMaxTokens)) {
     const norm: Record<string, number> = {}
-    for (const [k, val] of Object.entries(m.reasoningMinTokens)) {
-      if (typeof val === 'number' && Number.isSafeInteger(val) && val > 0 && val <= 200000) {
+    for (const [k, val] of Object.entries(m.reasoningMaxTokens)) {
+      if (typeof val === 'number' && Number.isSafeInteger(val) && val > 0) {
         norm[k.trim().toLowerCase()] = val
       }
     }
-    if (Object.keys(norm).length > 0) out.reasoningMinTokens = norm
+    if (Object.keys(norm).length > 0) out.reasoningMaxTokens = norm
   }
   if (typeof m.contextWindow === 'number') out.contextWindow = m.contextWindow
   if (typeof m.maxOutputTokens === 'number') out.maxOutputTokens = m.maxOutputTokens
@@ -150,7 +154,13 @@ type DB = InstanceType<typeof DatabaseSync>
 // 账号归属、用量归因、客户端里配的模型 ID 全部断裂。id 与名字必须分开。
 async function openAdminDB(path: string): Promise<DB> {
   const dir = dirname(path)
-  if (dir && dir !== '.') mkdirSync(dir, { recursive: true })
+  if (dir && dir !== '.') {
+      // 0700：库里是凭据性材料（admin.db 有 Provider 完整 headers——zen 免费档
+      // 指纹四件套，拿到即等于拿到调用凭据）。mode 对已存在目录不生效，
+      // 故再 chmod 一次收紧存量（对齐 credential_file.ts 的写法）。
+      mkdirSync(dir, { recursive: true, mode: 0o700 })
+      try { chmodSync(dir, 0o700) } catch { /* 只读盘等场景不致命 */ }
+    }
   const db = new DatabaseSync(path)
   // 与 Go 同口径：WAL + 繁忙等待
   db.exec('PRAGMA journal_mode=WAL')
@@ -253,6 +263,33 @@ function parseRow<T>(raw: string): T | undefined {
   } catch {
     return undefined
   }
+}
+
+// reviveAccountDates 把 JSON round-trip 打扁的 Date 字段还原成 Date。
+//
+// 为什么必须有（真实缺陷，扫描实证）：Account 落盘是整对象 JSON.stringify，
+// cooldownUntil/lastUsed（model/index.ts:292-293 声明为 Date）读回后变成
+// **string**。而池与展示层的比较全写成 `now > a.cooldownUntil`（Date > string
+// 走 ToPrimitive 后按字符串比，恒为 false）——冷却到期永远判不出来：
+// 账号被限流一次，网关一重启就永久停在 cooldown，只能人工点重置。
+// cli.ts 的注释还写着"惩罚已落盘，重启后照认"，实现正好反了。
+// 根因修在反序列化出口（list/get 两处都过这里），所有比较点不用逐个改；
+// 比较点侧的数值化防御由 pool/account.ts 的 asDate 兜底（两道保险）。
+function reviveAccountDates(a: Account): Account {
+  const revive = (v: unknown): Date | undefined => {
+    if (v instanceof Date) return v
+    if (typeof v === 'string' && v !== '') {
+      const d = new Date(v)
+      return Number.isNaN(d.getTime()) ? undefined : d
+    }
+    return undefined
+  }
+  const cooldownUntil = revive(a.cooldownUntil)
+  const lastUsed = revive(a.lastUsed)
+  if (cooldownUntil !== undefined || lastUsed !== undefined) {
+    return { ...a, ...(cooldownUntil !== undefined ? { cooldownUntil } : {}), ...(lastUsed !== undefined ? { lastUsed } : {}) }
+  }
+  return a
 }
 
 export class SQLiteProviderStore implements ProviderStore {
@@ -366,7 +403,7 @@ export class SQLiteAccountStore implements AccountStore {
     const out: Account[] = []
     for (const r of rows) {
       const a = parseRow<Account>(r.data)
-      if (a) out.push(a)
+      if (a) out.push(reviveAccountDates(a))
     }
     return out
   }
@@ -375,7 +412,8 @@ export class SQLiteAccountStore implements AccountStore {
     const row = this.db.prepare(`SELECT data FROM admin_accounts WHERE id = ?`)
       .get(id) as unknown as { data: string } | undefined
     if (!row) return undefined
-    return parseRow<Account>(row.data)
+    const a = parseRow<Account>(row.data)
+    return a ? reviveAccountDates(a) : undefined
   }
 
   put(a: Account): void {

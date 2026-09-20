@@ -290,3 +290,144 @@ describe('总量口径 = 上游 wire 总量（input + output）', () => {
     await store.close()
   })
 })
+
+describe('缓存语义分流（CACHE-SEMANTICS：sem 列 + inputSideTokens）', () => {
+  // Anthropic 口径实抓形态（zcode sidecar）：input 只含未命中部分，
+  // read 按会话前缀全额报出 → read 常远大于 input。旧实现把这种行当
+  // subset 算，命中率 = read/input 曾飙到 1117%。
+  test('separate 行：总量 = 三桶 + 输出；输入侧 = 三桶之和；命中率 ≤ 1', async () => {
+    const store = await Store.open(join(dir, 'sem-separate.db'))
+    await store.insertLog(log({ requestId: 'a', providerId: 7, providerName: 'zc', modelId: 'm',
+      inputTokens: 952, outputTokens: 963, cacheReadTokens: 52608, sem: 'separate' }))
+    const sum = await store.summarize(new Date(0))
+    // total = 952 + 963 + 52608 = 54523（subset 旧口径只有 1915，漏掉命中）
+    expect(sum.totalTokens).toBe(54523)
+    // 输入侧 = 952 + 52608 = 53560（input 只是未命中部分）
+    expect(sum.inputSideTokens).toBe(53560)
+    const bd = await store.breakdown(new Date(0))
+    expect(bd.totals.cacheHitRate).toBeCloseTo(52608 / 53560)
+    expect(bd.byModel[0]!.cacheHitRate).toBeCloseTo(52608 / 53560)
+    expect(bd.byModel[0]!.inputSideTokens).toBe(53560)
+    await store.close()
+  })
+
+  test('subset 行保持原口径：total = input + output，输入侧 = input', async () => {
+    const store = await Store.open(join(dir, 'sem-subset.db'))
+    await store.insertLog(log({ requestId: 'a', providerId: 5, providerName: 'wb', modelId: 'm',
+      inputTokens: 425, outputTokens: 10, cacheReadTokens: 320, cacheCreationTokens: 105, sem: 'subset' }))
+    const sum = await store.summarize(new Date(0))
+    expect(sum.totalTokens).toBe(435)
+    expect(sum.inputSideTokens).toBe(425)
+    const bd = await store.breakdown(new Date(0))
+    expect(bd.totals.cacheHitRate).toBeCloseTo(320 / 425)
+    await store.close()
+  })
+
+  test('sem 缺省按 subset 算（兼容未带协议的旧调用点）', async () => {
+    const store = await Store.open(join(dir, 'sem-default.db'))
+    await store.insertLog(log({ requestId: 'a', providerId: 7, providerName: 'zc', modelId: 'm',
+      inputTokens: 100, outputTokens: 10, cacheReadTokens: 50 }))
+    const sum = await store.summarize(new Date(0))
+    expect(sum.totalTokens).toBe(110)
+    expect(sum.inputSideTokens).toBe(100)
+    await store.close()
+  })
+
+  test('separate 的 creation 也计入总量与输入侧（三桶互斥）', async () => {
+    const store = await Store.open(join(dir, 'sem-creation.db'))
+    await store.insertLog(log({ requestId: 'a', providerId: 7, providerName: 'zc', modelId: 'm',
+      inputTokens: 100, outputTokens: 10, cacheReadTokens: 300, cacheCreationTokens: 20, sem: 'separate' }))
+    const sum = await store.summarize(new Date(0))
+    expect(sum.totalTokens).toBe(430)
+    expect(sum.inputSideTokens).toBe(420)
+    await store.close()
+  })
+
+  test('混语义聚合：byModel 加合 == totals，各源各算各的口径', async () => {
+    const store = await Store.open(join(dir, 'sem-mixed.db'))
+    // separate 源：read 全额算总量
+    await store.insertLog(log({ requestId: 'a', providerId: 7, providerName: 'zc', modelId: 'm1',
+      inputTokens: 100, outputTokens: 10, cacheReadTokens: 300, sem: 'separate' }))
+    // subset 源：read 是 input 子集，不另加
+    await store.insertLog(log({ requestId: 'b', providerId: 5, providerName: 'wb', modelId: 'm2',
+      inputTokens: 1000, outputTokens: 100, cacheReadTokens: 900, sem: 'subset' }))
+    const bd = await store.breakdown(new Date(0))
+    expect(bd.totals.totalTokens).toBe(410 + 1100)
+    expect(bd.totals.inputSideTokens).toBe(400 + 1000)
+    // 命中率分母含两个源的输入侧，分子 = 两个源的 read
+    expect(bd.totals.cacheHitRate).toBeCloseTo(1200 / 1400)
+    const sumOf = (f: string) => bd.byModel.reduce((acc, m) => acc + ((m as never as Record<string, number>)[f] ?? 0), 0)
+    for (const f of ['requests', 'inputTokens', 'outputTokens', 'cacheReadTokens',
+      'totalTokens', 'inputSideTokens', 'errors']) {
+      expect(sumOf(f), `byModel 的 ${f} 加合应等于 totals.${f}`)
+        .toBe((bd.totals as never as Record<string, number>)[f])
+    }
+    await store.close()
+  })
+
+  test('daily 与 byModel 同口径（separate 天的总量含三桶）', async () => {
+    const store = await Store.open(join(dir, 'sem-daily.db'))
+    await store.insertLog(log({ requestId: 'a', providerId: 7, providerName: 'zc', modelId: 'm',
+      inputTokens: 100, outputTokens: 10, cacheReadTokens: 300, sem: 'separate' }))
+    const bd = await store.breakdown(new Date(0))
+    expect(bd.daily[0]!.totalTokens).toBe(410)
+    expect(bd.daily[0]!.inputSideTokens).toBe(400)
+    await store.close()
+  })
+
+  test('accountBreakdown：separate 账号的总量/输入侧/模型行同口径', async () => {
+    const store = await Store.open(join(dir, 'sem-acct.db'))
+    await store.insertLog(log({ requestId: 'a', providerId: 7, providerName: 'zc', modelId: 'm',
+      inputTokens: 100, outputTokens: 10, cacheReadTokens: 300, sem: 'separate', accountId: 'acc1' }))
+    const rows = await store.accountBreakdown(new Date(0))
+    const acc = rows.find((r) => r.accountId === 'acc1')!
+    expect(acc.totalTokens).toBe(410)
+    expect(acc.inputSideTokens).toBe(400)
+    expect(acc.models[0]!.totalTokens).toBe(410)
+    expect(acc.models[0]!.inputSideTokens).toBe(400)
+    await store.close()
+  })
+
+  test('recent 往返还原 sem', async () => {
+    const store = await Store.open(join(dir, 'sem-roundtrip.db'))
+    await store.insertLog(log({ requestId: 'sep', sem: 'separate' }))
+    await store.insertLog(log({ requestId: 'sub', sem: 'subset' }))
+    const rows = await store.recent(10)
+    expect(rows.find((r) => r.requestId === 'sep')!.sem).toBe('separate')
+    expect(rows.find((r) => r.requestId === 'sub')!.sem).toBe('subset')
+    await store.close()
+  })
+
+  // 回填三段式：协议权威 → read>input 启发式 → 剩余钉 subset。
+  test('backfillSemantics：anthropic 行 separate、openai 行 subset、启发式兜底', async () => {
+    const store = await Store.open(join(dir, 'sem-backfill.db'))
+    // provider 7 = zcode（anthropic-messages），provider 5 = workbuddy（openai-completions）
+    await store.insertLog(log({ requestId: 'a', providerId: 7, providerName: 'zc', modelId: 'm',
+      inputTokens: 952, outputTokens: 10, cacheReadTokens: 52608 }))
+    await store.insertLog(log({ requestId: 'b', providerId: 5, providerName: 'wb', modelId: 'm',
+      inputTokens: 425, outputTokens: 10, cacheReadTokens: 320 }))
+    // 协议查不到的 Provider（已删）：read > input → 启发式判 separate
+    await store.insertLog(log({ requestId: 'c', providerId: 99, providerName: 'gone', modelId: 'm',
+      inputTokens: 100, outputTokens: 10, cacheReadTokens: 5000 }))
+    // 协议查不到且 read ≤ input：钉 subset
+    await store.insertLog(log({ requestId: 'd', providerId: 98, providerName: 'unk', modelId: 'm',
+      inputTokens: 1000, outputTokens: 10, cacheReadTokens: 800 }))
+    await store.close()
+
+    // 直接再打开验证落盘（backfill 由 cli 接线，这里手动调用与 cli 相同逻辑）
+    const store2 = await Store.open(join(dir, 'sem-backfill.db'))
+    const fixed = store2.backfillSemantics((id) =>
+      id === 7 ? 'anthropic-messages' : id === 5 ? 'openai-completions' : undefined)
+    expect(fixed).toBe(4)
+    const rows = await store2.recent(10)
+    const by = (id: string) => rows.find((r) => r.requestId === id)!
+    expect(by('a')!.sem).toBe('separate')
+    expect(by('b')!.sem).toBe('subset')
+    expect(by('c')!.sem).toBe('separate') // 启发式
+    expect(by('d')!.sem).toBe('subset')   // 兜底钉 subset
+    // 幂等：再跑一遍 0 行
+    expect(store2.backfillSemantics((id) =>
+      id === 7 ? 'anthropic-messages' : id === 5 ? 'openai-completions' : undefined)).toBe(0)
+    await store2.close()
+  })
+})

@@ -2,7 +2,11 @@
 // 属性名 = Go json tag，保证 admin API 返回的 JSON 逐字段兼容。
 
 import { readFileSync } from 'node:fs'
-import { validProtocol, type Protocol } from '../ir/index.ts'
+import { normalizeReasoningKey, REASONING_FOLLOW, REASONING_LEVELS, validReasoningLevel, validProtocol, type Protocol } from '../ir/index.ts'
+
+// 档位词汇（REASONING_LEVELS / REASONING_FOLLOW）定义在 ir（应用侧也要用），
+// 这里再导出给 model 层消费者（admin api / 前端文案），避免两侧 import 口径分裂。
+export { REASONING_FOLLOW, REASONING_LEVELS, validReasoningLevel } from '../ir/index.ts'
 
 export type AccessKind = 'official' | 'session-reuse' | 'simulated-login' | 'reverse'
 
@@ -75,11 +79,15 @@ export interface Model {
   input?: string[] // ["text"] 或 ["text","image"]
   api?: Protocol // 覆盖 Provider 级 api（空 = 继承）
   egress?: string // 覆盖 Provider 级出口代理（空 = 继承；EGRESS-SPIKE §7 粒度拍板：精确到模型）
-  // 高档位最低预算：只认 xhigh / max 两键（档位名小写），其他键忽略。
-  // 只托底不封顶——客户端 maxTokens 低于该档下限时抬到下限（防推理吃光预算导致
-  // 截断、无工具）；高于下限或没给值时不动（保持省略语义，不替上游默认档做主）。
-  // 例：{xhigh: 128000, max: 200000}。空/缺省 = 不干预。
-  reasoningMinTokens?: Record<string, number>
+  // 推理等级预设：配了就**强制覆盖**客户端透传的档位（不管上级发的什么，都按这里来）；
+  // 'follow'（跟随上游）= 不覆盖，客户端（上级）发什么档位就用什么。
+  // 空/缺省与 follow 同义。off/none 系 = 强制关闭思考。
+  reasoningEffort?: string
+  // 按档位的推理预算上限（token 数）：键 = 档位名（小写，xhigh/high/…），
+  // 值 = 该档位生效时 maxTokens 的上限。只压不抬——客户端 maxTokens 高于上限时
+  // 压到上限，低于或没给值时不动。按「当前生效档位」查键，与 reasoningEffort
+  // 预设解耦（预设定了 high，就查 high 的键）。例：{"xhigh": 65536, "high": 32768}。
+  reasoningMaxTokens?: Record<string, number>
   // 备注：一句话运维知识（如「23 点后才免费，白天用会扣额度」）。
   // 与 displayName 分工不同——displayName 是"叫什么"，note 是"要注意什么"。
   note?: string
@@ -91,43 +99,58 @@ export function modelEffAPI(m: Model, providerAPI: Protocol): Protocol {
   return m.api ? m.api : providerAPI
 }
 
-// 高档位预算上限：映射值超过即拒绝写入（防手滑多写个 0）。
-export const REASONING_MIN_TOKENS_MAX = 200000
+// 推理预算键长度上限：防把整段配置粘进档位名（档位是短词，正常最长 'minimal'）。
+export const REASONING_KEY_MAX_LEN = 32
 
-// 只认 xhigh / max 两档（大小写不敏感），其他档位一律不触发。
-export function reasoningFloorFor(effort: string | undefined, m: Model | undefined): number | undefined {
-  const eff = (effort ?? '').trim().toLowerCase()
-  if (eff !== 'xhigh' && eff !== 'max') return undefined
-  const floor = m?.reasoningMinTokens?.[eff]
-  if (floor === undefined || floor <= 0) return undefined
-  return floor
+// 推理等级预设应用到待发请求：
+//   · 预设为 follow（跟随上游）或缺省 → 档位原样透传（客户端没带就不凭空注入）；
+//   · 预设为具体档位 → 强制覆盖客户端档位，并清掉客户端带的 budget——否则
+//     Anthropic 出站优先走旧式 budget，预设会被静默架空。
+// 无需覆盖时返回原引用（便于调用方判定「没动过」）。
+export function applyReasoningPreset<T extends { reasoningEffort?: string; thinkingBudget?: number }>(
+  req: T, m: Model | undefined,
+): T {
+  const preset = normalizeReasoningKey(m?.reasoningEffort)
+  if (preset === undefined || preset === REASONING_FOLLOW) return req
+  // 档位相同且 budget 缺省：真·没动过，返回原引用（调用方的 [effort] 日志据此判定）。
+  if (normalizeReasoningKey(req.reasoningEffort) === preset && req.thinkingBudget === undefined) return req
+  return { ...req, reasoningEffort: preset, thinkingBudget: undefined }
 }
 
-// 高档位最低预算收敛：对象形态，键收小写、值须为 (0, 200000] 的正整数。
-// 非 xhigh/max 的键保留（写入时不拦，应用时忽略）；空/非法返回 undefined。
-export function sanitizeReasoningMinTokens(v: unknown): Record<string, number> | undefined {
+// 按档位预算收敛：对象形态，键收小写、值须为正整数（无上限——上游自己有硬顶，
+// 用户写多大是自己的判断，超出由上游报错并按事实归因）。空/非法返回 undefined。
+export function sanitizeReasoningMaxTokens(v: unknown): Record<string, number> | undefined {
   if (v === null || typeof v !== 'object' || Array.isArray(v)) return undefined
   const out: Record<string, number> = {}
   for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
-    const key = k.trim().toLowerCase()
-    if (key === '' || key.length > 32) return undefined
-    if (typeof val !== 'number' || !Number.isSafeInteger(val) || val <= 0 || val > REASONING_MIN_TOKENS_MAX) return undefined
+    const key = normalizeReasoningKey(k)
+    if (key === undefined || key.length > REASONING_KEY_MAX_LEN) return undefined
+    if (typeof val !== 'number' || !Number.isSafeInteger(val) || val <= 0) return undefined
     out[key] = val
   }
   return Object.keys(out).length > 0 ? out : undefined
 }
 
-// 高档位最低预算应用到待发请求（只托底）：生效档位是 xhigh/max 之一、
-// 映射里有下限、且客户端给了正值 maxTokens 但低于下限时，抬到下限。
-// 高于下限、没给值、无映射，一律原样返回（同一引用，便于调用方判定“没动过”）。
-export function applyReasoningFloor<T extends { reasoningEffort?: string; maxTokens?: number }>(
+// 生效档位的预算上限：档位取自**实际生效**的档位（覆盖后的），键不限定具体档位集合。
+// 没配映射 / 键没命中 / 值非法 → undefined（不干预）。
+export function reasoningCapFor(effort: string | undefined, m: Model | undefined): number | undefined {
+  const eff = normalizeReasoningKey(effort)
+  if (eff === undefined) return undefined
+  const cap = m?.reasoningMaxTokens?.[eff]
+  if (cap === undefined || cap <= 0) return undefined
+  return cap
+}
+
+// 档位预算上限应用到待发请求（只压不抬）：生效档位在映射里有上限、且客户端给了
+// 正值 maxTokens 高于上限时，压到上限；低于上限、没给值、无映射一律原样返回。
+export function applyReasoningCap<T extends { reasoningEffort?: string; maxTokens?: number }>(
   req: T, m: Model | undefined,
 ): T {
-  const floor = reasoningFloorFor(req.reasoningEffort, m)
-  if (floor === undefined) return req
+  const cap = reasoningCapFor(req.reasoningEffort, m)
+  if (cap === undefined) return req
   if (req.maxTokens === undefined || req.maxTokens === 0) return req
-  if (req.maxTokens >= floor) return req
-  return { ...req, maxTokens: floor }
+  if (req.maxTokens <= cap) return req
+  return { ...req, maxTokens: cap }
 }
 
 export function supportsImage(m: Model): boolean {
@@ -221,8 +244,13 @@ export function providerValidate(p: Provider): string | undefined {
   }
   if (!p.baseUrl) return `provider ${p.name}: base_url 不能为空`
   for (const m of p.models ?? []) {
-    if (m.reasoningMinTokens !== undefined && sanitizeReasoningMinTokens(m.reasoningMinTokens) === undefined) {
-      return `provider ${p.name} 模型 ${m.id}: reasoning_min_tokens 非法（须为{"xhigh"|"max": 1-${REASONING_MIN_TOKENS_MAX} 的正整数}，如 {"xhigh": 128000}）`
+    if (m.reasoningEffort !== undefined && m.reasoningEffort.trim() !== '' && !validReasoningLevel(m.reasoningEffort)) {
+      return `provider ${p.name} 模型 ${m.id}: reasoning_effort "${m.reasoningEffort}" 非法`
+        + `（允许 ${REASONING_LEVELS.join(' / ')}，follow = 跟随上游，留空同义）`
+    }
+    if (m.reasoningMaxTokens !== undefined && sanitizeReasoningMaxTokens(m.reasoningMaxTokens) === undefined) {
+      return `provider ${p.name} 模型 ${m.id}: reasoning_max_tokens 非法`
+        + `（须为 {"档位": 正整数预算}，如 {"xhigh": 65536}）`
     }
   }
   if (p.dynamicHeaders) {
@@ -273,8 +301,18 @@ export interface Account {
 
 // 冷却到期自动复位（不回写，读取时判定）。
 // exhausted 不在此列：额度用尽不会自己好，只认「重置」或一次成功的测试。
+//
+// 到期比较必须数值化：cooldownUntil 类型上是 Date，但 JSON round-trip 后
+// 可能是 string（持久层 reviveAccountDates 兜不住的旁路构造场景）。裸写
+// `now > a.cooldownUntil` 是 Date > string，恒为 false——冷却永不解除
+// （扫描实证的真实缺陷：账号限流一次、网关重启后永久停在 cooldown）。
 export function accountEffectiveStatus(a: Account, now: Date): AccountStatus {
-  if (a.status === 'cooldown' && a.cooldownUntil && now > a.cooldownUntil) return 'available'
+  const until = a.cooldownUntil
+  if (a.status === 'cooldown' && until) {
+    const ms = until instanceof Date ? until.getTime() : new Date(until).getTime()
+    if (ms > now.getTime()) return a.status
+    return 'available'
+  }
   return a.status
 }
 
@@ -323,6 +361,11 @@ export interface UsageLog {
   nodeId?: string
   stream: boolean
   firstTokenMs?: number
+  // 缓存语义（CACHE-SEMANTICS）：该行三桶（input/read/creation）的计量关系，
+  // 聚合层分流公式的唯一依据。'subset' = OpenAI 系（prompt_tokens 已含 cached
+  // 全量）；'separate' = Anthropic 系（input 只算未命中部分，三桶互斥）。
+  // 可选，缺省按 subset 处理（历史行由 store.backfillSemantics 回填）。
+  sem?: 'subset' | 'separate'
 }
 
 // ---- 免费档启发式 ----

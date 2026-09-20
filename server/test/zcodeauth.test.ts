@@ -108,6 +108,20 @@ describe('PollFlow', () => {
     expect(sess.code).toBe('CB1')
   })
 
+  test('上游 502（HTML 错误页）→ 报 HTTP 状态而不是"响应非 JSON"', async () => {
+    // 真实缺陷（扫描实证）：pollOnce 不查 HTTP 状态，WAF/网关返回 502 的 HTML
+    // 错误页时，用户看到「响应非 JSON: Unexpected token '<'」——被引导去查
+    // JSON 解析，真实原因（HTTP 502）不可诊断。
+    const c = new Client('https://token.test', '', fakeFetch({
+      '/api/v1/oauth/cli/poll/f1': () => new Response('<html>502 Bad Gateway</html>', { status: 502 }),
+    }))
+    await expect(c.pollFlow(flowOf(), 10_000)).rejects.toThrow(/http 502/)
+    // 且错误消息不再是误导性的"响应非 JSON"
+    const err = await c.pollFlow(flowOf(), 10_000).catch((e: Error) => e.message)
+    expect(err).not.toContain('响应非 JSON')
+    expect(err).toContain('502')
+  })
+
   test('超时报错且不等待过久', async () => {
     const c = new Client('https://token.test', '', fakeFetch({
       '/api/v1/oauth/cli/poll/f1': () => json({ code: 0, data: { status: 'pending' } }),

@@ -7,7 +7,8 @@
       "inputTokens": 12,
       "outputTokens": 0,
       "cacheReadTokens": 8,
-      "accuracy": "exact"
+      "accuracy": "exact",
+      "sem": "separate"
     }
   },
   {
@@ -38,7 +39,8 @@
     "stopReason": "end_turn",
     "usage": {
       "outputTokens": 2,
-      "accuracy": "exact"
+      "accuracy": "exact",
+      "sem": "separate"
     }
   },
   {

@@ -1,5 +1,6 @@
 <script setup>
 import { ref, computed, watch, nextTick, onMounted, onUnmounted, onBeforeUnmount } from 'vue'
+import { denomOf } from '../mergeGroups'
 import { ElMessage } from 'element-plus'
 import { api } from '../api.js'
 import { shareOf, shareTitle } from '../share'
@@ -331,9 +332,12 @@ onUnmounted(() => clearTimeout(copyTimer))
 
 const totals = computed(() => (attrBd.value && attrBd.value.totals) || {})
 
-// 总输入 = input_tokens 本身（OpenAI 系 prompt_tokens 已含 cached 全量）。
+// 总输入 = 输入侧总量（后端下发的 inputSideTokens，CACHE-SEMANTICS 口径）：
+// OpenAI 系 prompt 已含 cached → 等于 input；anthropic 系 input 只含未命中
+// → 三桶之和。缺字段的旧数据回退到 inputTokens。
 // 分子是「缓存读取」——与后端 hitRate 同源，卡片的分子/分母直接显示这两个数。
-const billedInput = computed(() => (totals.value.inputTokens || 0))
+const billedInput = computed(() =>
+  (totals.value.inputSideTokens ?? totals.value.inputTokens) || 0)
 
 // 缓存写入（cache_creation）不展示：只有 anthropic-messages 上游会报这个字段，
 // OpenAI 系（zen/workbuddy）只有 cached_tokens，绝大多数上游恒 0 = 「上游没给」
@@ -347,13 +351,9 @@ function failClass(rate) {
 }
 // byModel：按 providerName+modelId 合并（后端 GROUP BY 同口径，这里兜一层）。
 const FIELDS = ['requests', 'inputTokens', 'outputTokens', 'cacheReadTokens',
-  'cacheCreationTokens', 'reasoningTokens', 'totalTokens', 'errors']
-// 由「后端算好的命中率」反推该行的分母（命中数 / 命中率）。
-// 这样前端不必区分上游语义，也不会用错公式重算。
-function denomOf(r) {
-  const rate = r.cacheHitRate
-  return (rate != null && rate > 0) ? (r.cacheReadTokens || 0) / rate : 0
-}
+  'cacheCreationTokens', 'reasoningTokens', 'totalTokens', 'errors', 'inputSideTokens']
+// denomOf 已上移到 mergeGroups.ts（与该处导出原是两份逐字重复的公式，
+// 口径迟早漂移）——此处直接 import 使用。
 const byModel = computed(() => {
   const merged = new Map()
   for (const m of (attrBd.value && attrBd.value.byModel) || []) {
@@ -370,15 +370,15 @@ const byModel = computed(() => {
         acc[f] = wa + wb > 0 ? ((a ?? 0) * wa + (b ?? 0) * wb) / (wa + wb) : null
       }
       acc.sampled = (acc.sampled || 0) + (m.sampled || 0)
-      // 命中率不能平均（各行权重不同）：按后端算出的率反推各自分母再加总，
+      // 命中率不能平均（各行权重不同）：按各自分母（输入侧）加总再重算，
       // 维持「命中数 / 输入侧」口径。（仅同 provider 同 model 跨来源时走到这里）
       acc._num = (acc._num ?? acc.cacheReadTokens ?? 0) + (m.cacheReadTokens || 0)
       acc._denom = (acc._denom ?? denomOf(acc)) + denomOf(m)
     }
   }
-  // 命中率由后端算好（cacheHitRate = cacheRead / input，见 usage/store.ts hitRate）：
+  // 命中率由后端算好（cacheHitRate = 缓存读取 / 输入侧，见 usage/store.ts）：
   // 前端不再自行用单一公式重算（那正是之前的错误来源）。
-  // 只有发生合并（_denom 被写入）的行才需要按反推的分母重算。
+  // 只有发生合并（_denom 被写入）的行才需要按分母重算。
   for (const m of merged.values()) {
     if (m._denom !== undefined) {
       m.cacheHitRate = m._denom > 0 ? m._num / m._denom : null
@@ -429,7 +429,7 @@ const modelRows = computed(() => {
     if (!row) {
       row = { modelId: k, _members: [], requests: 0, inputTokens: 0, outputTokens: 0,
         cacheReadTokens: 0, cacheCreationTokens: 0, reasoningTokens: 0,
-        totalTokens: 0, errors: 0, sampled: 0, _tpsWeighted: 0, _ttftWeighted: 0,
+        totalTokens: 0, errors: 0, inputSideTokens: 0, sampled: 0, _tpsWeighted: 0, _ttftWeighted: 0,
         _num: 0, _denom: 0 }
       acc.set(k, row)
     }
@@ -771,7 +771,7 @@ function ttftText(m) {
               </div>
             </td>
             <td class="n num">{{ fmt(r.requests) }}</td>
-            <td class="n num">{{ fmt(r.inputTokens) }}</td>
+            <td class="n num">{{ fmt(r.inputSideTokens || r.inputTokens) }}</td>
             <td class="n num">{{ fmt(r.outputTokens) }}</td>
             <td class="n num" :class="{ dim: !r.sampled }">{{ tpsText(r) }}</td>
             <td class="n num">{{ fmt(r.cacheReadTokens) }}</td>
@@ -791,7 +791,7 @@ function ttftText(m) {
               </div>
             </td>
             <td class="n num">{{ fmt(sub.requests) }}</td>
-            <td class="n num">{{ fmt(sub.inputTokens) }}</td>
+            <td class="n num">{{ fmt(sub.inputSideTokens || sub.inputTokens) }}</td>
             <td class="n num">{{ fmt(sub.outputTokens) }}</td>
             <td class="n num" :class="{ dim: sub.sampled === 0 }">{{ tpsText(sub) }}</td>
             <td class="n num">{{ fmt(sub.cacheReadTokens) }}</td>
@@ -839,12 +839,12 @@ function ttftText(m) {
             </template>
           </td>
           <td class="n num">{{ fmt(m.requests) }}</td>
-          <td class="n num">{{ fmt(m.inputTokens) }}</td>
+          <td class="n num">{{ fmt(m.inputSideTokens || m.inputTokens) }}</td>
           <td class="n num">{{ fmt(m.outputTokens) }}</td>
           <!-- TPS/TTFT 成对展示（DSH 口径）；sampled=0 显示 —，缺数据不产出 0.0 -->
           <td class="n num" :class="{ dim: m.sampled === 0 }">{{ tpsText(m) }}</td>
           <td class="n num">{{ fmt(m.cacheReadTokens) }}</td>
-          <!-- 命中率：后端下发的 cacheHitRate（缓存读取 / 总输入，见 usage/store.ts hitRate）；无输入显示 — -->
+          <!-- 命中率：后端下发的 cacheHitRate（缓存读取 / 输入侧，见 usage/store.ts）；无输入显示 — -->
           <td class="n num" :class="{ dim: m.cacheHitRate == null }">
             {{ m.cacheHitRate == null ? '—' : pct(m.cacheHitRate) }}
           </td>
@@ -864,7 +864,7 @@ function ttftText(m) {
             </div>
           </td>
           <td class="n num">{{ fmt(sub.requests) }}</td>
-          <td class="n num">{{ fmt(sub.inputTokens) }}</td>
+          <td class="n num">{{ fmt(sub.inputSideTokens || sub.inputTokens) }}</td>
           <td class="n num">{{ fmt(sub.outputTokens) }}</td>
           <td class="n num" :class="{ dim: sub.sampled === 0 }">{{ tpsText(sub) }}</td>
           <td class="n num">{{ fmt(sub.cacheReadTokens) }}</td>

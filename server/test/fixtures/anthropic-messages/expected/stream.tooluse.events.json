@@ -6,7 +6,8 @@
     "usage": {
       "inputTokens": 20,
       "outputTokens": 0,
-      "accuracy": "exact"
+      "accuracy": "exact",
+      "sem": "separate"
     }
   },
   {
@@ -59,7 +60,8 @@
     "stopReason": "tool_use",
     "usage": {
       "outputTokens": 30,
-      "accuracy": "exact"
+      "accuracy": "exact",
+      "sem": "separate"
     }
   },
   {

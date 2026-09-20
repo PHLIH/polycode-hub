@@ -19,6 +19,7 @@
   "usage": {
     "inputTokens": 20,
     "outputTokens": 40,
-    "accuracy": "exact"
+    "accuracy": "exact",
+    "sem": "separate"
   }
 }

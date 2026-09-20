@@ -41,9 +41,13 @@ function parseModel(v: unknown): Model | undefined {
   if (typeof v.displayName === 'string') m.displayName = v.displayName
   if (typeof v.note === 'string' && v.note !== '') m.note = v.note
   if (typeof v.egress === 'string' && v.egress !== '') m.egress = v.egress
-  // 高档位下限非法值原样保留，由 providerValidate 点名报错。
-  if (v.reasoningMinTokens !== undefined && v.reasoningMinTokens !== null && typeof v.reasoningMinTokens === 'object' && !Array.isArray(v.reasoningMinTokens)) {
-    m.reasoningMinTokens = { ...(v.reasoningMinTokens as Record<string, number>) }
+  // 推理等级预设只收敛大小写：非法值原样保留，由 providerValidate 点名报错，不静默吞掉。
+  if (typeof v.reasoningEffort === 'string' && v.reasoningEffort.trim() !== '') {
+    m.reasoningEffort = v.reasoningEffort.trim().toLowerCase()
+  }
+  // 档位预算上限非法值原样保留，由 providerValidate 点名报错。
+  if (v.reasoningMaxTokens !== undefined && v.reasoningMaxTokens !== null && typeof v.reasoningMaxTokens === 'object' && !Array.isArray(v.reasoningMaxTokens)) {
+    m.reasoningMaxTokens = { ...(v.reasoningMaxTokens as Record<string, number>) }
   }
   if (typeof v.contextWindow === 'number') m.contextWindow = v.contextWindow
   if (typeof v.maxOutputTokens === 'number') m.maxOutputTokens = v.maxOutputTokens
@@ -75,6 +79,11 @@ export function parseProvider(raw: unknown): Provider {
   }
   if (typeof o.riskNote === 'string') p.riskNote = o.riskNote
   if (typeof o.probeModel === 'string') p.probeModel = o.probeModel
+  // egress 必须在新建路径也收：前端「新建 Provider」表单有出口代理下拉并发送
+  // egress 字段，此前 parseProvider 不收敛它——新建时选的出口被静默丢弃
+  // （编辑路径走 PATCH 白名单，白名单里有 egress，所以只有新建坏）。
+  // 空串 = 继承 Provider 级/直连，是合法值，故不用 !== '' 过滤。
+  if (typeof o.egress === 'string') p.egress = o.egress
   if (o.streamOnly === true) p.streamOnly = true
   const tags = strArr(o.tags)
   if (tags) p.tags = tags

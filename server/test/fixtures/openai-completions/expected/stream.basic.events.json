@@ -35,7 +35,8 @@
       "inputTokens": 12,
       "outputTokens": 2,
       "cacheReadTokens": 8,
-      "accuracy": "exact"
+      "accuracy": "exact",
+      "sem": "subset"
     }
   },
   {

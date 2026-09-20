@@ -29,6 +29,9 @@ export type InstallJobView = InstallJobLike
 export interface SidecarView {
   running: boolean
   status: string
+  // probe 是三态探活结果：up=可用 / hung=端口在监听但不响应（卡死）/
+  // down=没启动。卡死时「启动」必然被端口拦下，必须先「停止」。
+  probe?: 'up' | 'hung' | 'down'
   installed: boolean
   port: string
   workDir: string

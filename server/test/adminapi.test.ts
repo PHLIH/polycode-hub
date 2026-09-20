@@ -68,6 +68,7 @@ const stubStats: StatsSource = {
     totals: {
       requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
       cacheCreationTokens: 0, reasoningTokens: 0, totalTokens: 0, errors: 0, cacheHitRate: 0,
+      inputSideTokens: 0,
     },
     daily: [], byModel: [],
   }),
@@ -355,6 +356,23 @@ describe('providers CRUD（对齐 Go TestProviderCRUD/PatchReadonly/Validation�
     expect((await call('DELETE', `/admin/api/providers/${p.providerId}/purge`, { key: 'secret' })).status).toBe(404)
     // 非法 pid → 404（与其余 :pid 路由同口径）
     expect((await call('DELETE', '/admin/api/providers/abc/purge', { key: 'secret' })).status).toBe(404)
+  })
+
+  test('新建 Provider 携带 egress → 被保存（不被静默丢弃）', async () => {
+    // 回归：前端「新建 Provider」表单发送 egress 字段，parseProvider 此前不收敛
+    // 它——新建时选的出口代理静默丢失（编辑路径走 PATCH 白名单，只有新建坏）。
+    const call = caller(build({ egresses: [{ id: 'eg1', kind: 'http', addr: 'http://127.0.0.1:7890' }] }))
+    const res = await call('POST', '/admin/api/providers', {
+      key: 'secret',
+      body: { ...providerBody, egress: 'eg1' },
+    })
+    expect(res.status).toBe(201)
+    const p = await res.json() as Provider
+    expect(p.egress).toBe('eg1')
+    // 列表里读回也是 egress（落库而非只在响应里）
+    const list = await call('GET', '/admin/api/providers', { key: 'secret' })
+    const rows = (await list.json() as { providers: Provider[] }).providers
+    expect(rows.find((x) => x.providerId === p.providerId)?.egress).toBe('eg1')
   })
 
   test('重名规则：与 deleted 同名可复用（拿到新 providerId）', async () => {
@@ -2195,7 +2213,48 @@ describe('PUT /admin/api/providers/:pid/models/:model/note（模型备注）', (
   })
 })
 
-describe('PUT /admin/api/providers/:pid/models/:model/reasoning-min-tokens（高档位最低预算）', () => {
+describe('PUT /admin/api/providers/:pid/models/:model/reasoning-effort（推理等级预设）', () => {
+  function mk() {
+    const p = mkProviderFixed({
+      name: 'pz', api: 'anthropic-messages',
+      models: [{ id: 'm1', manual: false, enabled: true }],
+    })
+    p.models = p.models.map((m) => ({ ...m, providerId: p.providerId }))
+    return p
+  }
+
+  test('写入/大小写收敛/follow 与空串清掉；非法档位 400', async () => {
+    const pz = mk()
+    const call = caller(build({ providers: [pz] }))
+    const url = `/admin/api/providers/${pz.providerId}/models/m1/reasoning-effort`
+    const set = await call('PUT', url, { key: 'secret', body: { reasoningEffort: ' HIGH ' } })
+    expect(set.status).toBe(200)
+    expect(((await set.json()) as { reasoningEffort?: string }).reasoningEffort).toBe('high')
+
+    // follow = 跟随上游：不落字段（与空串同义）
+    expect((await call('PUT', url, { key: 'secret', body: { reasoningEffort: 'follow' } })).status).toBe(200)
+    let list = await (await call('GET', '/admin/api/providers', { key: 'secret' })).json() as { providers: Provider[] }
+    expect(list.providers[0]!.models[0]!.reasoningEffort).toBeUndefined()
+
+    expect((await call('PUT', url, { key: 'secret', body: { reasoningEffort: '' } })).status).toBe(200)
+    expect((await call('PUT', url, { key: 'secret', body: { reasoningEffort: 'ultra' } })).status).toBe(400)
+    expect((await call('PUT', url, { key: 'secret', body: {} })).status).toBe(400)
+
+    // 写一个具体档位，后续清空测试用
+    await call('PUT', url, { key: 'secret', body: { reasoningEffort: 'xhigh' } })
+    list = await (await call('GET', '/admin/api/providers', { key: 'secret' })).json() as { providers: Provider[] }
+    expect(list.providers[0]!.models[0]!.reasoningEffort).toBe('xhigh')
+
+    expect((await call('PUT', `/admin/api/providers/${pz.providerId}/models/nope/reasoning-effort`, {
+      key: 'secret', body: { reasoningEffort: 'high' },
+    })).status).toBe(404)
+    expect((await call('PUT', '/admin/api/providers/99999/models/m1/reasoning-effort', {
+      key: 'secret', body: { reasoningEffort: 'high' },
+    })).status).toBe(404)
+  })
+})
+
+describe('PUT /admin/api/providers/:pid/models/:model/reasoning-max-tokens（按档位预算上限）', () => {
   function mk() {
     const p = mkProviderFixed({
       name: 'pz', api: 'anthropic-messages',
@@ -2208,50 +2267,50 @@ describe('PUT /admin/api/providers/:pid/models/:model/reasoning-min-tokens（高
   test('写入/键收小写/清空；{} = 删掉整张映射', async () => {
     const pz = mk()
     const call = caller(build({ providers: [pz] }))
-    const set = await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/reasoning-min-tokens`, {
-      key: 'secret', body: { reasoningMinTokens: { XHIGH: 128000, max: 200000 } },
+    const set = await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/reasoning-max-tokens`, {
+      key: 'secret', body: { reasoningMaxTokens: { XHIGH: 65536, max: 1000000 } },
     })
     expect(set.status).toBe(200)
-    expect(((await set.json()) as { reasoningMinTokens?: Record<string, number> }).reasoningMinTokens)
-      .toEqual({ xhigh: 128000, max: 200000 })
+    expect(((await set.json()) as { reasoningMaxTokens?: Record<string, number> }).reasoningMaxTokens)
+      .toEqual({ xhigh: 65536, max: 1000000 })
 
     const list = await (await call('GET', '/admin/api/providers', { key: 'secret' })).json() as { providers: Provider[] }
-    expect(list.providers[0]!.models[0]!.reasoningMinTokens).toEqual({ xhigh: 128000, max: 200000 })
+    expect(list.providers[0]!.models[0]!.reasoningMaxTokens).toEqual({ xhigh: 65536, max: 1000000 })
 
-    const clear = await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/reasoning-min-tokens`, {
-      key: 'secret', body: { reasoningMinTokens: {} },
+    const clear = await call('PUT', `/admin/api/providers/${pz.providerId}/models/m1/reasoning-max-tokens`, {
+      key: 'secret', body: { reasoningMaxTokens: {} },
     })
     expect(clear.status).toBe(200)
     const after = await (await call('GET', '/admin/api/providers', { key: 'secret' })).json() as { providers: Provider[] }
-    expect(after.providers[0]!.models[0]!.reasoningMinTokens).toBeUndefined()
+    expect(after.providers[0]!.models[0]!.reasoningMaxTokens).toBeUndefined()
   })
 
-  test('非法映射 400（含超 20w 上限）；未知模型/provider 404', async () => {
+  test('非法映射 400（值须正整数，无 20w 上限）；未知模型/provider 404', async () => {
     const pz = mk()
     const call = caller(build({ providers: [pz] }))
-    const url = `/admin/api/providers/${pz.providerId}/models/m1/reasoning-min-tokens`
-    expect((await call('PUT', url, { key: 'secret', body: { reasoningMinTokens: { xhigh: 0 } } })).status).toBe(400)
-    expect((await call('PUT', url, { key: 'secret', body: { reasoningMinTokens: { xhigh: 200001 } } })).status).toBe(400)
-    expect((await call('PUT', url, { key: 'secret', body: { reasoningMinTokens: { xhigh: '8000' } } })).status).toBe(400)
-    expect((await call('PUT', url, { key: 'secret', body: { reasoningMinTokens: [1] } })).status).toBe(400)
+    const url = `/admin/api/providers/${pz.providerId}/models/m1/reasoning-max-tokens`
+    expect((await call('PUT', url, { key: 'secret', body: { reasoningMaxTokens: { xhigh: 0 } } })).status).toBe(400)
+    expect((await call('PUT', url, { key: 'secret', body: { reasoningMaxTokens: { xhigh: '8000' } } })).status).toBe(400)
+    expect((await call('PUT', url, { key: 'secret', body: { reasoningMaxTokens: [1] } })).status).toBe(400)
+    expect((await call('PUT', url, { key: 'secret', body: { reasoningMaxTokens: { xhigh: 99999999 } } })).status).toBe(200) // 无上限
     expect((await call('PUT', url, { key: 'secret', body: {} })).status).toBe(200) // 缺字段 = 清空
     // 非对象请求体必须 400 且不能清空已有映射（fail-closed，防一次坏请求删整张表）
     {
       const seed = mk()
-      seed.models[0]!.reasoningMinTokens = { xhigh: 128000 }
+      seed.models[0]!.reasoningMaxTokens = { xhigh: 65536 }
       const raw = caller(build({ providers: [seed] }))
-      const u2 = `/admin/api/providers/${seed.providerId}/models/m1/reasoning-min-tokens`
+      const u2 = `/admin/api/providers/${seed.providerId}/models/m1/reasoning-max-tokens`
       expect((await raw('PUT', u2, { key: 'secret', body: [1] })).status).toBe(400)
       expect((await raw('PUT', u2, { key: 'secret', body: 'oops' })).status).toBe(400)
       expect((await raw('PUT', u2, { key: 'secret' })).status).toBe(400) // 无 body
       const kept = await (await raw('GET', '/admin/api/providers', { key: 'secret' })).json() as { providers: Provider[] }
-      expect(kept.providers[0]!.models[0]!.reasoningMinTokens).toEqual({ xhigh: 128000 })
+      expect(kept.providers[0]!.models[0]!.reasoningMaxTokens).toEqual({ xhigh: 65536 })
     }
-    expect((await call('PUT', `/admin/api/providers/${pz.providerId}/models/nope/reasoning-min-tokens`, {
-      key: 'secret', body: { reasoningMinTokens: { xhigh: 8000 } },
+    expect((await call('PUT', `/admin/api/providers/${pz.providerId}/models/nope/reasoning-max-tokens`, {
+      key: 'secret', body: { reasoningMaxTokens: { xhigh: 8000 } },
     })).status).toBe(404)
-    expect((await call('PUT', '/admin/api/providers/99999/models/m1/reasoning-min-tokens', {
-      key: 'secret', body: { reasoningMinTokens: { xhigh: 8000 } },
+    expect((await call('PUT', '/admin/api/providers/99999/models/m1/reasoning-max-tokens', {
+      key: 'secret', body: { reasoningMaxTokens: { xhigh: 8000 } },
     })).status).toBe(404)
   })
 })

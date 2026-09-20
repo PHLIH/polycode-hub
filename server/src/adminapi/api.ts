@@ -8,9 +8,9 @@ import { timingSafeEqual } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { posix } from 'node:path'
 import { writeFile0600 } from './credential_file.ts'
-import { ERR, validProtocol } from '../ir/index.ts'
+import { ERR, validProtocol, REASONING_LEVELS, validReasoningLevel } from '../ir/index.ts'
 import {
-  providerValidate, accountHealth, validAccessKind, validRisk, sanitizeReasoningMinTokens,
+  providerValidate, accountHealth, validAccessKind, validRisk, sanitizeReasoningMaxTokens,
   credentialResolve, forgetProtocol,
   workBuddyRealmOfBaseUrl, workBuddyRealmOfToken, workBuddyRealmLabel,
   WB_CLIENT_VERSION,
@@ -1046,10 +1046,39 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     return ok(c, 200, m)
   })
 
-  // 高档位最低预算（只管 xhigh/max）：{"reasoningMinTokens": {"xhigh": 128000}}。
-  // 只托底不封顶（见 model.applyReasoningFloor）；空对象/缺字段 = 清掉整张映射。
-  // 值域 (0, 200000]，超限 400。
-  app.put('/admin/api/providers/:pid/models/:model/reasoning-min-tokens', async (c) => {
+  // 模型推理等级预设（强制覆盖语义）：{"reasoningEffort": "high"} 配上就听模型的，
+  // 不管上级（客户端）发的什么档位都按这里来；'follow'（跟随上游）与空串 = 不覆盖，
+  // 上级发什么档位就用什么（上级没发就不注入）。
+  app.put('/admin/api/providers/:pid/models/:model/reasoning-effort', async (c) => {
+    const raw = c.req.param('pid')
+    const pid = parsePid(raw)
+    const modelID = c.req.param('model')
+    const p = pid === undefined ? undefined : providers.get(pid)
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
+    const body = await jsonBody(c)
+    if (!isObj(body) || typeof body.reasoningEffort !== 'string') {
+      return errRes(c, 400, ERR.INVALID_REQUEST,
+        `请求体须为 {"reasoningEffort": string}（${REASONING_LEVELS.join(' / ')}；follow 或空串 = 跟随上游）`)
+    }
+    const effort = body.reasoningEffort.trim().toLowerCase()
+    if (effort !== '' && !validReasoningLevel(effort)) {
+      return errRes(c, 400, ERR.INVALID_REQUEST,
+        `reasoningEffort 只允许 ${REASONING_LEVELS.join(' / ')}，或空串表示跟随上游`)
+    }
+    const m = p.models.find((x) => x.id === modelID)
+    if (!m) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 下没有模型 ${modelID}`)
+    if (effort === '' || effort === 'follow') delete m.reasoningEffort
+    else m.reasoningEffort = effort
+    providers.put(p)
+    changed()
+    return ok(c, 200, m)
+  })
+
+  // 按档位的推理预算上限：{"reasoningMaxTokens": {"xhigh": 65536}}。
+  // 只压不抬（见 model.applyReasoningCap）——生效档位命中键且客户端 maxTokens
+  // 高于上限时压到上限；空对象/缺字段 = 清掉整张映射。值须为正整数，无上限
+  // （上游有硬顶，写多大由用户自己判断，超出由上游报错并按事实归因）。
+  app.put('/admin/api/providers/:pid/models/:model/reasoning-max-tokens', async (c) => {
     const raw = c.req.param('pid')
     const pid = parsePid(raw)
     const modelID = c.req.param('model')
@@ -1057,20 +1086,20 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
     const body = await jsonBody(c)
     if (!isObj(body)) return errRes(c, 400, ERR.INVALID_REQUEST, '请求体不是合法 JSON')
-    const v = body.reasoningMinTokens
+    const v = body.reasoningMaxTokens
     if (v !== undefined && (v === null || typeof v !== 'object' || Array.isArray(v))) {
-      return errRes(c, 400, ERR.INVALID_REQUEST, '请求体须为 {"reasoningMinTokens": {"xhigh"|"max": 正整数预算}}（{} = 清掉映射）')
+      return errRes(c, 400, ERR.INVALID_REQUEST, '请求体须为 {"reasoningMaxTokens": {"档位": 正整数预算}}（{} = 清掉映射）')
     }
     const m = p.models.find((x) => x.id === modelID)
     if (!m) return errRes(c, 404, ERR.NOT_FOUND, `provider #${c.req.param('pid')} 下没有模型 ${modelID}`)
     if (v === undefined || Object.keys(v as Record<string, unknown>).length === 0) {
-      delete m.reasoningMinTokens
+      delete m.reasoningMaxTokens
     } else {
-      const clean = sanitizeReasoningMinTokens(v)
+      const clean = sanitizeReasoningMaxTokens(v)
       if (clean === undefined) {
-        return errRes(c, 400, ERR.INVALID_REQUEST, 'reasoningMinTokens 非法：键须为非空短档位名，值须为 1-200000 的正整数（如 {"xhigh": 128000}）')
+        return errRes(c, 400, ERR.INVALID_REQUEST, 'reasoningMaxTokens 非法：键须为非空短档位名，值须为正整数（如 {"xhigh": 65536}）')
       }
-      m.reasoningMinTokens = clean
+      m.reasoningMaxTokens = clean
     }
     providers.put(p)
     changed()

@@ -14,7 +14,7 @@ import { Proxy } from './gateway/proxy.ts'
 import { Probe } from './gateway/probe.ts'
 import { AccountPool } from './pool/account.ts'
 import type { Account, Provider } from './model/index.ts'
-import { Store as UsageStore } from './usage/store.ts'
+import { Store as UsageStore, backfillSemantics } from './usage/store.ts'
 import {
   SQLiteEgressStore, SQLiteProviderStore, SQLiteAccountStore,
   seedProvidersIfEmpty, seedAccountsIfEmpty, migrateWorkBuddyAttributionHeaders,
@@ -221,6 +221,26 @@ export async function runServe(args: string[]): Promise<void> {
   const fixed = usageStore.resolveProviderIds((n) => named.get(n))
   if (fixed > 0) console.log(`用量归因迁移：${fixed} 个历史 Provider 名已绑定到内部 id`)
 
+  // 历史行缓存语义回填（CACHE-SEMANTICS）：协议是权威——模型级声明 > Provider 级
+  // 声明，anthropic-messages → separate，其余 → subset。已删 Provider 的配置也参与
+  // （list 不过滤 deleted），否则删源后历史行全靠启发式猜。必须在 Provider 入库后跑。
+  // 键必须是 (providerId, modelId)：同一 Provider 下不同模型可声明不同协议
+  // （senseaudio 就是 openai-completions/anthropic-messages/openai-responses 三混）。
+  // 早期版本用 providerId 单键，"最后一个带 api 的模型"会覆盖整个 Provider，
+  // 混合源里的 anthropic 模型被整体判成 subset——而转发路径 resolveProtocol 是
+  // 按 modelID 精确解析的，两边口径分裂（实时转发算 separate、历史回填算 subset）。
+  const protoByModel = new Map<string, string>()
+  const protoByProvider = new Map<number, string>()
+  for (const p of providers.list()) {
+    if (p.api) protoByProvider.set(p.providerId, p.api)
+    for (const m of p.models) {
+      if (m.api) protoByModel.set(`${p.providerId}\u0000${m.id}`, m.api)
+    }
+  }
+  const semFixed = usageStore.backfillSemantics(
+    (pid, mid) => protoByModel.get(`${pid}\u0000${mid}`) ?? protoByProvider.get(pid))
+  if (semFixed > 0) console.log(`用量缓存语义回填：${semFixed} 行已按协议/启发式标记 sem`)
+
   // WorkBuddy 模型痕迹：多平台数据根合并（此前写死 $HOME/.workbuddy，Windows 恒空）。
   const wbGoos = process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'darwin' : 'linux'
   const wbHome = homedir()
@@ -420,6 +440,10 @@ export async function runServe(args: string[]): Promise<void> {
     }
   }
 
+  // discover 扫描器提出来：监听成功后要拿它预热缓存（见下方 scan() 调用），
+  // 让「服务刚重启 → 第一次进 Provider/发现页」直接命中缓存，
+  // 而不是由第一个页面请求同步等一次 2~8 秒的 zen 联网探测。
+  const scanner = new Scanner({ ...defaultConfig(), zenCallProbe })
   const admin = createAdminApi({
     adminKey: cfg.gateway.adminKey,
     // 概览页接入区：前端据此决定 API Key 那行是「随便填」还是「去配 gateway_key」。
@@ -432,7 +456,7 @@ export async function runServe(args: string[]): Promise<void> {
     providers,
     accounts,
     stats: usageStatsSource(usageStore),
-    discover: new DiscoverSourceAdapter(new Scanner({ ...defaultConfig(), zenCallProbe })),
+    discover: new DiscoverSourceAdapter(scanner),
     resetter: { resetAccount: (id: string) => acctPool.resetAccount(id) },
     // 池内惩罚（冷却/连败）是运行时状态，列表页要显示就得现问池子。
     accountRuntime: {
@@ -499,6 +523,10 @@ export async function runServe(args: string[]): Promise<void> {
   if (!(await bound)) process.exit(1)
 
   console.log(`polycode-hub 已启动 http://${cfg.gateway.host}:${cfg.gateway.port}/admin/`)
+  // 预热 discover 扫描缓存（后台跑，不阻塞启动）：zen 联网验证固有 2~8 秒，
+  // 不预热的话，服务启动后第一个进 Provider/发现页的人要同步等这一次。
+  // 失败静默——scan 内部会生成 unreachable 的 finding，这里只是提前触发。
+  void scanner.scan().catch(() => {})
   // 前端产物不入库（web/dist 由构建生成，见 .gitignore），clone 后没构建过就会落到这里：
   // 服务照常起、API 照常通，但 /admin 全 404——不报错的话极难排查（同 update.sh
   // 记录过的「报成功但跑旧代码」一类）。所以显式告警，并给出修复命令。

@@ -227,29 +227,75 @@ describe('客户端推理档位透传（端到端）', () => {
     expect(JSON.parse(lastUpstreamBody)).not.toHaveProperty('reasoning_effort')
   })
 
-  test('xhigh/max 托底：低于下限抬起，高于不动，其他档不动', async () => {
-    const { app } = buildApp({ providers: [pv({ reasoningMinTokens: { xhigh: 128000, max: 200000 } })] })
-    // xhigh + 小预算 → 抬到 128000
+  test('模型推理等级预设：配了就强制覆盖客户端档位；follow/未配置透传', async () => {
+    // 预设 high：客户端发的 xhigh 被替换，客户端没发也注入
+    const { app } = buildApp({ providers: [pv({ reasoningEffort: 'high' })] })
     const r1 = await app.request('/v1/chat/completions', {
-      method: 'POST', body: JSON.stringify(chatBody({ reasoning_effort: 'xhigh', max_tokens: 32768 })),
+      method: 'POST', body: JSON.stringify(chatBody({ reasoning_effort: 'xhigh' })),
     })
     expect(r1.status).toBe(200)
     await r1.json()
-    expect(JSON.parse(lastUpstreamBody).max_tokens).toBe(128000)
-    // max + 小预算 → 抬到 200000
+    expect(JSON.parse(lastUpstreamBody).reasoning_effort).toBe('high')
+
     const r2 = await app.request('/v1/chat/completions', {
-      method: 'POST', body: JSON.stringify(chatBody({ reasoning_effort: 'max', max_tokens: 100 })),
+      method: 'POST', body: JSON.stringify(chatBody()),
     })
     expect(r2.status).toBe(200)
     await r2.json()
-    expect(JSON.parse(lastUpstreamBody).max_tokens).toBe(200000)
-    // high 不受影响
-    const r3 = await app.request('/v1/chat/completions', {
-      method: 'POST', body: JSON.stringify(chatBody({ reasoning_effort: 'high', max_tokens: 100 })),
+    expect(JSON.parse(lastUpstreamBody).reasoning_effort).toBe('high')
+
+    // follow（跟随上游）= 透传：客户端发什么发什么，没发不发
+    const { app: app2 } = buildApp({ providers: [pv({ reasoningEffort: 'follow' })] })
+    const r3 = await app2.request('/v1/chat/completions', {
+      method: 'POST', body: JSON.stringify(chatBody({ reasoning_effort: 'max' })),
     })
     expect(r3.status).toBe(200)
     await r3.json()
-    expect(JSON.parse(lastUpstreamBody).max_tokens).toBe(100)
+    expect(JSON.parse(lastUpstreamBody).reasoning_effort).toBe('max')
+    const r4 = await app2.request('/v1/chat/completions', {
+      method: 'POST', body: JSON.stringify(chatBody()),
+    })
+    expect(r4.status).toBe(200)
+    await r4.json()
+    expect(JSON.parse(lastUpstreamBody)).not.toHaveProperty('reasoning_effort')
+  })
+
+  test('档位预算上限：按生效档位压超限 maxTokens，只压不抬', async () => {
+    const { app } = buildApp({ providers: [pv({ reasoningMaxTokens: { xhigh: 65536, high: 32768 } })] })
+    // xhigh + 超限预算 → 压到 65536
+    const r1 = await app.request('/v1/chat/completions', {
+      method: 'POST', body: JSON.stringify(chatBody({ reasoning_effort: 'xhigh', max_tokens: 200000 })),
+    })
+    expect(r1.status).toBe(200)
+    await r1.json()
+    expect(JSON.parse(lastUpstreamBody).max_tokens).toBe(65536)
+    // xhigh + 低于上限 → 不动
+    const r2 = await app.request('/v1/chat/completions', {
+      method: 'POST', body: JSON.stringify(chatBody({ reasoning_effort: 'xhigh', max_tokens: 1024 })),
+    })
+    expect(r2.status).toBe(200)
+    await r2.json()
+    expect(JSON.parse(lastUpstreamBody).max_tokens).toBe(1024)
+    // 键没命中的档位不动
+    const r3 = await app.request('/v1/chat/completions', {
+      method: 'POST', body: JSON.stringify(chatBody({ reasoning_effort: 'low', max_tokens: 999999 })),
+    })
+    expect(r3.status).toBe(200)
+    await r3.json()
+    expect(JSON.parse(lastUpstreamBody).max_tokens).toBe(999999)
+  })
+
+  test('预设与上限叠加：先覆盖档位，再按覆盖后的档位压预算', async () => {
+    const { app } = buildApp({ providers: [pv({ reasoningEffort: 'high', reasoningMaxTokens: { high: 32768 } })] })
+    // 客户端发 xhigh + 大预算：档位被覆盖成 high，预算按 high 的上限压
+    const r1 = await app.request('/v1/chat/completions', {
+      method: 'POST', body: JSON.stringify(chatBody({ reasoning_effort: 'xhigh', max_tokens: 100000 })),
+    })
+    expect(r1.status).toBe(200)
+    await r1.json()
+    const up = JSON.parse(lastUpstreamBody)
+    expect(up.reasoning_effort).toBe('high')
+    expect(up.max_tokens).toBe(32768)
   })
 })
 
@@ -299,6 +345,37 @@ describe('换源闸门（端到端）', () => {
     const good = usage.rows.find((r) => r.status === 'ok')!
     expect(good.accountId).toBe('a-good')
     expect(pool.snapshot().find((a) => a.id === 'a-bad')!.fails).toBe(1)
+  })
+
+  test('账号轮换：4 个账号前 3 个坏 → 第 4 个必须被试到（上界=账号数）', async () => {
+    // 回归锚点：旧代码上界取 cands.length + 1（候选 Provider 数），单 Provider
+    // 时上界为 2——5 个号只试 2 个，第 3 个起的好号根本没被问过。
+    // 只对前三次请求 401，第四次起放行（上游按 x-mode=flip 走本 handler）
+    let n = 0
+    upstreamMode.flip = (_q, res) => {
+      n++
+      if (n <= 3) { res.writeHead(401); res.end('nope'); return }
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.write('data: {"id":"c1","choices":[{"index":0,"delta":{"role":"assistant","content":"ok"}}]}\n\n')
+      res.write('data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n')
+      res.write('data: [DONE]\n\n')
+      res.end()
+    }
+    const pool = new AccountPool([
+      { id: 'b1', providerId: 1, credential: {}, status: 'available', fails: 0 },
+      { id: 'b2', providerId: 1, credential: {}, status: 'available', fails: 0 },
+      { id: 'b3', providerId: 1, credential: {}, status: 'available', fails: 0 },
+      { id: 'b4', providerId: 1, credential: {}, status: 'available', fails: 0 },
+    ])
+    const { app, usage } = buildApp({
+      providers: [provider({ headers: { 'x-mode': 'flip' } })],
+      pool,
+    })
+    const res = await app.request('/v1/messages', { method: 'POST', body: JSON.stringify(anthropicRequest()) })
+    expect(res.status).toBe(200)
+    await res.text() // 消费流
+    const ok = usage.rows.find((r) => r.status === 'ok')!
+    expect(ok.accountId).toBe('b4') // 第 4 个号被试到并成功（旧代码上界 2，必失败）
   })
 
   test('账号池全失败：兜底账归因到最后尝试的账号 + errorKind', async () => {
