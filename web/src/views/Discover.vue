@@ -25,7 +25,7 @@ const elapsed = ref('')
 
 const GROUP = {
   ready: { title: '可采用', hint: '登录态有效，点采用即生成 Provider 并把桌面登录态导入账号池' },
-  attention: { title: '需处理', hint: '照下面的提示处理好再采用' },
+  attention: { title: '需处理', hint: '联网探测没通过（多为地区限制/指纹过期/网络）——仍可点「仍要采用」先导入，再按提示处理' },
   missing: { title: '未发现', hint: '本机没装或没登录过这些 harness' }
 }
 const ATTENTION = new Set(['expired', 'unknown', 'unreachable'])
@@ -555,13 +555,24 @@ function gotoProviders() {
           <p class="field-hint">token 由服务端直接从登录态文件读取落盘（0600），不经过浏览器。</p>
         </div>
       </div>
+      <!-- 采用按钮的显示条件：**只要本机发现了、且有可用草稿就给**。
+           以前只有 ready 才渲染（groupOf(f) === 'ready'），于是联网探测没通过的项
+           （unreachable/unknown/expired）在页面上连个按钮都没有——用户被告知
+           「这也不能用」，却没有任何「先导进来再处理」的出口，被探测结论锁死。
+           导入是本地动作（把本机发现翻译成 Provider 配置），不联网、不需要上游同意，
+           探测结论该作为提示，不该作为禁止导入的闸门。 -->
       <button
-        v-if="groupOf(f) === 'ready'"
-        class="btn primary"
+        v-if="f.suggestedProvider"
+        class="btn"
+        :class="groupOf(f) === 'ready' ? 'primary' : 'ghost'"
         :disabled="adopting === f.key"
-        :title="f.adoptedProviderId ? `已由「${adoptedName(f.adoptedProviderId)}」接管，点此跳到 Provider 页` : ''"
+        :title="f.adoptedProviderId
+          ? `已由「${adoptedName(f.adoptedProviderId)}」接管，点此跳到 Provider 页`
+          : groupOf(f) === 'ready'
+            ? '采用为 Provider 并导入本机登录态'
+            : `探测未通过（${statusText[f.status] || f.status}）——仍可导入，导入后再按上面的指引处理`"
         @click="f.adoptedProviderId ? gotoProviders() : adopt(f)">
-        {{ f.adoptedProviderId ? '去查看' : adopting === f.key ? '采用中…' : '采用' }}
+        {{ f.adoptedProviderId ? '去查看' : adopting === f.key ? '采用中…' : (groupOf(f) === 'ready' ? '采用' : '仍要采用') }}
       </button>
     </div>
   </section>

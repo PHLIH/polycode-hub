@@ -31,7 +31,8 @@ import { Store as ProjectsStore } from './projects/store.ts'
 import { openLog, quoteArg, startDetached } from './projects/process.ts'
 import {
   Scanner, defaultConfig, discoverWorkBuddyModelsFrom, workBuddyDataDirs,
-  discoverOpenCodeFingerprint, discoverAllOpenCodeFingerprints, type ZenCallProbe,
+  discoverOpenCodeFingerprint, discoverAllOpenCodeFingerprints, zenProbeRequest,
+  type ZenCallProbe,
 } from './discover/index.ts'
 import { refreshAllZenProviders, refreshZenProvider } from './discover/zen_refresh.ts'
 import { isZenBaseUrl, mintZenRequestId, parseZenSessionPool, writeZenSessionPool } from './model/index.ts'
@@ -41,6 +42,8 @@ const workBuddyDataNullsafe = (dirs: string[] | undefined): string[] => dirs ?? 
 import { homedir } from 'node:os'
 import { usageStatsSource } from './adminapi/stats.ts'
 import { providerValidate } from './model/index.ts'
+// adopt 子命令与发现页「采用」共用同一条可导入判据（单一真相源，避免口径漂移）。
+import { notAdoptableReason } from './adminapi/discover_api.ts'
 
 // 路径语义对齐 Go：配置/数据/凭据一律相对进程 cwd（运行目录即工作目录）；
 // 仅 web/dist 锚定包/仓库自身（Go 时代它嵌在二进制里，TS 侧从安装位置现读）。
@@ -373,6 +376,11 @@ export async function runServe(args: string[]): Promise<void> {
   // 「网络通」误报成 ready，用户到手才发现 403 FreeTierError（真实假阳性）。
   const zenCallProbe: ZenCallProbe = async (model) => {
     const draft = defaultConfig()
+    // 项目出口代理：探针与真实转发必须走同一个出口（见下方 p.egress 的注释）。
+    // 与 sidecar 下载的决议口径一致——表里仅一项时自动采用（单 clash 最常见，多项不猜）。
+    // 只在「没有已配置 zen Provider」的草稿分支用得到：有已配置 Provider 时它自带的
+    // egress 就是用户为这个源指定的出口，那份优先。
+    const projectEgressId = egresses.list().length === 1 ? egresses.list()[0]!.id : ''
     // 探针必须用「与真实转发同一份配置」，否则会把「探针没带够配置」误报成「源不可用」。
     // 两份来源，优先级从高到低：
     //   ① 已配置的 zen Provider —— 用户配的指纹头、egress 出口全在里面；
@@ -407,6 +415,13 @@ export async function runServe(args: string[]): Promise<void> {
         api: 'openai-completions', baseUrl: (draft.zenBaseURL ?? 'https://opencode.ai/zen') + '/v1',
         credential: { apiKeyEnv: 'ZEN_KEY' },
         headers: autoHeaders,
+        // 出口代理：还没配过 zen Provider 的用户走这条草稿分支，**必须把项目已配的
+        // 出口带上**。否则探针直连、真实转发走代理，两者的地区判定可以完全相反——
+        // 探针把「有代理就能用的模型」报成「地区不可用」，用户照提示去配代理，
+        // 而代理其实早就配好了（探测结论与真实链路不一致，是最难自证的一类假阴性）。
+        // 与 sidecar 下载同源：项目 egress 表（表里仅一项时自动采用），
+        // 即「用户在管理台配的出口就是这里用的出口」。
+        ...(projectEgressId ? { egress: projectEgressId } : {}),
         priority: 1,
         models: [{ id: model, manual: false, enabled: true }],
       }
@@ -421,10 +436,11 @@ export async function runServe(args: string[]): Promise<void> {
     }
     const probeUp = up.withOpts({ credLookup: zenLookup })
     try {
-      const req: import('./ir/index.ts').IrRequest = {
-        model, stream: true, maxTokens: 8,
-        messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
-      }
+      // 探针必须带 tools —— 免费档的身份闸门看的是「请求长得像不像官方客户端的
+      // agent 请求」，不只是指纹头。2026-09-20 用抓包拿到的真实 opencode 会话实测：
+      // 同一会话同一秒，裸请求（只有一条 user 消息）恒 403 FreeTierError，
+      // 加上 tools:[bash,read] 立刻 200 出字。形状定义与理由见 ZEN_PROBE_TOOLS。
+      const req = zenProbeRequest(model)
       // 拿到 2xx 响应即算可调用——**不等首块**。
       //
       // streamWithTimeout 的契约：非 2xx 抛 UpstreamError，2xx 才返回 stream。
@@ -590,8 +606,12 @@ async function runAdopt(args: string[]): Promise<void> {
   const findings = await new Scanner(defaultConfig()).scan()
   const found = findings.find((f) => f.key === rest[0])
   if (!found) fatal(new Error(`未发现 "${rest[0]}"，先跑 scan 看看`))
+  // 与发现页「采用」共用同一条判据（不许两处各写一份：口径漂移过一次了）。
+  // 本机发现了就允许导入，联网探测没通不拦（见 notAdoptableReason 注释）。
+  const blocked = notAdoptableReason(found)
+  if (blocked) fatal(new Error(blocked))
   if (found.status !== 'ready') {
-    fatal(new Error(`${found.harness} 未就绪（${found.status}）：${(found.actions ?? []).join('；')}`))
+    console.warn(`注意：${found.harness} 探测未通过（${found.status}）——仍按你的要求导入，之后可能需换出口/补指纹`)
   }
   const p = { ...found.suggestedProvider! }
   if (id) p.name = id

@@ -9,7 +9,7 @@ import {
   discoverWorkBuddyModels, workBuddyAuthDirs, workBuddySearchPaths, searchWorkBuddyAuthFiles,
   detectRealmFromAuth,
   parseFingerprintFromLog, openCodeDataDirs,
-  Scanner, defaultConfig, type ScanConfig,
+  Scanner, defaultConfig, type ScanConfig, zenProbeRequest, pruneStaleDraftModels,
 } from '../src/discover/index.ts'
 import { providerValidate, type Provider } from '../src/model/index.ts'
 
@@ -448,6 +448,111 @@ describe('checkZen', () => {
     expect(f.status).toBe('ready')
     expect(called).toBe('mimo-v2.5-free') // 优先免费档模型
     expect(f.detail).toContain('实测')
+  })
+
+  // 根因回归（2026-09-20 用户实测）：探针发的是裸请求（只有一条 user 消息、无 tools），
+  // 而 zen 免费档的身份闸门要求请求体像官方客户端的 agent 请求。抓包实测（同一真实
+  // opencode 会话、同一秒、仅换请求体）：裸 body 恒 403 FreeTierError，
+  // 加 tools:[bash,read] 立刻 200。于是探针恒报「指纹被拒/地区受限」→ 判 unreachable
+  // → 发现页连导入按钮都不给，用户被一个假阴性锁死。
+  // 这里把「探针请求必须带 tools 且必须流式」锁成契约。
+  test('探针请求形状：必带 tools(bash+read) 且流式（免费档闸门要求）', () => {
+    const req = zenProbeRequest('mimo-v2.5-free')
+    expect(req.stream).toBe(true) // 非流式同样 403
+    const names = (req.tools ?? []).map((t) => t.name)
+    // 闸门要求字面量同时含 bash 与 read（大小写敏感，别的组合一律 403）
+    expect(names).toContain('bash')
+    expect(names).toContain('read')
+    expect(req.messages.length).toBeGreaterThan(0)
+  })
+
+  // 上游已下线的模型留在草稿里，采用后就是永远 404 的目录项（用户看不出是模型没了
+  // 还是自己配错）。草稿必须跟随上游列表剪掉这些，且**如实告知**（不静默改动目录）。
+  test('草稿模型跟随上游刷新：剔除已下线项并如实告知', async () => {
+    const fetchList = (async () => new Response(
+      JSON.stringify({ data: [{ id: 'mimo-v2.5-free' }, { id: 'nemotron-3-ultra-free' }] }),
+      { status: 200 },
+    )) as typeof fetch
+    const f = await checkZen('https://zen.example', fetchList) // 不测调用：只看草稿
+    const names = (f.suggestedProvider?.models ?? []).map((m) => m.id)
+    expect(names).toContain('mimo-v2.5-free')
+    expect(names).toContain('nemotron-3-ultra-free')
+    expect(names).not.toContain('union-alpha') // 上游已下线
+    expect(f.detail).toContain('union-alpha') // 剔除要如实告知
+  })
+
+  // 剪枝的两条边界（宁可不剪也不误删）——直接锁纯函数，不绕道网络。
+  test('剪枝保留 manual 手工项；列表拉空时整体不剪', () => {
+    const models = [
+      { id: 'gone-auto' },                    // 上游没了 + 自动 → 剪
+      { id: 'gone-manual', manual: true },    // 上游没了 + 手工 → 留（用户自己维护的）
+      { id: 'live', manual: false },          // 上游还在 → 留
+    ]
+    const r = pruneStaleDraftModels(models, ['live'])
+    expect(r.kept.map((m) => m.id)).toEqual(['gone-manual', 'live'])
+    expect(r.stale).toEqual(['gone-auto'])
+    // live 为空（列表拉空/解析异常）：沉默比误删安全，一个都不剪
+    const empty = pruneStaleDraftModels(models, [])
+    expect(empty.kept).toHaveLength(3)
+    expect(empty.stale).toEqual([])
+  })
+
+  // 真实误判（2026-09-20 用户实测报回）：按上游列表顺序取前 3 个免费模型做探针，
+  // 恰好那 3 个都不可用（jev 500 / deepseek-v4-flash 已下线 / muse-spark 地区受限），
+  // 于是整个源被判 unreachable，用户连导入按钮都点不到——而草稿里的 mimo-v2.5-free
+  // 当时是可调用的。探针要回答的是「采用后我能不能用」，所以候选必须先取草稿模型。
+  test('探针候选优先取草稿模型（不被列表顺序挤掉）', async () => {
+    const fetchList = (async () => new Response(
+      JSON.stringify({ data: [
+        { id: 'jev-1.13-free' },
+        { id: 'deepseek-v4-flash-free' },
+        { id: 'muse-spark-1.3-contributor-free' },
+        { id: 'mimo-v2.5-free' },
+        { id: 'nemotron-3-ultra-free' },
+      ] }), { status: 200 },
+    )) as typeof fetch
+    const tried: string[] = []
+    const f = await checkZen('https://zen.example', fetchList, 8000, async (m) => {
+      tried.push(m)
+      // 只有草稿里的模型可用；列表前三个都不可用（含地区限制）
+      return m === 'mimo-v2.5-free'
+        ? { ok: true }
+        : { ok: false, kind: 'region', error: 'not available in your country' }
+    })
+    // 草稿里的 mimo-v2.5-free 必须被探到，且整体判 ready
+    expect(tried).toContain('mimo-v2.5-free')
+    expect(f.status).toBe('ready')
+    expect(f.detail).toContain('mimo-v2.5-free')
+  })
+
+  // 全失败时，detail 必须列出**每个候选各自**的失败类型，而不是只报一个最优病因。
+  // 只报「地区受限」会把真相压成一个词：用户无法判断是源整体不可用，还是探针
+  // 撞上了单个坏模型（本轮误判的根源）。
+  test('全候选失败：detail 逐个列出候选与失败类型', async () => {
+    const fetchList = (async () => new Response(
+      JSON.stringify({ data: [{ id: 'a-free' }, { id: 'b-free' }] }), { status: 200 },
+    )) as typeof fetch
+    const f = await checkZen('https://zen.example', fetchList, 8000, async (m) =>
+      m === 'a-free'
+        ? { ok: false, error: 'upstream server (http 500): boom' }
+        : { ok: false, kind: 'region', error: 'not available in your country' })
+    expect(f.status).toBe('unreachable')
+    expect(f.detail).toContain('a-free')
+    expect(f.detail).toContain('b-free')
+    expect(f.detail).toContain('地区受限')
+    expect(f.detail).toContain('http 500')
+  })
+
+  // 探测没通过也必须留一条「仍可导入」的出路：导入是本地动作，不该被联网结论锁死。
+  test('不可达时 action 里仍给出「采用」的出路', async () => {
+    const fetchList = (async () => new Response(
+      JSON.stringify({ data: [{ id: 'a-free' }] }), { status: 200 },
+    )) as typeof fetch
+    const f = await checkZen('https://zen.example', fetchList, 8000, async () => ({
+      ok: false, kind: 'fingerprint', error: "free tier can only be used from within OpenCode",
+    }))
+    expect(f.status).toBe('unreachable')
+    expect(f.actions?.some((a) => a.includes('采用'))).toBe(true)
   })
 
   // 单模型误判（2026-09-17 实测）：探针只试第一个模型就下结论，
