@@ -62,16 +62,35 @@ export function fatal(err: Error): never {
   process.exit(1)
 }
 
+// 回环监听判定（管理口令、网关口令两处守卫共用）：剥掉 IPv6 方括号后认
+// localhost / 127.0.0.0/8 / ::1。抽成助手是为了不让两处口径各自演化——
+// 判据漂移过一次的地方，再多写一遍迟早再漂一次。
+function isLoopbackHost(host: string): boolean {
+  const h = host.replace(/^\[|\]$/g, '')
+  return h === 'localhost' || h.startsWith('127.') || h === '::1'
+}
+
 // 管理口令策略（按暴露程度分级）：配了直接用；没配 + 回环监听放行（Ollama 同款）；
 // 没配 + 对外监听拒绝启动。
 function ensureAdminKey(cfg: Config): void {
   if (cfg.gateway.adminKey) return
-  const host = cfg.gateway.host.replace(/^\[|\]$/g, '')
-  const loopback = host === 'localhost' || host.startsWith('127.') || host === '::1'
-  if (!loopback) {
+  if (!isLoopbackHost(cfg.gateway.host)) {
     fatal(new Error(`监听地址 ${cfg.gateway.host} 对外暴露，管理口令不能为空（请配置 gateway.admin_key）`))
   }
   console.warn('管理面无鉴权（仅回环监听可访问）；如需暴露到局域网/公网，请配置 gateway.admin_key')
+}
+
+// 网关口令策略（与 ensureAdminKey 同一套分级，判据共用 isLoopbackHost）：
+// gateway_key 为空时 /v1/* 转发完全不鉴权（见 gateway/proxy.ts 的校验）——
+// 回环监听时空口令只有本机可触达，放行 + 提醒即可；但 host 绑到 0.0.0.0/局域网后，
+// 网关就变成任何人可用的开放 LLM 中继，会烧掉所有已配置的上游凭据，
+// 所以「对外监听 + 空 key」必须像管理口令一样直接拒绝启动。
+function ensureGatewayKey(cfg: Config): void {
+  if (cfg.gateway.gatewayKey) return
+  if (!isLoopbackHost(cfg.gateway.host)) {
+    fatal(new Error(`监听地址 ${cfg.gateway.host} 对外暴露，网关口令不能为空（请配置 gateway.gateway_key）`))
+  }
+  console.warn('转发无鉴权（gateway_key 为空，仅回环监听可访问）；如需暴露到局域网/公网，请配置 gateway.gateway_key')
 }
 
 // discover.Scanner → adminapi.DiscoverSource 适配（对齐 Go main.go discoverSource）。
@@ -104,6 +123,7 @@ export async function runServe(args: string[]): Promise<void> {
   }
   const cfg = loadOrDefault(configPath)
   ensureAdminKey(cfg)
+  ensureGatewayKey(cfg) // 转发面的口令与管理口令同等敏感：对外监听 + 空 key = 开放中继
   if (portOverride > 0) cfg.gateway.port = portOverride
   console.log(`配置加载完成 providers=${cfg.providers.length} accounts=${cfg.accounts.length} listen=${cfg.gateway.host}:${cfg.gateway.port}`)
 
@@ -562,15 +582,66 @@ export async function runServe(args: string[]): Promise<void> {
   // 开工先立刻 tick 一次——网关重启后引擎若是死的，不该等满一个周期才动手。
   void sidecarGuard.tick()
   const stopGuard = sidecarGuard.run()
-  const shutdown = () => {
-    stopSweeper() // 先停巡检，再关服务，避免退出期间还在改状态文件
-    stopGuard()   // 停保活：退出过程中不该再拉起引擎
-    console.log('已退出')
-    void server.close()
-    process.exit(0)
+  // 优雅退出（SIGINT/SIGTERM）：按序收摊，而不是打一行日志就 process.exit(0)。
+  // 旧实现 `void server.close()` 后立即 exit —— close 回调永不执行，在途请求
+  // （包括正在转发中的 SSE 流）被硬杀，SIGTERM 优雅退出形同虚设；
+  // usageStore / admin.db 的 DatabaseSync 句柄也从不 close，WAL checkpoint
+  // 只能等下次打开才恢复。
+  //
+  // 收摊顺序（每步的理由见行内注释）：
+  //   1. 停巡检/保活 → 2. 发起 server.close()（停止接新连接）
+  //   → 3. 掐掉空闲 keep-alive 连接让 drain 能完成 → 4. await close 完成
+  //   → 5. 关掉所有持有 DatabaseSync 的 store（触发 WAL 落盘）
+  //   → 6. 打「已退出」→ process.exit(0)。
+  //
+  // 幂等：第一次信号走完整收摊；第二次信号（用户按两次 = 不等了）直接强退。
+  // 兜底：8 秒看门狗，任何一步卡住（如某条流迟迟不结束）仍会退出，
+  // 防止「优雅」退化成「挂死」；正常路径两处都 clearTimeout。
+  let shuttingDown = false
+  const shutdown = (signal: string): void => {
+    if (shuttingDown) {
+      console.log(`再次收到 ${signal}，强制退出`)
+      process.exit(0)
+    }
+    shuttingDown = true
+    const forceExit = setTimeout(() => {
+      console.warn('优雅退出超时（8s 未完成），强制结束进程')
+      process.exit(0)
+    }, 8000)
+    void (async () => {
+      stopSweeper() // 先停巡检，再关服务，避免退出期间还在改状态文件
+      stopGuard()   // 停保活：退出过程中不该再拉起引擎
+      // server.close() 的回调要等**在途请求全部结束**才触发，所以先发起、
+      // 走完第 3 步再 await —— 直接 void 掉就等于没人等它（旧实现的病根）。
+      const closing = new Promise<void>((resolve) => { server.close(() => resolve()) })
+      // 只关**空闲**的 keep-alive 连接：close() 会等这些连接被回收，而空闲连接
+      // 可能长期挂着，不掐掉 drain 永远完不成；在途请求所在的连接是「忙」的，
+      // 不受影响，跑完才放行。绝不能用 closeAllConnections —— 那会硬杀正在跑的
+      // 请求/SSE 流，退回旧实现的毛病。ServerType 是 http/http2 联合类型，
+      // http2 分支没有这个方法，故按可选成员访问（本项目实际走 http）。
+      ;(server as { closeIdleConnections?: () => void }).closeIdleConnections?.()
+      await closing
+      // 三个 store 各自 open() 时都 new 了独立的 DatabaseSync（见 adminapi/store.ts
+      // 的 openAdminDB），句柄并不共享 —— 所以逐个关、每个只关一次即可，
+      // 不存在重复 close 同一句柄的问题；accounts.seedLedger() 复用 accounts 的
+      // 句柄且自身不暴露 close，故不单独关。SQLiteEgressStore 没有暴露 close()
+      // （store.ts 不在本次修改范围），它那一个句柄交给进程退出兜底。
+      usageStore.close()
+      providers.close()
+      accounts.close()
+      clearTimeout(forceExit)
+      console.log('已退出')
+      process.exit(0)
+    })().catch((e) => {
+      // 收尾任一步抛错（如 store 已被别处关过）也不能把进程挂住：
+      // 打出来、清看门狗、照样退出，退出码仍为 0（服务已停止是既成事实）。
+      console.error('优雅退出收尾出错:', e)
+      clearTimeout(forceExit)
+      process.exit(0)
+    })
   }
-  process.on('SIGINT', shutdown)
-  process.on('SIGTERM', shutdown)
+  process.on('SIGINT', () => shutdown('SIGINT'))
+  process.on('SIGTERM', () => shutdown('SIGTERM'))
 }
 
 // ---- scan 子命令 ----

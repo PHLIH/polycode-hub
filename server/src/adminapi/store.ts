@@ -1,5 +1,5 @@
 // 管理面存储：Provider/Account 的 CRUD（对齐 Go internal/adminapi/store_sqlite.go）。
-// admin.db 两表：admin_providers / admin_accounts（id TEXT PRIMARY KEY + data TEXT JSON blob），
+// admin.db 四表：admin_providers / admin_accounts / admin_egresses / admin_meta（meta 为 k/v 标记位，其余为 id 类主键 + data JSON blob），
 // schema 与 Go 版完全一致，可互开对方写出的库。内存实现供测试与缺省装配。
 
 import { chmodSync, mkdirSync } from 'node:fs'

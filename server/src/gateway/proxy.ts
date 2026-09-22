@@ -128,11 +128,18 @@ export function mergeStreamUsage(ul: UsageLog, ev: StreamEvent): void {
 // （非法 JSON 容忍为空，与 codec.parseArgs 一致）；用量按字段级最新优先合并；
 // 空流返回空内容（不断言，调用方按既有语义记账）。
 // 上游以 error 事件半路失败时抛错（调用方按上游错误记账，不伪造 200 空包）。
+//
+// opts 是两道超时闸（不传则不设任何定时器，保持两参调用的既有行为）：
+// Upstream.streamWith 收到 2xx 响应头就返回 body 流，上游“发完头就挂住”时下面
+// 的 read() 会永远 pending——连接、reader、账号冷却、usage 记账全部悬挂。所以这里
+// 与流式分支对齐补两道闸：首块须在 firstByteTimeoutMs 内到（首字节闸），此后每块
+// 之间的间隔超过 idleTimeoutMs 即掐断（静默闸，每收到一块就重置计时）。
 // 注意是“空包才抛”：流中偶发的坏行（某 chunk 非法 JSON）只跳过，继续收后面
 // 的好内容——与流式透传“坏帧透传 + 好内容照出”对齐；全程无内容才说明整条流
 // 不可用，此时抛第一个错误（调用方记 upstream_error）。
 export async function collectStreamResponse(
   out: OutboundCodec, rc: ReadableStream<Uint8Array>,
+  opts?: { firstByteTimeoutMs?: number; idleTimeoutMs?: number },
 ): Promise<IrResponse> {
   const sp = out.newStreamParser()
   const blocks = new Map<number, Block>()
@@ -215,10 +222,49 @@ export async function collectStreamResponse(
     }
   }
   const reader = rc.getReader()
-  for (;;) {
-    const { done, value } = await reader.read()
-    if (done) break
-    if (value) feed(sp.feed(value))
+  // ---- 两道超时闸（语义与流式分支的首字节闸/静默闸一致）----
+  let timedOut: 'firstByte' | 'idle' | null = null // 哪道闸触发了（null = 正常收完）
+  let timer: ReturnType<typeof setTimeout> | null = null
+  let fireTimeout: (() => void) | null = null // 闸门触发后让 read() 的 race 落败
+  const timeoutFired = new Promise<void>((resolve) => { fireTimeout = resolve })
+  const clearTimer = () => { if (timer) { clearTimeout(timer); timer = null } }
+  const arm = (ms: number, phase: 'firstByte' | 'idle') => {
+    clearTimer() // 重置上一段计时：每收到一块就从头数（静默闸语义）
+    timer = setTimeout(() => { timedOut = phase; fireTimeout!() }, ms)
+  }
+  if (opts?.firstByteTimeoutMs !== undefined) arm(opts.firstByteTimeoutMs, 'firstByte')
+  try {
+    for (;;) {
+      const readP = reader.read().then((r) => ({ r }))
+      // race 落败的那支若之后 reject（上游 socket 随后报错），不能变成未处理 rejection。
+      void readP.catch(() => {})
+      const raced = await Promise.race([readP, timeoutFired.then(() => 'timeout' as const)])
+      if (raced === 'timeout') break // 闸门已触发：下面统一 cancel + 抛错
+      const { done, value } = raced.r
+      if (done) break
+      if (value) {
+        feed(sp.feed(value))
+        // 首字节闸已过（已收到块）：换成静默闸；没配静默闸就撤掉首字节计时，
+        // 否则残留的首字节 timer 会在正常长流上误触发。
+        if (opts?.idleTimeoutMs !== undefined) arm(opts.idleTimeoutMs, 'idle')
+        else clearTimer()
+      }
+    }
+  } catch (err) {
+    // 解析/读错误：也必须掐掉 reader，不能把持锁的流留在上游侧悬挂。
+    void reader.cancel((err as Error)).catch(() => {})
+    throw err
+  } finally {
+    clearTimer() // 任何退出路径都不留残留 timer 拖住事件循环
+  }
+  if (timedOut) {
+    void reader.cancel(new Error('upstream timeout')).catch(() => {})
+    const ms = timedOut === 'firstByte' ? opts!.firstByteTimeoutMs! : opts!.idleTimeoutMs!
+    const secs = Math.round(ms / 1000)
+    const msg = timedOut === 'firstByte'
+      ? `上游未在 ${secs}s 内返回首字节（已掐断）`
+      : `上游流中途静默超时（${secs}s 无新数据）`
+    throw new UpstreamError(0, UPSTREAM.NETWORK, msg)
   }
   feed(sp.finish())
   if (order.length === 0 && firstStreamError !== undefined) {
@@ -643,8 +689,14 @@ export class Proxy {
       // 这里收齐拼成单包再回。所有上游统一走这条路，不止 zen。
       let resp: IrResponse
       try {
-        resp = await collectStreamResponse(out, rc)
+        // 非流式路径同样要过两道闸：上游发完头就挂住时这个 await 会永不返回。
+        resp = await collectStreamResponse(out, rc, {
+          firstByteTimeoutMs: this.cfg.gateway.firstByteTimeoutMs,
+          idleTimeoutMs: this.cfg.gateway.streamIdleTimeoutMs,
+        })
       } catch (err) {
+        // 归因必须落 errorKind，否则 accountBreakdown byKind 丢这类失败（对齐流式分支）。
+        ul.errorKind = err instanceof UpstreamError ? err.kind : UPSTREAM.SERVER
         this.logUsage(ul, 'upstream_error', Date.now() - start)
         const msg = err instanceof UpstreamError ? err.message : (err as Error).message
         return writeIrError(inb, irError(ERR.API, '上游响应收齐失败: ' + msg))

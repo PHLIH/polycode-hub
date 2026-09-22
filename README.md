@@ -1,6 +1,6 @@
 # polycode-hub
 
-[![Version: 0.1.0](https://img.shields.io/badge/version-0.1.0-orange)](package.json) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![Node.js >= 22.13](https://img.shields.io/badge/Node.js-%3E%3D22.13-339933?logo=node.js&logoColor=white)](package.json) [![Tests](https://img.shields.io/badge/tests-463%20passed-brightgreen)](#开发) [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue?logo=typescript&logoColor=white)](tsconfig.json)
+[![Version: 0.1.0](https://img.shields.io/badge/version-0.1.0-orange)](package.json) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![Node.js >= 22.13](https://img.shields.io/badge/Node.js-%3E%3D22.13-339933?logo=node.js&logoColor=white)](package.json) [![Tests](https://img.shields.io/badge/tests-943%20passed-brightgreen)](#开发) [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue?logo=typescript&logoColor=white)](tsconfig.json)
 
 > 免费额度通常绑着自家客户端一起发：想用这份额度，就得用它的 harness。于是你的工具选择权，被 token 拿走了。
 
@@ -117,7 +117,7 @@ curl -N http://127.0.0.1:3000/v1/responses \
   -d '{"model":"<providerId>/<modelId>","input":"hi"}'
 ```
 
-网关默认**只监听 `127.0.0.1`** 且**免鉴权**（回环地址安全）。要对局域网/公网暴露，必须在配置文件里设 `gateway.admin_key`，否则拒绝启动。转发面另有 `gateway_key`（非空则 client 须带 `Authorization: Bearer <key>`）。
+网关默认**只监听 `127.0.0.1`** 且**免鉴权**（回环地址安全）。要对局域网/公网暴露，必须在配置文件里设 `gateway.admin_key`，否则拒绝启动。转发面另有 `gateway_key`（非空则 client 须带 `Authorization: Bearer <key>`；与管理口令同款要求——监听非回环时同样必填，否则拒绝启动：对外监听 + 空 key 等于开放中继，会烧掉所有已配置的上游凭据）。
 
 ---
 
@@ -135,7 +135,7 @@ cp config/apps.example.yaml config/apps.yaml
 gateway:
   port: 3000            # 换端口；也可启动时加 --port 3999
   admin_key: "..."      # 管理台口令；对非回环监听时必填
-  gateway_key: ""       # client 侧 Bearer 校验；留空不校验
+  gateway_key: ""       # client 侧 Bearer 校验；回环监听留空 = 不校验，对外监听必填（否则拒绝启动）
 providers:
   - name: "company-anthropic"
     api: "anthropic-messages"   # 留空 = 自动识别（推荐）
@@ -146,7 +146,7 @@ providers:
 
 > **注意**：配置文件是**严格模式**——写错字段名会直接拒绝启动，错误信息会点名是哪个字段。示例文件一定是能解析的（有测试守着）。
 >
-> **存储**：运行时以 SQLite（`data/admin.db`）为准——在管理台上的增删改重启不丢，运维入口以管理台为准。
+> **存储**：运行时以 SQLite 为准——`data/` 下双库：`admin.db`（Provider / 账号 / egress 配置与状态）+ `usage.db`（用量统计，见 `server/src/usage/store.ts` 头注释）。在管理台上的增删改重启不丢，运维入口以管理台为准。
 >
 > **凭据热轮换**：改 `config/credentials/` 下的文件内容即生效（下次请求自动读新值），再调 `POST /admin/api/accounts/{id}/recheck` 清冷却立刻恢复，**全程不重启**。`api_key_env` 引的环境变量改值需重启进程。
 
@@ -179,7 +179,7 @@ npx tsx server/src/cli.ts <子命令>     # 或用 bin shim：node bin/polycode-
 | Projects | 本机项目一键启停 / 端口冲突 / 日志 |
 | Login | 管理口令登录 |
 
-转发面端点：`POST /v1/messages`、`POST /v1/chat/completions`、`POST /v1/responses`（另有裸路径别名 `/chat/completions`、`/responses`）、`GET /v1/models`、免鉴权的 `GET /health`。
+转发面端点：`POST /v1/messages`、`POST /v1/chat/completions`、`POST /v1/responses`（另有裸路径别名 `/chat/completions`、`/responses`）、`GET /v1/models`（另有裸别名 `GET /models`）、免鉴权的 `GET /health`。
 
 ---
 
@@ -187,8 +187,8 @@ npx tsx server/src/cli.ts <子命令>     # 或用 bin shim：node bin/polycode-
 
 ```bash
 npm run dev            # 后端热重启（tsx watch）
-npm test               # 全量测试（vitest，27 个文件 463 个用例）
-npm run typecheck      # tsc --noEmit
+npm test               # 全量测试（vitest，46 个文件 943 个用例，另 1 个跳过）
+npm run typecheck      # tsc --noEmit——只覆盖 server/（tsconfig include 仅 server/src、server/test；web 前端的 .ts/.vue 不参与）
 
 npm run dev:web        # 前端 HMR；已配代理把 /admin/api 转给 :3000
 ```
@@ -212,6 +212,8 @@ server/src/
 ├── adminapi/         # 管理台 REST API
 ├── usage/            # 用量与 token 计量（SQLite）
 ├── projects/         # 本地项目管理器（启停服务、端口冲突检测）
+├── discover/         # 本机发现（扫描 WorkBuddy / ZCode / OpenCode Zen 登录态，Discover 页与一键导入的来源）
+├── zcodeauth/        # ZCode OAuth 登录（`zcode login` 的实现）
 └── sidecar/          # ZCode 本地引擎托管（只做下载+配置+进程管理，不含上游代码）
 web/src/              # Vue 3 + Element Plus + ECharts 管理台
 ```

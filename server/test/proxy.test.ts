@@ -819,6 +819,32 @@ describe('collectStreamResponse：SSE 收齐拼单包（非流式兜底）', () 
     expect(resp.content).toEqual([])
     expect(resp.usage.accuracy).toBe('unknown')
   })
+
+  // 回归：上游发完 2xx 响应头就挂住（免费额度上游常见）。没有这两道闸，
+  // reader.read() 永远 pending：连接、reader、usage 记账全部悬挂。
+  test('上游从不吐块：首字节闸掐断并抛 UpstreamError(网络)', async () => {
+    const hang = new ReadableStream<Uint8Array>({ start() { /* 永不 enqueue、永不 close */ } })
+    let caught: unknown
+    try {
+      await collectStreamResponse(out(), hang, { firstByteTimeoutMs: 30, idleTimeoutMs: 60_000 })
+    } catch (e) { caught = e }
+    expect(caught).toBeInstanceOf(UpstreamError)
+    expect((caught as UpstreamError).kind).toBe(UPSTREAM.NETWORK)
+    expect((caught as UpstreamError).message).toContain('首字节')
+  })
+
+  test('上游吐一块后挂住：静默闸掐断并抛 UpstreamError(网络)', async () => {
+    const oneThenHang = new ReadableStream<Uint8Array>({
+      start(c) { c.enqueue(B('data: [DONE]\n\n')) /* 之后永不 close */ },
+    })
+    let caught: unknown
+    try {
+      await collectStreamResponse(out(), oneThenHang, { firstByteTimeoutMs: 60_000, idleTimeoutMs: 30 })
+    } catch (e) { caught = e }
+    expect(caught).toBeInstanceOf(UpstreamError)
+    expect((caught as UpstreamError).kind).toBe(UPSTREAM.NETWORK)
+    expect((caught as UpstreamError).message).toContain('静默超时')
+  })
 })
 
 describe('非流式客户端经内部流式上游拼包返回（全源生效）', () => {

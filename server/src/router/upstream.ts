@@ -430,14 +430,20 @@ export class Upstream {
       } catch (err) {
         // 清缓存与换协议是两件事（B-P0-1 拆分）：
         //   · 只有 BAD_REQUEST（路径不对）才忘掉记住的协议；
-        //   · SERVER/NETWORK 照样进 for 循环试下一个（错协议也可能回 500，
+        //   · SERVER/NETWORK 照样进 for 循环换协议再试（错协议也可能回 500，
         //     如 zen muse-spark 走错端点；且 5xx 多为上游病了，换个端点或能好）。
+        //     注意 probeOrder(proto) 的首候选正是刚失败的 proto，循环里要跳过它——
+        //     否则同一个失败请求原样重打一遍（多一次完整上游调用，限流场景白烧配额）。
         if (isBadRequestErr(err)) forgetProtocol(p.name, irReq.model) // 记住的协议失效 → 丢掉并重探
         if (!shouldTryNextProtocol(err)) throw err
         lastErr = err
       }
     }
     for (const cand of probeOrder(proto)) {
+      // known 时 probeOrder 的第一个候选就是上面刚试过并失败的 proto，跳过：
+      // 首打失败的协议不再原样重打（streamWith 的 transient 重试额度是每次调用
+      // 独立的，不跳会真的多发一次上游请求）。!known 时 proto 为空串，无候选命中。
+      if (known && cand === proto) continue
       try {
         const s = await this.streamWith(p, irReq, cand, session)
         rememberProtocol(p.name, irReq.model, cand)

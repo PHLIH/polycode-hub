@@ -1,25 +1,34 @@
 # polycode-hub 配置示例（v0.4：Source / Provider / 模型目录 / 三协议）
 # 复制为 config/apps.yaml 并按需修改（POLYCODE_CONFIG 可覆盖路径）
 #
-# 硬规则（docs/upstream-providers.md §2.1）：
+# 硬规则：
 #   1. 一个 Provider 只说一种协议（api 字段）；同一网关提供两种协议 → 建两个 Provider
-#   2. Provider ID 永久不可改（改名 = 新建 + 删旧），取名一次到位
+#   2. Provider 名可改（管理台 PATCH 只动 name，模型 ID 前缀跟着变，旧前缀立即失效）；
+#      内部 providerId 永不变（账号归属与用量归因按它走）
 #   3. baseURL 停在操作路径之前：anthropic-messages 不含 /v1，openai 两种含 /v1
 #   4. 凭据不落明文：只存引用（api_key_env 或 api_key_file），密钥放环境变量或
 #      config/credentials/ 下文件（0600，已 gitignore）
 #   5. 热轮换：api_key_file 改内容即生效（免重启）+ recheck 清冷却；
-#      api_key_env 改值需重启；增删改账号/源走 Admin API 即时生效（见 docs/admin-api.md）
+#      api_key_env 改值需重启；增删改账号/源走 Admin API（/admin/api/*，管理台即其客户端）即时生效
 
 gateway:
   host: "127.0.0.1"            # 默认只监听本机；公网暴露须自行评估 TLS + 强令牌
   port: 3000
-  admin_key: "changeme"        # 后台 /admin 与 /admin/api/* 的访问口令（必填）
-  gateway_key: ""              # client 面 Bearer 鉴权；留空 = 不校验
-  default_model: "glm-5.2"     # client 未指定 model 时的默认模型
+  admin_key: "changeme"        # 后台 /admin 与 /admin/api/* 的访问口令：回环监听可留空（裸跑），
+                               # 监听非回环（0.0.0.0 / 局域网）时必填，否则拒绝启动（cli.ts ensureAdminKey）
+  gateway_key: ""              # client 面 Bearer 鉴权：回环监听留空 = 不校验；非回环监听同样必填
+                               # （cli.ts ensureGatewayKey）。对外监听 + 空 key = 开放中继，会烧掉所有上游凭据
+  default_model: "company-anthropic/claude-sonnet-4-6"  # client 不带 model 时的兑底；须是下方示例 Provider 的 models 里真实存在的模型
   risk_max: "high"             # 调度风险上限: low | medium | high（high = 不过滤）
   precheck_context: false      # 上下文预检开关；默认关。开启后超限拒绝+换 Provider，绝不截断
 
 data_dir: "data"               # SQLite 用量与状态落盘目录
+
+# 出口代理（可选；Provider / 模型用 `egress: <id>` 引用，未引用 = 直连）：
+# egresses:
+#   - id: "clash"
+#     kind: "http"               # 仅 http | https（socks5 不支持；Clash 类用混合端口的 http 形态）
+#     addr: "127.0.0.1:7897"
 
 # 上游服务 / harness（ZCode、OpenCode、公司自建……）
 # 接入方式实例（一个 Source 可有多个 Provider；风险是一等调度维度，UI 必须显示徽章与说明）
@@ -51,7 +60,7 @@ providers:
         enabled: true
 
   # 同一上游若还讲 openai-completions 协议，另建一个 Provider（base_url 含 /v1）：
-  # - id: "company-openai"
+  # - name: "company-openai"
   #   api: "openai-completions"
   #   base_url: "https://gw.example.com/v1"   # openai 系: 含 /v1，网关拼 chat/completions
   #   credential: { api_key_env: "COMPANY_GW_KEY" }
@@ -66,7 +75,7 @@ accounts: []
 
 # ZCode 接入示例（Anthropic 原生，直通；多账号轮换靠上方的 accounts）：
 # providers:
-#   - id: "zcode-official"
+#   - name: "zcode-official"
 #     display_name: "ZCode 免费额度"
 #     access_kind: "session-reuse" # 手动填 JWT（风险中，见 NOTICE.md 登记）
 #     risk: "medium"
@@ -78,7 +87,7 @@ accounts: []
 #     headers:                         # 伪装请求头（缺了可能被拒）
 #       HTTP-Referer: "https://zcode.z.ai"
 #       X-Title: "Z Code@electron"
-#     # dynamic_headers:               # plan 通道要现场验证头时启用（见 upstream-providers.md §7.2）：
+#     # dynamic_headers:               # plan 通道要现场验证头时启用：
 #     #   command: "/usr/local/bin/zcode-minter"  # 绝对路径；stdout 打印 KEY=VALUE 行
 #     #   timeout_ms: 8000
 #     enabled: false
@@ -101,7 +110,7 @@ accounts: []
 #   Discover 页会把两版分列成两项，各自「一键导入」成独立 Provider，无需手写下面这段。
 #
 # providers:
-#   - id: "workbuddy-direct"
+#   - name: "workbuddy-direct"
 #     display_name: "WorkBuddy直连（国内版）"
 #     access_kind: "session-reuse"   # 复用桌面登录态（风险中，见 NOTICE.md 登记）
 #     risk: "medium"
@@ -123,7 +132,7 @@ accounts: []
 #
 #   # 海外版：把上面那份的 base_url / X-Domain 换成 www.workbuddy.ai 即可（两个字段必须同时改，
 #   # X-Domain 与 base_url 的 host 不一致会被上游拒）。
-#   - id: "workbuddy-ai-direct"
+#   - name: "workbuddy-ai-direct"
 #     display_name: "WorkBuddy直连（海外版）"
 #     access_kind: "session-reuse"
 #     risk: "medium"
@@ -188,7 +197,7 @@ accounts: []
 # 1) sidecar 侧：按其文档登录 + serve 在 127.0.0.1:18080（plan: start-plan）
 # 2) 本网关侧：如下建 Provider（无需凭据、无需 dynamic_headers），client 用 zcode/GLM-5.3-Flash
 # providers:
-#   - id: "zcode-plan-local"
+#   - name: "zcode-plan-local"
 #     display_name: "ZCode计划(本地sidecar)"
 #     access_kind: "reverse"
 #     risk: "high"
