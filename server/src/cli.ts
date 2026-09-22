@@ -20,6 +20,8 @@ import {
   seedProvidersIfEmpty, seedAccountsIfEmpty, migrateWorkBuddyAttributionHeaders,
 } from './adminapi/store.ts'
 import { createAdminApi } from './adminapi/api.ts'
+// 来源体检：Host 检查（防 DNS rebinding）+ 回环主机判据（下文两处口令守卫共用）。
+import { hostGuard, isLoopbackHost } from './source_guard.ts'
 import type { Finding } from './adminapi/types.ts'
 import { createSidecarApp } from './adminapi/sidecar_app.ts'
 import { createProjectsApp } from './adminapi/projects_app.ts'
@@ -62,13 +64,9 @@ export function fatal(err: Error): never {
   process.exit(1)
 }
 
-// 回环监听判定（管理口令、网关口令两处守卫共用）：剥掉 IPv6 方括号后认
-// localhost / 127.0.0.0/8 / ::1。抽成助手是为了不让两处口径各自演化——
-// 判据漂移过一次的地方，再多写一遍迟早再漂一次。
-function isLoopbackHost(host: string): boolean {
-  const h = host.replace(/^\[|\]$/g, '')
-  return h === 'localhost' || h.startsWith('127.') || h === '::1'
-}
+// 回环监听判定：口径不在这里维护——管理口令、网关口令两处启动守卫与来源体检
+// 的 Host 检查共用 source_guard.isLoopbackHost（判据漂移过一次的地方，
+// 再多写一遍迟早再漂一次）。
 
 // 管理口令策略（按暴露程度分级）：配了直接用；没配 + 回环监听放行（Ollama 同款）；
 // 没配 + 对外监听拒绝启动。
@@ -512,6 +510,11 @@ export async function runServe(args: string[]): Promise<void> {
   })
 
   const app = new Hono()
+  // 来源体检 · Host 检查（防 DNS rebinding）：全局中间件，/v1 转发面与 /admin 管理面
+  // 都挂（恶意域名 rebinding 到 127.0.0.1 后即同源，两个面都可能被直读/直写）。
+  // 只在纯裸跑（admin_key 与 gateway_key 都为空）时启用——为什么不能改成全局启用，
+  // 见 source_guard.ts 文件头注释（一句话：配了 key 的部署常有合法非回环 Host）。
+  app.use('*', hostGuard({ adminKey: cfg.gateway.adminKey, gatewayKey: cfg.gateway.gatewayKey }))
   px.registerRoutes(app)
   app.route('/', admin)
   // 产物路径在模块加载时按「哪个候选目录含 web/dist」探测定下（见文件顶部 distRoot），

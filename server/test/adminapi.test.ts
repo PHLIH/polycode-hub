@@ -155,6 +155,10 @@ function caller(app: Hono) {
     const headers: Record<string, string> = {}
     if (o.key) headers['X-Admin-Key'] = o.key
     if (o.bearer) headers['Authorization'] = `Bearer ${o.bearer}`
+    // 管理面有 Content-Type 检查（来源体检 · 防 CSRF）：带 body 的请求必须声明
+    // application/json。真实管理台（web/src/api.js）恒带头；这里不带的话，
+    // fetch 会给字符串体自动补 text/plain，正好撞上 415 那条防线。
+    if (o.body !== undefined) headers['Content-Type'] = 'application/json'
     // 账号按 Provider 名归属（建号时校验存在性）。账号用例的夹具一律 providerName:'s'，
     // 这里在真正要建号前惰性补建一个名为 s 的 Provider——用 ensure 而不是预置，
     // 是为了不污染 provider 用例（它们断言的是 provider 列表本身，比如"空列表"）。
@@ -184,6 +188,7 @@ async function ensureAccountOwner(
   const headers: Record<string, string> = {}
   if (o.key) headers['X-Admin-Key'] = o.key
   if (o.bearer) headers['Authorization'] = `Bearer ${o.bearer}`
+  headers['Content-Type'] = 'application/json' // 见 caller：Content-Type 来源体检
   let providers: Provider[] = []
   try {
     const resp = await app.request('/admin/api/providers', { headers })
@@ -270,6 +275,8 @@ describe('鉴权（对齐 Go TestAuth/TestAuthOpenMode）', () => {
     const app = build({ key: '' })
     const call = caller(app)
     expect((await call('GET', '/admin/api/providers')).status).toBe(200)
+    // 裸跑 = 鉴权整体放行，连“带了错 key”也一样（早退分支，不走恒时比较）。
+    expect((await call('GET', '/admin/api/providers', { key: 'wrong' })).status).toBe(200)
     expect((await call('POST', '/admin/api/providers', { body: providerBody })).status).toBe(201)
     expect((await call('GET', '/admin/api/stats')).status).toBe(200)
   })

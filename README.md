@@ -1,6 +1,6 @@
 # polycode-hub
 
-[![Version: 0.1.0](https://img.shields.io/badge/version-0.1.0-orange)](package.json) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![Node.js >= 22.13](https://img.shields.io/badge/Node.js-%3E%3D22.13-339933?logo=node.js&logoColor=white)](package.json) [![Tests](https://img.shields.io/badge/tests-943%20passed-brightgreen)](#开发) [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue?logo=typescript&logoColor=white)](tsconfig.json)
+[![Version: 0.1.0](https://img.shields.io/badge/version-0.1.0-orange)](package.json) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![Node.js >= 22.13](https://img.shields.io/badge/Node.js-%3E%3D22.13-339933?logo=node.js&logoColor=white)](package.json) [![Tests](https://img.shields.io/badge/tests-957%20passed-brightgreen)](#开发) [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue?logo=typescript&logoColor=white)](tsconfig.json)
 
 > 免费额度通常绑着自家客户端一起发：想用这份额度，就得用它的 harness。于是你的工具选择权，被 token 拿走了。
 
@@ -187,7 +187,7 @@ npx tsx server/src/cli.ts <子命令>     # 或用 bin shim：node bin/polycode-
 
 ```bash
 npm run dev            # 后端热重启（tsx watch）
-npm test               # 全量测试（vitest，46 个文件 943 个用例，另 1 个跳过）
+npm test               # 全量测试（vitest，47 个文件 957 个用例，另 1 个跳过）
 npm run typecheck      # tsc --noEmit——只覆盖 server/（tsconfig include 仅 server/src、server/test；web 前端的 .ts/.vue 不参与）
 
 npm run dev:web        # 前端 HMR；已配代理把 /admin/api 转给 :3000

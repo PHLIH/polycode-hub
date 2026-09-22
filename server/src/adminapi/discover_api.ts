@@ -338,14 +338,25 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     // 上游慢/网络差时 fetchModelsWithProtocols 可能挂很久——导入响应绝不能被它拖住
     // （provider 在前面的 put 就已落库，模型补全晚到只损失「自动发现模型」这一项）。
     // 8s 竞速：超时走 catch 分支给指引，用户可稍后手动「扫描可用性」。
+    //
+    // 计时器必须在竞速**结束后清掉**（正常/异常都要，放 finally 一处收口）：
+    // race 一结束结果就有了归宿，这颗 8s 定时器却还挂在事件循环上——白白拖住
+    // 事件循环最长 8 秒才退出；rej 闭包若还被定时器握着，连带它捕获的 Promise
+    // 也多活 8 秒。此处不涉及 AbortController，上游请求的中止语义保持原样
+    //（照旧自行跑完/失败，只清计时器，不碰 lister 那一路）。
+    let timer: ReturnType<typeof setTimeout> | undefined
     try {
       const list = await Promise.race([
         lister.listProviderModels(p.providerId),
-        new Promise<never>((_, rej) => setTimeout(() => rej(new Error('模型自动扫描超时（8s）')), 8000)),
+        new Promise<never>((_, rej) => {
+          timer = setTimeout(() => rej(new Error('模型自动扫描超时（8s）')), 8000)
+        }),
       ])
       ids = (list as { models: string[] }).models
     } catch (e) {
       return `模型目录为空且自动扫描未完成（${(e as Error).message}）：请到 Providers 页点「扫描可用性」或手动添加模型`
+    } finally {
+      clearTimeout(timer)
     }
     if (ids.length === 0) {
       return `模型目录为空且未能自动发现模型：请到 Providers 页点「扫描可用性」或手动添加模型`

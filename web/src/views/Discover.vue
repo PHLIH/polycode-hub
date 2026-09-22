@@ -121,6 +121,16 @@ const scProvider = ref('')
 // 换 provider 再点一次会叠出两条，展示新提示前先把旧的关掉。
 let loginToast = null
 
+// escapeHtml：登录提示保留富文本结构（<b> / <br> / <a>，去掉会把标签原样显示给用户，
+// UI 变化太大），但 r.provider / r.url 来自服务端（引擎返回的授权链接与账号类型），
+// 属不可信数据——直接拼进 dangerouslyUseHTMLString 的 HTML 会被浏览器当 HTML 解析执行
+// （数据源里塞 `<img src=x onerror=...>` 即可触发 XSS，读 localStorage 管理口令、同源直打 admin API）。
+// 所有插值字段先转义再拼，实体化后只剩纯文本，无法再构成标签/属性注入。
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+}
+
 async function scLogin() {
   // 防重入：scBusy 的赋值是同步的，但 `:disabled` 要等 Vue 更新 DOM 才生效，
   // 快速双击仍可能进两次函数。这里显式挡一道。
@@ -134,10 +144,16 @@ async function scLogin() {
     // （没有默认浏览器关联、远程会话等），用户点一下就能到达授权页。
     // 常驻提示只保留最新一条：换 provider 再点时旧的还在，会跟新文案打架。
     loginToast?.close()
+    const escProvider = escapeHtml(r.provider)
+    // href 只放行 http(s)：转义挡住标签/属性注入，但拦不住 `javascript:` 这类
+    // 可执行 scheme（实体化后仍是合法 URL 文本，点击即执行）——非 http(s) 不渲染链接。
+    const linkHtml = /^https?:\/\//i.test(String(r.url))
+      ? `<br><a href="${escapeHtml(r.url)}" target="_blank" rel="noopener">没看到弹窗？点此打开授权页</a>`
+      : ''
     loginToast = ElMessage({
       duration: 0, showClose: true, dangerouslyUseHTMLString: true,
-      message: `引擎已在默认浏览器打开 <b>${r.provider}</b> 授权页 —— 完成授权后回来点「启动」。`
-        + `<br><a href="${r.url}" target="_blank" rel="noopener">没看到弹窗？点此打开授权页</a>`
+      message: `引擎已在默认浏览器打开 <b>${escProvider}</b> 授权页 —— 完成授权后回来点「启动」。`
+        + linkHtml
         + `<br><span style="opacity:.7">若随后自动弹出 ZCode 客户端窗口，那是授权回调`
         + `（zcode:// 链接），直接关掉即可，不影响登录。</span>`,
     })

@@ -14,7 +14,7 @@
 // ProxyAgent（与 router/upstream 转发面同源，不新增依赖）。
 
 import { execFileSync } from 'node:child_process'
-import { fetch as undiciFetch, ProxyAgent } from 'undici'
+import { fetch as undiciFetch, ProxyAgent, Response as UndiciResponse } from 'undici'
 import type { FetchLike } from './sidecar.ts'
 
 export interface ProxyURL {
@@ -234,11 +234,106 @@ export function maskProxyURI(uri: string | null): string {
 // proxiedFetch 按代理 URI 造 fetch：有代理 → 走 undici ProxyAgent 的 fetch
 //（与转发面同源，避免 npm undici 与 Node 内置 undici 跨包传 dispatcher 报
 // invalid onRequestStart）；无代理 → 全局 fetch（直连）。
+//
+// 连接池作用域（此前漏掉的缺陷）：旧实现在这里 new 一个 ProxyAgent 交给返回的
+// fetch 反复用，**用完从不 close**。进程是长驻的（serve 常驻、CLI 一个进程跑完
+// 整个 ensure），管理台每测一次代理、每走一次带 egress 的下载就漏一个连接池——
+// fd 与 socket 缓慢累积，跑得越久漏得越多。现在改为**每次 HTTP 交换独立造一个
+// agent，并在这次交换彻底完成后关掉**（见 proxiedExchange）。不能整个 fetch
+// 共用一个池再挑时机关：返回的 fetch 会被调很多次（release 查询 6 次重试、下载
+// 60 轮续传重试），共用一个池就永远说不清「哪一刻之后彻底没人用了」，又会退回
+// 从不关的老路。
 export function proxiedFetch(proxyURI: string | null): FetchLike {
   if (!proxyURI) return fetch
-  const agent = new ProxyAgent(proxyURI)
   return ((url: string | URL | Request, init?: RequestInit) =>
-    undiciFetch(url as never, { ...(init as object), dispatcher: agent } as never)) as unknown as FetchLike
+    proxiedExchange(proxyURI, url, init)) as unknown as FetchLike
+}
+
+// 模块级注册表：兜住「拿到 Response 后既不读也不 cancel、直接丢弃」的路径——
+// 本仓库确有这种写法（sidecar 下载循环对非 200/206 直接 continue、latestRelease
+// 对 4xx 直接 throw，都不碰 body）。这条路没有任何事件可挂，只剩 GC：token 与
+// 响应一起变成垃圾时补一次关池。正常关闭会走 unregister，不会重复触发。
+const abandonedAgentCloser = new FinalizationRegistry<ProxyAgent>((agent) => {
+  void agent.close().catch(() => { /* 已关/正在关 */ })
+})
+
+// proxiedExchange 执行一次「代理出口 HTTP 交换」：建池 → 请求 → 等这次交换
+// 彻底完成 → 关池。**所有路径都要关**，判据是「这次交换还有没有字节在途」：
+//   1. fetch 抛错（连不上代理/上游、signal 中止）→ 响应都没成型，没有 body 要
+//      管，当场关；
+//   2. 响应没有 body（HEAD/204/304）→ 响应头拿到即交换完成，当场关；
+//   3. 响应带**流式 body**（release JSON、66MB 引擎下载都在这条路上）→ 绝不能
+//      在 body 还在传时关：close() 会把在途连接一起拆掉，下载会截断成半截文件、
+//      撞上 sha256 不匹配。所以把 body 包一层透传流，「读完 / 被 cancel /
+//      传输出错」任一出口到达（= 再没有字节在途）才关。
+async function proxiedExchange(
+  proxyURI: string,
+  url: string | URL | Request,
+  init?: RequestInit,
+): Promise<UndiciResponse> {
+  const agent = new ProxyAgent(proxyURI)
+  // token 由下面的关闭逻辑与 body 包装流共同持有：只要还有人在读这份响应就活着，
+  // 响应被整体丢弃（既不读也不 cancel）时才随垃圾一起消失，触发注册表兜底。
+  const token = {}
+  abandonedAgentCloser.register(token, agent)
+  let closed = false
+  // 关池只发生一次，且**绝不冒泡**：走到这里时该交换已经结束（或已经出错），
+  // 关不掉只是连接池的卫生问题，不该把它变成一次「下载失败」。与本文件其余兜底
+  //（读系统代理失败 → 直连）同风格：吞掉，不打扰主流程。
+  const closeAgent = async (): Promise<void> => {
+    if (closed) return
+    closed = true
+    abandonedAgentCloser.unregister(token)
+    try { await agent.close() } catch { /* 已关/正在关 */ }
+  }
+  let res: UndiciResponse
+  try {
+    res = await undiciFetch(url as never, { ...(init as object), dispatcher: agent } as never)
+  } catch (e) {
+    await closeAgent() // 路径 1：错误路径上也要关
+    throw e
+  }
+  const body = res.body
+  if (body === null) {
+    await closeAgent() // 路径 2：无 body，响应头拿到即交换完成
+    return res
+  }
+  // 路径 3：流式 body。包一层透传流，把「读完 / 取消 / 出错」翻译成关池时机；
+  // 关池用 void 而不 await——流回调里的 close 不该拖慢调用方的下一次 read()。
+  const reader = body.getReader()
+  const wrapped = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read()
+        if (done) {
+          controller.close()
+          void closeAgent() // 最后一个字节已交给调用方 → 这次交换彻底完成
+        } else {
+          controller.enqueue(value)
+        }
+      } catch (e) {
+        void closeAgent() // 传输出错 / 被 signal 中止：交换以异常告终，同样要关
+        controller.error(e)
+      }
+    },
+    async cancel(reason) {
+      // 调用方放弃（res.body.cancel() / 读到一半取消）：关池与拆底层流两件都要做，
+      // 只 cancel 不关就又漏回去了。
+      void closeAgent()
+      try { await reader.cancel(reason) } catch { /* 底层流可能已关闭 */ }
+    },
+  })
+  // 必须重新包一层 Response：undici 的 text()/arrayBuffer() 读的是**内部** body 流
+  //（consumeBody → getInternalState(this).body），只改公开的 res.body 属性骗不过它，
+  // 得让包装流成为这份 Response 的本体。代价是 url/redirected 不跟着带过来（构造
+  // 出来的 Response 没有这两个字段），本文件调用方（sidecar 的 install/ensure 只看
+  // status/headers/body）不用它们。TS 侧 undici 的 BodyInit 没收 ReadableStream
+  //（DOM-free 类型的省略），运行时 extractBody 明确支持，故按 as never 过类型。
+  return new UndiciResponse(wrapped as never, {
+    status: res.status,
+    statusText: res.statusText,
+    headers: res.headers,
+  })
 }
 
 // egressDefToProxyURI 把项目 egress 表的一行（{kind, addr}）转成代理 URI。

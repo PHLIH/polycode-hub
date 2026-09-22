@@ -80,7 +80,7 @@ function ok(c: C, status: 200 | 201 | 409 | 501 | 502, v?: unknown): Response {
   return c.json(v ?? {}, status)
 }
 
-function errRes(c: C, status: 400 | 401 | 403 | 404 | 409 | 500 | 501 | 502, typ: string, msg: string): Response {
+function errRes(c: C, status: 400 | 401 | 403 | 404 | 409 | 415 | 500 | 501 | 502, typ: string, msg: string): Response {
   return c.json({ error: { type: typ, message: msg } }, status)
 }
 
@@ -254,6 +254,33 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
       return errRes(c, 401, ERR.AUTHENTICATION, '管理口令无效')
     }
     await next()
+  })
+
+  // ---- 来源体检 · Content-Type 检查（防 CSRF）----
+  //
+  // 威胁模型：c.req.json() 原先不看 Content-Type，而恶意网页可以用
+  // `fetch('http://127.0.0.1:3000/admin/api/...', {method:'POST', body:'{"..."}',
+  // headers:{'Content-Type':'text/plain'}})` 跨站发 JSON——text/plain 是 simple
+  // request，不预检、浏览器直发；裸跑（admin_key 为空）时 withAuth 放行，攻击者
+  // 就能改掉本机配置。补法：只认 application/json（含 ;charset 等参数）。
+  //
+  // 三条规则（对 POST/PUT/PATCH/DELETE）：
+  //   · 带了 Content-Type 且不以 application/json 开头 → 415（表单/FormData 必为
+  //     urlencoded/multipart/text/plain，全被这一条拦住）；
+  //   · 没带 Content-Type → 放行（保 curl 无头习惯；浏览器发 body 必带 CT，
+  //     所以「带 body 却没 CT」只可能来自非浏览器调用方，不构成 CSRF）；
+  //   · GET/HEAD 不查（无 body 可藏）。
+  // 只挂 admin 面：转发面（/v1 等）协议五花八门，不做内容类型限制。
+  // 位置在 withAuth 之后：鉴权失败先报 401，不给未鉴权者暴露校验口径。
+  app.use('*', async (c, next) => {
+    const method = c.req.method
+    if (method !== 'POST' && method !== 'PUT' && method !== 'PATCH' && method !== 'DELETE') return next()
+    const ct = c.req.header('Content-Type')
+    if (ct === undefined) return next() // 没带 = 放行（见上）
+    // 媒体类型大小写不敏感；参数（;charset=utf-8）在前缀之后，不影响 startsWith。
+    if (ct.trim().toLowerCase().startsWith('application/json')) return next()
+    return errRes(c, 415, ERR.INVALID_REQUEST,
+      `Content-Type 须为 application/json（收到 ${ct.slice(0, 80)}）。管理面只收 JSON 请求体`)
   })
 
   // ---- providers ----
