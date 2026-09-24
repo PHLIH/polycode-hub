@@ -913,6 +913,11 @@ function ttftText(m) {
 .num { font-variant-numeric: tabular-nums; }
 
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; margin-bottom: 16px; }
+/* ≤600px：minmax(190px) 的最小列宽在窄屏下会把网格撑出视口（375px 下 .card 溢出 39px，真缺陷）。
+   改单列自适应：列宽由容器决定，永不溢出。 */
+@media (max-width: 600px) {
+  .cards { grid-template-columns: minmax(0, 1fr); }
+}
 /* 卡片：默认全部同权重，没有任何一格被固定强调。
    只有鼠标悬浮时才提亮边框——高亮是「正在看这里」的反馈，不是常驻状态。 */
 .card {
@@ -946,7 +951,10 @@ function ttftText(m) {
 /* ---- 接入信息条（一行） ----
    标签 / 地址框 / Key 说明 / 复制键。地址框与 Key 说明各占一半剩余宽度
    （flex:1 1 0），整行铺满不留白——之前地址框限宽 320px，全挤在左边是被嫌的原因。 */
-.access { display: flex; align-items: center; gap: 12px; padding: 10px 16px; }
+.access { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+  /* 375px 下固定开销（label+btn+gaps+padding ≈158px）已超内容区 127px，
+     两个 flex 框缩到 0 也无处可缩，复制按钮被挤出面板 ~39px（真缺陷）：装不下就换行。 */
+  flex-wrap: wrap; }
 .access-label { flex: 0 0 auto; font-size: 12px; }
 .access-hint {
   flex: 1 1 0; min-width: 0; font-size: 12px;
@@ -992,7 +1000,18 @@ function ttftText(m) {
    故月份行不再需要 margin-left）。 */
 .heat-wrap { overflow-x: auto; padding-bottom: 4px; }
 .heat-months { display: flex; gap: 3px; height: 14px; margin-bottom: 3px; }
-.heat-month { font-size: 10px; color: var(--dim); flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; }
+.heat-month { font-size: 10px; color: var(--dim); flex: 1; min-width: 0; white-space: nowrap; overflow: visible; }
+/* 列宽 < 字宽时（窄屏列仅 ~7px）曾把「10月」裁成「10」（改动前就存在）。
+   改 overflow:visible 让文字右溢到相邻空列——月份标签间隔 ≥4 列（一个月约 4.2 列），
+   空隙足够不撞下一个标签；窄屏再收一档字号，实测文字框不相交（见验证）。 */
+@media (max-width: 900px) {
+  .heat-month { font-size: 9px; }
+}
+/* <600px：内容区仅 127~232px 塞 53 列，列距 < 字宽，任何字号都必然相撞（实测 480px 真撞 3 对）：
+   整行隐藏，日期交给格子 hover 的自绘 tooltip（信息不丢，只降级呈现）。 */
+@media (max-width: 599px) {
+  .heat-months { display: none; }
+}
 /* 残月候选只在窄屏下隐藏：宽屏（1440px）放得下就留着，JS 不一刀切（见 MONTH_LABELS 注释）。
    必须用 visibility 而非 display：display:none 会把该 flex item 从行里移除，
    行内只剩 N−1 个 flex:1 子项、节距变宽，后面每个月份标签整体左移
