@@ -306,6 +306,9 @@ async function saveNote(p, id) {
   const k = keyOf(p, id)
   const m = modelOf(p, id)
   if (!m) return
+  // 真实缺陷修复：keyup.esc 先置空 noteEdit（取消），随后输入框卸载仍会触发 blur → saveNote，
+  // 把本该被取消的内容存进服务端（Esc 取消失效）。故 blur/enter 落库前必须确认编辑仍在进行。
+  if (noteEdit.value !== k) return
   const note = noteDraft.value.trim()
   if (note === (m.note || '')) { noteEdit.value = ''; return } // 没改就不打接口
   try {

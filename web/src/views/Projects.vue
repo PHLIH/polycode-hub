@@ -1125,7 +1125,9 @@ h2 { margin: 0; font-size: 18px; }
 /* 日志窗口提示行：truncated 说明窗口裁掉了更早的行，不是全量 */
 .log-tip { color: var(--dim); font-size: 12px; margin: 6px 0; }
 .log-foot { align-items: center; }
-.log-auto { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 12px; cursor: pointer; }
+.log-auto { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 12px; cursor: pointer;
+  /* 不可收缩且不折行：弹窗窄时曾被右侧按钮挎成「自动刷/新/(2s)」三行（真缺陷修复） */
+  flex: none; white-space: nowrap; }
 .log-auto input { accent-color: var(--accent); }
 .log-paused { color: var(--warn); font-size: 12px; }
 </style>

@@ -263,7 +263,7 @@ function level(v) {
 const MONTH_LABELS = computed(() => {
   const cols = WEEKS.value
   let lastMonth = null
-  return cols.map((col) => {
+  const labels = cols.map((col) => {
     if (!col.length) return ''
     // 该列里第一个「月份与上一列末尾不同」的格子 = 本月真正开始的位置
     const months = col.map(c => c.month)
@@ -278,6 +278,14 @@ const MONTH_LABELS = computed(() => {
     }
     return ''
   })
+  // 首列往往只是个残月（窗口不从月初开始）：它与下一个标签可能只隔一两列，
+  // 窄屏下两段文字会挤在一起（真缺陷：768px 下「9月 10月」贴脸）。
+  // 距下一个标签不足 4 列（一个月约 4.2 列）就丢掉残月标签，让第一个完整月份当起点。
+  if (labels[0]) {
+    const next = labels.findIndex((l, i) => i > 0 && l)
+    if (next > 0 && next < 4) labels[0] = ''
+  }
+  return labels
 })
 
 // 活跃天数/峰值跟热力图的 365 天全周期（heatBd），【不】跟胶囊。
@@ -663,12 +671,14 @@ function ttftText(m) {
         <span v-for="(m, i) in MONTH_LABELS" :key="i" class="heat-month">{{ m }}</span>
       </div>
       <!-- 无星期行标：格子只表达「某天用了多少」，行列不承载星期语义。
-           提示用自绘 tooltip（见 hoverTip）：原生 title 有 1~2s 的浏览器延迟。 -->
+           提示用自绘 tooltip（见 hoverTip）：原生 title 有 1~2s 的浏览器延迟。
+           只有「有量」的天才进 Tab 序：零值格 hover 同样有提示，但 365 个空格全部可聚焦
+           会让键盘/无障碍树被无效节点刷屏（真缺陷修复）。 -->
       <div class="heat-grid">
         <div v-for="(w, wi) in WEEKS" :key="wi" class="heat-week" :class="{ 'col-on': hover.col === wi }">
           <div v-for="(c, ri) in w" :key="c.key" class="heat-cell" :class="'lv' + level(c.value)"
             @mouseenter="showTip(c, $event, wi, ri)" @mouseleave="hideTipAndHover" @focus="showTip(c, $event, wi, ri)" @blur="hideTipAndHover"
-            tabindex="0" :aria-label="`${c.day}：${fmt(c.tokens)} token / ${c.requests} 次请求`" />
+            :tabindex="c.value ? 0 : -1" :aria-label="`${c.day}：${fmt(c.tokens)} token / ${c.requests} 次请求`" />
         </div>
       </div>
     </div>
@@ -745,7 +755,11 @@ function ttftText(m) {
       <button type="button" class="merge-apply" @click="doMerge">确认合并</button>
     </div>
     <p v-if="byModel.length && filteredModels.length && merging && !canMerge" class="dim merge-hint">勾选要合并的行（至少选两行）</p>
-    <table v-if="filteredModels.length" class="attr">
+    <!-- 表格包滚动容器：11 个数字列 + 占比条在窄屏下天然超宽。
+         以前是整个 .main 跟着溢出（768px 下 scrollWidth 594 > clientWidth 568，真缺陷修复）。
+         现在表格在容器内横滚：面板不破版，表头与分页保持对齐。 -->
+    <div v-if="filteredModels.length" class="attr-scroll">
+    <table class="attr">
       <thead>
         <tr>
           <th v-if="merging" class="check-col"></th>
@@ -763,7 +777,7 @@ function ttftText(m) {
         <template v-for="r in modelRows" :key="'gm-' + r.modelId">
           <tr>
             <td>
-              <div class="model-line"><span class="model-name">{{ r.modelId }}</span></div>
+              <div class="model-line"><span class="model-name" :title="r.modelId">{{ r.modelId }}</span></div>
               <div class="src-name sub-src">
                 <button class="link-btn" @click="toggleExpand('gm-' + r.modelId)">
                   {{ expandedGroups.has('gm-' + r.modelId) ? '收起' : '展开' }}({{ r._members.length }} 个来源)
@@ -832,7 +846,7 @@ function ttftText(m) {
             </template>
             <template v-else>
               <!-- 归因视图 A：模型是主（用户按模型认账），Provider 是辅并标内部 id -->
-              <div class="model-line"><span class="model-name">{{ m.modelId }}</span></div>
+              <div class="model-line"><span class="model-name" :title="m.modelId">{{ m.modelId }}</span></div>
               <div class="src-name sub-src">
                 {{ srcName(m) }}<span v-if="srcIdOf(m)" class="mono pid">#{{ srcIdOf(m) }}</span>
               </div>
@@ -858,7 +872,7 @@ function ttftText(m) {
           :key="'sub-' + sub.providerName + '/' + sub.modelId" class="sub-row">
           <td v-if="merging" class="check-col"></td>
           <td>
-            <div class="model-line"><span class="model-name">{{ sub.modelId }}</span></div>
+            <div class="model-line"><span class="model-name" :title="sub.modelId">{{ sub.modelId }}</span></div>
             <div class="src-name sub-name sub-src">
               {{ srcName(sub) }}<span v-if="srcIdOf(sub)" class="mono pid">#{{ srcIdOf(sub) }}</span>
             </div>
@@ -879,6 +893,7 @@ function ttftText(m) {
         </template>
       </tbody>
     </table>
+    </div>
     <div v-if="pageCount > 1" class="pager">
       <span class="pager-total num">共 {{ filteredModels.length }} 个模型</span>
       <el-pagination layout="prev, pager, next" :page-size="PAGE_SIZE"
@@ -1005,7 +1020,13 @@ function ttftText(m) {
    .heat-tip 元素，scoped 样式不跨组件）。这里不再重复定义。 */
 
 /* ---- 归因表 ---- */
-.attr { width: 100%; border-collapse: collapse; font-size: 12px; }
+.attr-scroll { overflow-x: auto; margin: 0 -16px; padding: 0 16px; }
+.attr { width: 100%; min-width: 640px; border-collapse: collapse; font-size: 12px; }
+/* 数字列不折行（"48.7 tok/s" 曾在窄屏下被断成两行压高行）；
+   模型名列允许省略，悬停有完整名：见 .model-name title 绑定。 */
+.attr .num { white-space: nowrap; }
+.model-name { display: inline-block; max-width: 220px; overflow: hidden;
+  white-space: nowrap; text-overflow: ellipsis; vertical-align: bottom; }
 /* 右上角合并开关：与时间胶囊并排的轻量按钮 */
 .merge-toggle {
   border: 1px solid var(--line); background: var(--panel-2); color: var(--dim);
