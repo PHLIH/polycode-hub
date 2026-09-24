@@ -279,13 +279,15 @@ const MONTH_LABELS = computed(() => {
     return ''
   })
   // 首列往往只是个残月（窗口不从月初开始）：它与下一个标签可能只隔一两列，
-  // 窄屏下两段文字会挤在一起（真缺陷：768px 下「9月 10月」贴脸）。
-  // 距下一个标签不足 4 列（一个月约 4.2 列）就丢掉残月标签，让第一个完整月份当起点。
+  // 窄屏下两段文字会挤在一起（真缺陷：768px 下「9月 10月」贴脸）。但删不删取决于视口——
+  // 1440px 宽屏是放得下的，不能一刀切。JS 只判定「拥挤候选」打标，具体藏不藏交给 CSS 媒体查询。
+  // 距下一个标签不足 4 列（一个月约 4.2 列）即为候选，让第一个完整月份当窄屏起点。
+  let dropNarrow = -1
   if (labels[0]) {
     const next = labels.findIndex((l, i) => i > 0 && l)
-    if (next > 0 && next < 4) labels[0] = ''
+    if (next > 0 && next < 4) dropNarrow = 0
   }
-  return labels
+  return { labels, dropNarrow }
 })
 
 // 活跃天数/峰值跟热力图的 365 天全周期（heatBd），【不】跟胶囊。
@@ -668,7 +670,8 @@ function ttftText(m) {
 
     <div class="heat-wrap" ref="heatWrapEl">
       <div class="heat-months">
-        <span v-for="(m, i) in MONTH_LABELS" :key="i" class="heat-month">{{ m }}</span>
+        <span v-for="(m, i) in MONTH_LABELS.labels" :key="i" class="heat-month"
+          :data-drop-narrow="i === MONTH_LABELS.dropNarrow || null">{{ m }}</span>
       </div>
       <!-- 无星期行标：格子只表达「某天用了多少」，行列不承载星期语义。
            提示用自绘 tooltip（见 hoverTip）：原生 title 有 1~2s 的浏览器延迟。
@@ -930,9 +933,15 @@ function ttftText(m) {
 
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; margin-bottom: 16px; }
 .panel h3 { margin: 0 0 12px; font-size: 14px; }
-.panel-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.panel-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
 .panel-head h3 { margin: 0; }
-.controls { display: flex; gap: 8px; }
+/* ≤600px 时搜索框 + 三个按钮天然超宽（既有问题，真缺陷）：换行而不是撑出面板。
+   搜索框允许收缩到 120px，按钮不折行，胶囊独占一行时右对齐不断裂。 */
+.controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; min-width: 0; }
+.controls .el-input { min-width: 0; }
+@media (max-width: 600px) {
+  .controls .el-input { flex: 1 1 120px; width: auto !important; }
+}
 
 /* ---- 接入信息条（一行） ----
    标签 / 地址框 / Key 说明 / 复制键。地址框与 Key 说明各占一半剩余宽度
@@ -984,6 +993,14 @@ function ttftText(m) {
 .heat-wrap { overflow-x: auto; padding-bottom: 4px; }
 .heat-months { display: flex; gap: 3px; height: 14px; margin-bottom: 3px; }
 .heat-month { font-size: 10px; color: var(--dim); flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; }
+/* 残月候选只在窄屏下隐藏：宽屏（1440px）放得下就留着，JS 不一刀切（见 MONTH_LABELS 注释）。
+   必须用 visibility 而非 display：display:none 会把该 flex item 从行里移除，
+   行内只剩 N−1 个 flex:1 子项、节距变宽，后面每个月份标签整体左移
+   （768px 实测漂移 −13.2px ≈ 一整列，「10月」落到 9 月的列上），
+   违反上面「月份行与网格同列数、同 flex 策略，节距恒一致」的对齐契约。 */
+@media (max-width: 1100px) {
+  .heat-month[data-drop-narrow] { visibility: hidden; }
+}
 .heat-grid { display: flex; gap: 3px; }
 .heat-week { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .heat-week .heat-cell {
