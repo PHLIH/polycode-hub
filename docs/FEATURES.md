@@ -217,6 +217,18 @@ SQLite 持久化（`usage/store.ts`，schema v5，`user_version` 前向迁移，
   - 代理实现复用已有依赖 `undici` 的 `ProxyAgent`（与转发面同源，不新增依赖）；CLI 侧不再用 `setGlobalDispatcher` 全局污染（那是进程级副作用，改为按次注入 fetch）。
   - 实测（2026-09-18，本机 egress `clash`=127.0.0.1:7897）：release `v4.6.7` / `zcode-proxy-darwin-arm64` 63.4MB 经代理下载成功，约 1.0 MB/s。修复前管理台 `ensure` 走全局 fetch 直连，同一网络下必然长时间卡住。
 - **平台口径（易错点）**：`assetName()` 吃的是 **Go 的 GOOS**（`darwin`/`linux`/`windows`），而 Node 的 `process.platform` 在 Windows 上是 `win32`。两者必须在边界处经 `normalizeGOOS()` 归一。历史缺陷：`install()` 直接把 `process.platform` 传进去，Windows 恒抛「平台 win32/x64 无预编译产物」——**从来就装不上**，且与网络无关（在下载之前就返回了）；旧测试全用 `goos:'windows'` 显式传参，恰好绕开了真实入参路径所以没暴露。Windows 资产是单一构建 `zcode-proxy.exe`（不带架构后缀，v4.6.7 为 87.1MB），arm64 靠系统仿真运行。
+- **macOS 代码签名修复（`sidecar/machsign.ts`，2026-09-26）**：官方 release 的 adhoc 签名在新版 macOS 上过不了内核分页校验，`install` 落地后自动重签。
+  - 故障形态：下载的产物**内容 sha256 与 release API 的 `asset.digest` 完全一致**（即未被篡改），但 exec 之后**立刻被 SIGKILL**，连 `--help` 都不输出。`~/Library/Logs/DiagnosticReports/*.ips` 给出确切死因：`exception = EXC_BAD_ACCESS / "SIGKILL (Code Signature Invalid)"`、`termination = { namespace: "CODESIGNING", indicator: "Invalid Page" }`——即内容分页哈希与自带签名不符。
+  - 与上游版本无关：v2.6.0 / v4.0.0 / v4.1.2 / v4.5.5 / v4.6.5 / v4.6.9 / v4.7.0 **全部同样被杀**；而本机 bun 1.4.2 自己 `bun build --compile` 的产物（同为 linker-signed adhoc）能正常跑。根因是上游 CI 用的 bun 1.4.0 打出的签名与新版 macOS 的 codesigning 校验不兼容，上游侧短期无法修复。
+  - 修法：`install` 在 `rename` 到最终路径后调 `resignIfNeeded(dest)`（`sidecar.ts:958-967`），用本机 `codesign --force --sign -` 重打一份 adhoc 签名覆盖旧的。实测 v4.6.9 / v4.7.0 重签后均正常启动，且对已修文件重复执行幂等。
+  - 为什么放在 `rename` 之后：codesign 是**原地改写**，必须作用在最终路径上；且此时 sha256 已校验通过（签名在内容之外，不被牵连）。
+  - 三态返回（`resigned` / `already-valid` / `failed`）：非 darwin、签名本来就有效（`codesign --verify` 退出码 0）、重签失败，三种情况都**不阻断安装**——重签失败时保留原文件，只打告警并给出可手动执行的命令，至少让用户有明确线索可查。
+  - **只在 darwin 上动手**：linux/windows 没有这套 codesigning 校验，官方产物一直是能跑的。
+  - 测试（`server/test/machsign.test.ts`）不引入 66MB 二进制 fixture：取一份真实 Mach-O（本机 bun 编译的），写坏 `__TEXT` 中段但保留签名区与文件长度，复刻「有效签名 + 内容被改」的形态，断言重签后 `codesign --verify` 通过且能 exec。
+- **上游版本跟踪（2026-09-26）**：引擎跟随 `releases/latest`，无版本锁。当次核对上游 `TriDefender/zcode-api` 已发 **v4.7.0**（2026-09-25），本机安装即该版本，实测 LLM 主通道可用。
+  - v4.7.0 的主要新功能是**官方 MCP 网关中继**（`GET /mcp` 列端点 + `/mcp/{server}` 转发到 `zcode.z.ai/api/v1/mcp/server/{routeId}`，目录含天眼查/Wind/同花顺 iFinD 等 15 个 server）。本机实测可达：`GET /mcp` 正常返回目录，但 `authReady: false` / `authError: plan_unsupported`，实际 `initialize` 被上游以 JSON-RPC `3101 coding plan is required` 拒绝。
+  - 原因是**配置口径**而非代码缺陷：上游 MCP 中继只支持 `plan: coding-plan`，而 `setupConfig()` 生成的是 `plan: start-plan`（`sidecar.ts:976`）。start-plan 是纯体验/JWT 通道，上游明确不让它访问 MCP 平面。
+  - **本机不具备切换条件（已实测）**：切 coding-plan 需要一份有效的 coding-plan API key。本机 `~/.zcode/v2/config.json` 里 `builtin:zai-coding-plan.options.apiKey` 确实存在且**直连上游 api.z.ai 有效**（返回 `1113 Insufficient balance or no resource package` 而非 401），即账号没有付费 coding plan 资源包。因此切换 `plan` 只会让 MCP 从「明确不可用」变成「明确也不可用」，同时让现在能用的 start-plan 通道受影响。**结论：保持 start-plan，不接 MCP**；待账号有付费资源包后再评估（届时只需改 `setupConfig` 的 plan 一行，凭据可由 `auth login zai --import` 自动带入——上游 `importFromZCodeConfig` 会同时导入 apiKey 与 JWT）。
 - OAuth（`zcodeauth/index.ts`）：`TOKEN_BASE https://zcode.z.ai` / `LOGIN_BASE https://api.z.ai`；`startFlow`（`POST …/oauth/cli/init` 拿 flowID/authorizeURL）→ `pollFlow`（`GET …/poll/{flowID}` 等 ready，5 分钟有效）→ `resolveBusinessToken`（`POST …/api/auth/z/login` 换 business JWT）；JWT 只打印不落盘。
 
 ## 11. 本地项目管理器（与代理链路解耦）

@@ -10,6 +10,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { resignIfNeeded } from './machsign.ts'
 
 export const releaseAPI = 'https://api.github.com/repos/TriDefender/zcode-api/releases/latest'
 
@@ -955,6 +956,17 @@ export class Sidecar {
     // 0700 仅本用户可执行——part 是同目录内的临时文件，先 chmod 再改名。
     chmodSync(part, 0o700)
     renameSync(part, dest)
+    // macOS 代码签名修复：官方 release 的 adhoc 签名在新版 macOS 上过不了内核
+    // 的分页校验（exec 即被 SIGKILL，详见 machsign.ts 的取证记录）。
+    // 落在 rename **之后**：重签必须作用在最终路径上（codesign 是原地改写），
+    // 且此时 sha256 已校验通过——签名是内容之外的一层，不会被这次校验牵连。
+    // 非 macOS / 签名本来有效 / 重签失败都不阻断安装（见 machsign.ts 的三态返回）。
+    const resign = resignIfNeeded(dest)
+    if (resign === 'resigned') {
+      console.log(`sidecar: 已为 ${name} 重打 macOS 代码签名（官方 release 的 adhoc 签名无法通过本机校验，exec 会被 SIGKILL）`)
+    } else if (resign === 'failed') {
+      console.warn(`sidecar: 警告 —— ${name} 的 macOS 代码签名重打失败，若启动时立刻退出（Killed: 9），请手动执行 codesign --force --sign - ${dest}`)
+    }
     return dest
   }
 
