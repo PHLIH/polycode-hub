@@ -99,6 +99,237 @@ describe('checkWorkBuddy', () => {
   })
 })
 
+// 新版 WorkBuddy 客户端（2026-09-28 用户机实测）把 auth.accessToken、account.nickname
+// 换成了加密信封对象 {"$wbEncrypted":1,"envelope":"…"}，旧版仍是裸字符串。
+// 修复前的真实故障：parseAuthFile 用「字段存在」判有效（对象是 truthy），
+// 扫描器拿对象去 token.split() → TypeError 穿透到 /admin/api/discover → 整页 500。
+describe('加密信封登录态（新版客户端格式）', () => {
+  const envelope = { $wbEncrypted: 1, envelope: 'eyJzdWl0ZSI6MSwia2V5SWQiOiI5' }
+
+  async function writeEnvelopeFile(
+    dir: string, name: string, expiresAt?: number,
+  ): Promise<string> {
+    const auth: Record<string, unknown> = {
+      accessToken: envelope, refreshToken: envelope, tokenType: 'Bearer',
+      domain: 'www.workbuddy.cn', sessionState: '0bb1b756-aa1d',
+    }
+    if (expiresAt !== undefined) auth.expiresAt = expiresAt
+    const path = join(dir, name)
+    await writeFile(path, JSON.stringify({
+      auth,
+      account: {
+        uid: '0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d', // 形状仿真实客户端（UUID v4），非真实账号
+        nickname: envelope, // 昵称同样是信封
+        type: 'personal',
+      },
+    }), 'utf8')
+    return path
+  }
+
+  // 回归本体：不会抛，且如实报成「本机发现了、但有效期读不出」而不是崩。
+  test('checkWorkBuddy 遇信封 token → unknown，不抛 TypeError', async () => {
+    const dir = await tempDir()
+    const path = await writeEnvelopeFile(dir, 'workbuddy-desktop.info')
+    const r = checkWorkBuddy([path])
+    expect(r.ok).toBe(true) // 文件确实是登录痕迹
+    expect(r.finding.status).toBe('unknown')
+    expect(r.finding.detail).toContain('加密信封')
+  })
+
+  test('nickname 是信封对象时回落到默认，不炸（optional chaining 挡不住对象）', async () => {
+    const dir = await tempDir()
+    const path = await writeEnvelopeFile(dir, 'workbuddy-desktop.info')
+    const { finding: f } = checkWorkBuddy([path])
+    expect(f.detail).toContain('未知用户')
+  })
+
+  // 客户端把绝对过期时刻写在了 auth.expiresAt（epoch 毫秒）。信envelop 没有明文可解，
+  // 这是唯一还能拿到的有效性事实——用上它，就不必把一个还剩 30 天的号报成「待确认」。
+  test('信封 token + 未来的 expiresAt → ready', async () => {
+    const dir = await tempDir()
+    const path = await writeEnvelopeFile(
+      dir, 'workbuddy-desktop.info', Date.now() + 30 * 86400_000)
+    const { finding: f } = checkWorkBuddy([path])
+    expect(f.status).toBe('ready')
+    expect(f.detail).toContain('剩余约')
+  })
+
+  test('信封 token + 已过去的 expiresAt → expired', async () => {
+    const dir = await tempDir()
+    const path = await writeEnvelopeFile(
+      dir, 'workbuddy-desktop.info', Date.now() - 86400_000)
+    const { finding: f } = checkWorkBuddy([path])
+    expect(f.status).toBe('expired')
+    expect(f.detail).toContain('已过期')
+  })
+
+  // 秒级时间戳（10 位）也要认：客户端换单位时不该产出 1970 年的假「已过期」。
+  test('expiresAt 为秒级时间戳时按秒换算', async () => {
+    const dir = await tempDir()
+    const path = await writeEnvelopeFile(
+      dir, 'workbuddy-desktop.info', Math.floor((Date.now() + 86400_000) / 1000))
+    const { finding: f } = checkWorkBuddy([path])
+    expect(f.status).toBe('ready')
+  })
+
+  // 形状不认识的非字符串不能被当成登录态：宁可少报一条，也不拿一个读不出凭据的
+  // 坏文件去编一个「已发现」出来。（注意对象里的 $wbEncrypted 标记例外——
+  // 那是新版客户端的合法加密信封格式，见上面同 describe 的用例。）
+  test('accessToken 是数字/数组/空对象 → 不算登录态（ok=false）', async () => {
+    const dir = await tempDir()
+    for (const bad of [123, [], {}, { envelope: 'x' }, null, '']) {
+      const path = join(dir, `workbuddy-desktop.${Math.random()}.info`)
+      await writeFile(path, JSON.stringify({ auth: { accessToken: bad }, account: { uid: 'u' } }), 'utf8')
+      expect(checkWorkBuddy([path]).ok).toBe(false)
+    }
+  })
+
+  test('导 token 的指引不再指向 python 一行（那条会打印出信封对象）', async () => {
+    const dir = await tempDir()
+    const path = await writeEnvelopeFile(dir, 'workbuddy-desktop.info')
+    const { finding: f } = checkWorkBuddy([path])
+    const acts = (f.actions ?? []).join(' | ')
+    expect(acts).not.toContain("['auth']['accessToken']")
+    expect(acts).toContain('config/credentials/')
+  })
+
+  test('旧版明文 token 仍正常给 python 导出行', async () => {
+    const dir = await tempDir()
+    const path = await writeAuthFile(dir, 'workbuddy-desktop.info', craftJWT(new Date(Date.now() + 86400_000)))
+    const { finding: f } = checkWorkBuddy([path])
+    expect((f.actions ?? []).join(' | ')).toContain("['auth']['accessToken']")
+  })
+
+  test('discoverWorkBuddyAccounts 遇信封：条目不炸，alive 取自 expiresAt', async () => {
+    const dir = await tempDir()
+    await writeEnvelopeFile(dir, 'workbuddy-desktop.info', Date.now() + 86400_000)
+    const accts = discoverWorkBuddyAccounts(dir)
+    expect(accts).toHaveLength(1)
+    expect(accts[0]!.alive).toBe(true)
+    expect(accts[0]!.nickname).toBe('未知用户')
+    expect(accts[0]!.realm).toBe('cn') // 仍能按 domain 认出版本
+  })
+})
+
+// 同一 uid 多份快照时，选哪一份决定一键导入能不能真把号入池。
+// 只按 mtime 取最新会把「还活着、实测可用」的旧明文挡掉：
+// 实测（2026-09-29）最新份分别是信封/已过期，旧明文打上游全 ok:true。
+describe('多快照去重：档位优先于时间', () => {
+  const UID = 'same-uid-0001'
+
+  // 两份快照放同一目录（去重按目录扫）。
+  async function dirWith(files: Array<[string, Record<string, unknown>]>): Promise<string> {
+    const dir = await tempDir()
+    for (const [name, raw] of files) await writeFile(join(dir, name), JSON.stringify(raw), 'utf8')
+    return dir
+  }
+  const plain = (expDays: number): string => craftJWT(new Date(Date.now() + expDays * 86400_000))
+  const envelopeFile = (expiresAt?: number): Record<string, unknown> => ({
+    auth: {
+      accessToken: { $wbEncrypted: 1, envelope: 'Zm9v' }, tokenType: 'Bearer',
+      domain: 'www.workbuddy.cn', ...(expiresAt !== undefined ? { expiresAt } : {}),
+    },
+    account: { uid: UID, nickname: { $wbEncrypted: 1, envelope: 'Zm9v' }, type: 'personal' },
+  })
+  const plainFile = (expDays: number): Record<string, unknown> => ({
+    auth: { accessToken: plain(expDays), tokenType: 'Bearer', domain: 'www.workbuddy.cn' },
+    account: { uid: UID, nickname: '旧明文', type: 'personal' },
+  })
+
+  test('新份是信封、旧份是活明文 → 选旧明文（这才是能入池的那份）', async () => {
+    const dir = await dirWith([
+      ['workbuddy-desktop.info', envelopeFile(Date.now() + 29 * 86400_000)], // 最新：信封，alive
+      ['workbuddy-desktop.2026-09-16T01-06-33-028Z.9.x.info', plainFile(17)],   // 较旧：明文，alive
+    ])
+    const accts = discoverWorkBuddyAccounts(dir)
+    expect(accts).toHaveLength(1)
+    expect(accts[0]!.tokenPath).toContain('2026-09-16')
+    expect(accts[0]!.alive).toBe(true)
+  })
+
+  test('新份已过期、旧份是活明文 → 选活的旧份（不被死的最新版压掉）', async () => {
+    const dir = await dirWith([
+      ['workbuddy-desktop.info', plainFile(-11)],  // 最新：明文但已过期
+      ['workbuddy-desktop.2026-09-13T13-53-30-073Z.9.y.info', plainFile(44)], // 较旧：明文且活
+    ])
+    const accts = discoverWorkBuddyAccounts(dir)
+    expect(accts).toHaveLength(1)
+    expect(accts[0]!.alive).toBe(true)
+    expect(accts[0]!.tokenPath).toContain('2026-09-13')
+  })
+
+  test('两份都活且都是明文 → 仍取最新（原有行为不变）', async () => {
+    const dir = await dirWith([
+      ['workbuddy-desktop.info', plainFile(30)],
+      ['workbuddy-desktop.2026-09-16T01-06-33-028Z.9.z.info', plainFile(17)],
+    ])
+    const accts = discoverWorkBuddyAccounts(dir)
+    expect(accts).toHaveLength(1)
+    expect(accts[0]!.tokenPath).toContain('workbuddy-desktop.info') // 最新那份
+  })
+
+  test('同档平手仍按 mtime/exp 取最新（原有平手规则保留）', async () => {
+    const dir = await dirWith([
+      ['workbuddy-desktop.a.info', envelopeFile()],       // 信封，无 expiresAt → 死档? expiresAt 缺失
+      ['workbuddy-desktop.b.info', envelopeFile(Date.now() + 5 * 86400_000)],
+    ])
+    const accts = discoverWorkBuddyAccounts(dir)
+    expect(accts).toHaveLength(1)
+    // 两份都是信封；a 无 expiresAt（alive=false，档 0），b 有（alive=true，档 2）→ b 胜
+    expect(accts[0]!.tokenPath).toContain('workbuddy-desktop.b.info')
+    expect(accts[0]!.alive).toBe(true)
+  })
+
+  test('不同 uid 不互相吞（去重键含 uid）', async () => {
+    const dir = await dirWith([
+      ['workbuddy-desktop.info', envelopeFile()],
+      ['workbuddy-desktop.other.info', {
+        auth: { accessToken: plain(30), tokenType: 'Bearer', domain: 'www.workbuddy.cn' },
+        account: { uid: 'other-uid-9', nickname: '二号', type: 'personal' },
+      }],
+    ])
+    expect(discoverWorkBuddyAccounts(dir)).toHaveLength(2)
+  })
+})
+
+// 一条坏数据不能打掉整页扫描：扫描是尽力而为的观察，任何一环抛错都只应让**该项**
+// 降级。（真实故障同上：WorkBuddy 升级 → 整页 /discover 恒 500，连没问题的
+// ZCode / zen 也一起陪葬。）
+describe('Scanner 容错（单点异常不打掉整页扫描）', () => {
+  test('zen 探针抛错 → 其余发现项照常返回，zen 单独报不可达', async () => {
+    const dir = await tempDir()
+    const sc = new Scanner({
+      workBuddyPaths: [], workBuddyAuthDirs: [], workBuddyFallbackRoots: [],
+      zCodeDirs: [join(dir, 'no-such-zcode')],
+      zCodeHome: dir,
+      openCodeDirs: [],
+      zenBaseURL: 'https://zen.invalid',
+      fetchImpl: (async () => { throw new Error('代理拒绝连接') }) as typeof fetch,
+    })
+    const out = await sc.scan(true)
+    // 扫描本身必须是 200 语义：拿到了结构化结果，而不是抛出去变 500。
+    expect(out.length).toBeGreaterThan(1)
+    expect(out.some((f) => f.key === 'opencode-zen' && f.status === 'unreachable')).toBe(true)
+    expect(out.some((f) => f.key === 'zcode')).toBe(true) // 没被 zen 的故障牵连
+  })
+
+  test('本机扫描整体抛错 → 返回带错误原文的 finding，不把异常抛给 HTTP 层', async () => {
+    // 打断「读本机路径」这一步：默认配置注入一个会在构造期抛错的 getter。
+    const bad: ScanConfig = {
+      workBuddyPaths: [],
+      workBuddyAuthDirs: [],
+      get workBuddyFallbackRoots(): string[] { throw new Error('磁盘炸了') },
+      zCodeDirs: [], zCodeHome: tmpdir(), openCodeDirs: [],
+      fetchImpl: (async () => new Response('{}', { status: 200 })) as typeof fetch,
+    }
+    const out = await new Scanner(bad).scan(true)
+    expect(out).toHaveLength(1)
+    expect(out[0]!.key).toBe('scan-error')
+    expect(out[0]!.status).toBe('unreachable')
+    expect(out[0]!.detail).toContain('磁盘炸了')
+  })
+})
+
 describe('search paths', () => {
   test('各 OS 路径表非空且含桌面 auth 文件名', () => {
     for (const goos of ['darwin', 'linux', 'windows']) {

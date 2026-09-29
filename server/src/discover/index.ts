@@ -283,18 +283,90 @@ export function zCodeSearchDirs(goos: string, home: string, winProfile: string):
 
 // ---- 小件 ----
 
+// 客户端写进 auth 文件的字段类型是**运行时才知道**的，不是编译期能保证的：
+// 新版 WorkBuddy 把 accessToken / nickname 等敏感值换成了加密信封对象
+// `{"$wbEncrypted":1,"envelope":"…"}`（2026-09-28 用户机上的 workbuddy-desktop.info
+// 就是这个形状），旧版仍是裸字符串。所以这两个字段一律声明为 unknown，
+// 由取值函数按运行时形状收窄——声明成 string 只会骗过编译器，不会骗过真实文件。
 interface WbAuthFile {
-  auth?: { accessToken?: string; tokenType?: string; domain?: string }
-  account?: { uid?: string; nickname?: string; type?: string }
+  auth?: {
+    accessToken?: unknown
+    refreshToken?: unknown
+    tokenType?: string
+    domain?: string
+    // 客户端写的绝对过期时刻（epoch 毫秒）。信封取不出明文时唯一还能拿到的
+    // 有效性事实，比「有效期不明」有用得多。
+    expiresAt?: number
+  }
+  account?: { uid?: string; nickname?: unknown; type?: string }
+}
+// 加密信封（新版客户端形状）：$wbEncrypted 标记 + envelope 密文。
+// 判据只看标记在不在，不碰 envelope 内容——那是密文，网关也不该去解。
+export function isEncryptedEnvelope(v: unknown): boolean {
+  return typeof v === 'object' && v !== null && (v as { $wbEncrypted?: unknown }).$wbEncrypted !== undefined
 }
 function parseAuthFile(raw: string): WbAuthFile | null {
   try {
     const f = JSON.parse(raw) as WbAuthFile
-    if (!f.auth?.accessToken) return null
+    const at = f.auth?.accessToken
+    if (at === undefined || at === null || at === '') return null // 没有 accessToken = 不是登录态
+    // 形状不认识的非字符串（数字/数组/空对象）判为非登录态：宁可少报一条，
+    // 也不拿一个读不出凭据的坏文件去编一个「已发现」出来。
+    if (typeof at !== 'string' && !isEncryptedEnvelope(at)) return null
     return f
   } catch {
     return null
   }
+}
+
+// 登录态文件是否「读得出明文 token」。false = 网关无法用它做转发凭据
+// （新版客户端的加密信封属于这一种）。注意这**不代表文件不是登录痕迹**——
+// 它仍然是有效的登录事实，只是明文不可得。
+export function wbHasPlaintextToken(f: WbAuthFile | null | undefined): boolean {
+  return wbAccessToken(f) !== ''
+}
+
+// 取登录态里的明文 access token；取不到（加密信封 / 非字符串 / 空白）返回 ''。
+//
+// 加密信封没有解密密钥，网关无从还原明文（也不该尝试——那意味着把用户的登录态
+// 当成可离线破解的密文）。这种情况按「没有可用凭据」处理：文件本身仍是有效的
+// 登录痕迹（账号、版本、有效期都在），过期时间另有 auth.expiresAt 可用。
+export function wbAccessToken(f: WbAuthFile | null | undefined): string {
+  const v = f?.auth?.accessToken
+  if (typeof v !== 'string') return ''
+  const t = v.trim()
+  return t
+}
+
+// 登录态的过期时刻：优先 token 的 JWT exp，其次客户端写的 auth.expiresAt。
+// 两者都没有才返回 null（前端显示「待确认」）。
+export function wbTokenExpiry(f: WbAuthFile | null | undefined): Date | null {
+  const tok = wbAccessToken(f)
+  if (tok !== '') {
+    const exp = jwtExpiry(tok)
+    if (exp) return exp
+  }
+  // 信封 token 没有明文，JWT 解不了——但客户端把绝对时刻一并写在了 expiresAt
+  // （epoch 毫秒）。旧版登录态也有这个字段，只是从前没人读它。单位先按毫秒判定：
+  // 秒级时间戳（10 位）乘 1000 即可；明显不是有效日期的值一律丢弃，
+  // 免得客户端将来改单位时产出一个 1970 年的「已过期」假象。
+  const at = f?.auth?.expiresAt
+  if (typeof at === 'number' && Number.isFinite(at) && at > 0) {
+    const ms = at < 1e12 ? at * 1000 : at
+    const d = new Date(ms)
+    if (!Number.isNaN(d.getTime())) return d
+  }
+  return null
+}
+
+// 账号昵称：字符串就用，加密信封或缺失则回落到给定默认值。
+// 同样不能假设是字符串——新版客户端的 nickname 就是那个信封对象，
+// 原来的 `f.account?.nickname?.trim()` 在它上面会直接抛 TypeError
+//（optional chaining 只挡 undefined/null，挡不住「是个对象」）。
+function wbNickname(f: WbAuthFile | null | undefined, fallback: string): string {
+  const v = f?.account?.nickname
+  if (typeof v === 'string' && v.trim() !== '') return v.trim()
+  return fallback
 }
 
 // 解 JWT exp（不验签）；解析不出返回 null。
@@ -397,19 +469,33 @@ export function checkWorkBuddy(paths: string[], realm?: WbRealm): Checked {
       continue
     }
     const f = parseAuthFile(raw)
-    if (!f || !f.auth?.accessToken) continue
+    if (!f) continue
     // 版本过滤：文件内容认出的版本与要求的版本不符就跳过。
     // 认不出（旧客户端没写 domain 且 token 不是 JWT）时放行——总比整个漏掉强。
     const fileRealm = detectRealmFromAuth(raw)
     if (realm && fileRealm && fileRealm !== realm) continue
-    const exp = jwtExpiry(f.auth.accessToken)
-    const nick = f.account?.nickname?.trim() || '未知用户'
+    // 过期时间：JWT exp 优先，读不到明文时用客户端写的 expiresAt。
+    const exp = wbTokenExpiry(f)
+    const nick = wbNickname(f, '未知用户')
     const realmNote = fileRealm ? WB_REALMS.find((r) => r.realm === fileRealm)!.label : '版本未知'
     base.detail = `${nick} · ${f.account?.type ?? ''} · ${realmNote} · ${path}`
-    base.actions = [
-      `export WB_TOKEN=$(python3 -c "import json;print(json.load(open('${path}'))['auth']['accessToken'])")`,
-      '然后在发现页点「采用」，或确认 WB_TOKEN 后重试',
-    ]
+    // 导 token 的指引只在真能导出**明文** 时给。新版客户端把 token 写成加密信封，
+    // 那条 python 一行会打印 `{'envelope': '…'}` 而不是 token——用户照做就得到一个
+    // 直接 401 的 Authorization，属于「指引把人带进更深的坑」。这种情况改成给
+    // 配置凭据的路径指引（config/credentials/）。
+    const plaintext = wbAccessToken(f)
+    if (plaintext !== '') {
+      base.actions = [
+        `export WB_TOKEN=$(python3 -c "import json;print(json.load(open('${path}'))['auth']['accessToken'])")`,
+        '然后在发现页点「采用」，或确认 WB_TOKEN 后重试',
+      ]
+    } else {
+      base.actions = [
+        `该登录态的 token 是加密信封（新版客户端才有），网关读不到明文；`
+          + `若要转发，请自行在客户端侧取得 token 后填进 config/credentials/ 下的凭据文件`,
+        '然后在发现页点「采用」先接入 Provider（账号导入会如实说明跳过原因）',
+      ]
+    }
     // 多账号发现：客户端切号会把旧登录态另存为带时间戳的副本，同机多账号天然共存。
     // 只列**同版本**的账号：跨版本的 token 不通用，混列会诱导用户把它们导进同一个 Provider。
     const accts = discoverWorkBuddyAccounts(dirname(path))
@@ -423,8 +509,15 @@ export function checkWorkBuddy(paths: string[], realm?: WbRealm): Checked {
       }
     }
     if (!exp) {
+      // 保留「unknown（待确认）」而不是改成 expired：unknown 的语义是
+      // 「本机确实有登录痕迹，但有效期读不出来」——而这正是加密信封那种情形的
+      // 事实描述。新版客户端的 accessToken 是 {"$wbEncrypted":1,"envelope":"…"}，
+      // 网关没有解密密钥、读不到明文，把它说成「已过期」是编造（它可能还有 30 天）。
+      // 用户侧该做的事也一样（重新登录刷新登录态），只是结论不能歪。
+      const reason = wbAccessToken(f) === '' ? 'token 为加密信封，网关读不到明文' : 'token 有效期不明'
       base.status = 'unknown'
-      base.detail += ' · token 有效期不明'
+      base.detail += ` · ${reason}`
+      base.actions = ['重新登录 WorkBuddy 桌面端以刷新登录态', ...base.actions]
       return { finding: base, ok: true }
     }
     if (Date.now() > exp.getTime()) {
@@ -1122,9 +1215,28 @@ export function discoverAllOpenCodeFingerprints(dirs: string[]): OpenCodeFingerp
 interface Acct extends DiscoveredAccount {
   modified: Date // 文件修改时间（同账号取最新）
   exp: Date | null // token 过期时间（去重平手时比较用）
+  rank: number // 可用性档次（去重第一判据，见 snapshotRank）
+}
+
+// 同一账号的多份快照里，哪一份**最有价值**——先比档，同档再比 mtime。
+//
+// 为什么不能只比 mtime（2026-09-29 实测）：客户端切号/换登录会把旧登录态另存
+// 成带时间戳的快照，同一个 uid 名下常有 2~3 份。只留最新一份时，最新恰好是
+// 「加密信封读不出明文」或「已过期」的一份，就把**还活着、实测可用**的旧明文
+// 快照挡在门外——一键导入随之 imported=0，看起来像是「导入功能废了」。实际
+// 那两份旧快照的 token 打上游全部 ok:true 出字。
+// 档位（高到低）：
+//   3 = 活着且有明文 token ——唯一能真正入池转发的，永远优先
+//   2 = 活着但 token 是信封 ——能证明登录态有效，但网关取不到明文
+//   1 = 已过期但有明文 ——转发必 401，至少不是一无所知
+//   0 = 已过期且信封 ——啥也说明不了
+// 同档平手才回到原来的 mtime/exp 规则（同批写入平手时取 token 有效期更新的）。
+function snapshotRank(alive: boolean, plaintext: boolean): number {
+  return (alive ? 2 : 0) + (plaintext ? 1 : 0)
 }
 // 扫描 WorkBuddy 登录态目录，返回全部可读的账号登录态。
-// 同一账号（按 UID）取修改时间最新的一份，不同账号各自成条目。
+// 同一账号（按 realm+UID）取**最有价值**的一份快照（档位规则见 snapshotRank），
+// 不同账号各自成条目。
 // 目录不存在/不可读时返回空（尽力而为，不报错）。
 // 每个条目带 realm（国内版/海外版）：两个版本的文件共存于同一目录，必须分别标识，
 // 否则上层会把两套互不通用的 token 混进同一个 Provider。
@@ -1148,9 +1260,9 @@ export function discoverWorkBuddyAccounts(dir: string): DiscoveredAccount[] {
       continue
     }
     const f = parseAuthFile(raw)
-    if (!f || !f.auth?.accessToken) continue
+    if (!f) continue
     const realm = detectRealmFromAuth(raw)
-    const nick = f.account?.nickname?.trim() || '未知用户'
+    const nick = wbNickname(f, '未知用户')
     let uid = f.account?.uid?.trim() ?? ''
     if (!uid) uid = nick // 无 UID 时按昵称去重
     let mod = new Date(0)
@@ -1159,14 +1271,18 @@ export function discoverWorkBuddyAccounts(dir: string): DiscoveredAccount[] {
     } catch {
       // 取不到 mtime 用零值（不影响去重主键）
     }
-    const exp = jwtExpiry(f.auth.accessToken)
+    const exp = wbTokenExpiry(f)
     const alive = exp !== null && Date.now() < exp.getTime()
+    const rank = snapshotRank(alive, wbHasPlaintextToken(f))
     const key = `${realm ?? '?'}:${uid}`
     const prev = byKey.get(key)
     if (prev) {
-      // 同账号去重：取「更新」的一份。mtime 平手（同秒批量写入很常见）时
-      // 比 token 过期时间——那是客户端写快照时的真实业务事实。
-      if (mod.getTime() > prev.modified.getTime()) {
+      // 第一判据是档位（可用性），不是时间：最新的死快照不能压掉更早的活明文。
+      if (rank < prev.rank) continue
+      if (rank > prev.rank) { /* 新份档位更高：无条件胜出，往下覆盖 */ }
+      // 同档才回到原有时间规则：同账号取「更新」的一份；mtime 平手（同秒批量
+      // 写入很常见）时比 token 过期时间——那是客户端写快照时的真实业务事实。
+      else if (mod.getTime() > prev.modified.getTime()) {
         // 新文件胜出，继续
       } else if (mod.getTime() === prev.modified.getTime()) {
         if (!exp || !prev.exp || exp.getTime() <= prev.exp.getTime()) continue
@@ -1176,7 +1292,7 @@ export function discoverWorkBuddyAccounts(dir: string): DiscoveredAccount[] {
     }
     byKey.set(key, {
       nickname: nick, uid: shortID(uid), realm, type: f.account?.type, alive,
-      tokenPath: join(dir, name), modified: mod, exp,
+      tokenPath: join(dir, name), modified: mod, exp, rank,
       expiresAt: exp ? fmtLocal(exp) : undefined,
     })
   }
@@ -1185,7 +1301,7 @@ export function discoverWorkBuddyAccounts(dir: string): DiscoveredAccount[] {
     if (x.alive !== y.alive) return x.alive ? -1 : 1 // 活的排前
     return y.modified.getTime() - x.modified.getTime()
   })
-  return out.map(({ modified: _m, exp: _e, ...rest }) => rest)
+  return out.map(({ modified: _m, exp: _e, rank: _r, ...rest }) => rest)
 }
 
 // ---- WorkBuddy 模型发现 ----
@@ -1365,6 +1481,25 @@ export class Scanner {
         this.cachedAt = Date.now()
         return out.map((f) => ({ ...f }))
       })
+      .catch((e: unknown) => {
+        // 扫描是「尽力而为的观察」：任何一环（本地文件形状、上游、客户端目录）
+        // 抛错都只应让**这一项**降级，绝不能顺着 await 穿透到 HTTP 端点变成
+        // 500 —— 那样整页发现直接不可用，连本来没问题的 ZCode / zen 也一起陪葬。
+        // 真实故障：WorkBuddy 客户端升级后把 auth.accessToken 换成加密信封对象，
+        // 扫描器拿它去 token.split() 抛 TypeError，/admin/api/discover 恒 500。
+        //
+        // 这里不假装扫描成功（那会向用户报「没发现」这种假的否定结论），而是把
+        // 真实错误作为一条 finding 报出去，页面上写明扫描失败。
+        const msg = e instanceof Error ? e.message : String(e)
+        this.cached = null
+        this.cachedAt = 0
+        return [{
+          key: 'scan-error', harness: '本机扫描',
+          status: 'unreachable' as const,
+          detail: `扫描过程中出错，其余 harness 的结果也未产生：${msg}`,
+          actions: ['把上面的报错原文反馈给维护者；其余检查（Provider 测试、用量、转发）不受影响'],
+        }]
+      })
       .finally(() => { this.inflight = null })
     return this.inflight
   }
@@ -1390,13 +1525,26 @@ export class Scanner {
     const fp = this.cfg.openCodeDirs && this.cfg.openCodeDirs.length > 0
       ? discoverOpenCodeFingerprint(this.cfg.openCodeDirs)
       : null
-    out.push(await checkZen(
-      this.cfg.zenBaseURL ?? 'https://opencode.ai/zen',
-      this.cfg.fetchImpl ?? globalThis.fetch,
-      this.zenTimeoutMs,
-      this.cfg.zenCallProbe,
-      fp,
-    ))
+    // zen 是唯一会联网的一环，单独包 try：它挂了（DNS/代理/客户端目录读不到）
+    // 不该把已经扫好的 WorkBuddy / ZCode 结果一起丢掉，页面上仍应看得到本机装了什么。
+    // 只报 zen 这一环不可达，不影响其他行。
+    try {
+      out.push(await checkZen(
+        this.cfg.zenBaseURL ?? 'https://opencode.ai/zen',
+        this.cfg.fetchImpl ?? globalThis.fetch,
+        this.zenTimeoutMs,
+        this.cfg.zenCallProbe,
+        fp,
+      ))
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      out.push({
+        key: 'opencode-zen', harness: 'OpenCode Zen',
+        status: 'unreachable',
+        detail: `探测出错：${msg}`,
+        actions: ['检查本机网络/代理后点「重新扫描」'],
+      })
+    }
     return out
   }
 }

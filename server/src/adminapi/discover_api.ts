@@ -3,10 +3,12 @@
 // 红线：token 全程服务端读写、不经过前端、不落日志；tokenPath 必须在本次扫描结果内
 // （防任意文件读）；credentialFile 只允许写在 config/credentials/ 下（防路径穿越）。
 
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { normalize, posix } from 'node:path'
+import { dirname, join, normalize, posix } from 'node:path'
 import { writeFile0600 } from './credential_file.ts'
+import { wbRefreshSession } from '../discover/wb_refresh.ts'
+import { detectRealmFromAuth } from '../discover/index.ts'
 import { ERR } from '../ir/index.ts'
 import { providerValidate, workBuddyRealmOfBaseUrl, type Account, type Provider } from '../model/index.ts'
 import type { Context, Hono } from 'hono'
@@ -15,6 +17,106 @@ import type { AdminCtx } from './api.ts'
 
 function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
+// 读登录态文件并取出 accessToken。
+//
+// 信封兼容（2026-09-29）：新版客户端把 accessToken 加密成 {"$wbEncrypted":1,...}，
+// 但 **refreshToken 在旧快照里仍是明文**，且官方刷新链路完全可用（POST
+// /v2/plugin/auth/token/refresh + X-Refresh-Token，实测 HTTP 200 换出新 token）。
+// 所以信封文件不再拒绝——按顺序尝试：
+//   ① 本文件的明文 refreshToken → 走官方刷新；
+//   ② 同目录同 uid 其它快照的明文 refreshToken → 同样走刷新（客户端切号会把
+//      旧登录态另存为带时间戳的快照，同一账号的 refresh 凭据可能只留在旧份里；
+//      2026-09-29 实测：当前快照连 refreshToken 都是信封，而 09-13 旧份的
+//      明文 refreshToken 刷新 HTTP 200 换出新 token 并真实出字）。
+// 密文本身依旧无人解（也不该解）：这是客户端刷新自己账号的同一条路。
+// 注意：刷新要走网络，导入从同步变异步（唯一调用方已 await）。
+async function readSession(tokenPath: string): Promise<{ token: string; uid?: string }> {
+  let raw: string
+  try {
+    raw = readFileSync(tokenPath, 'utf8')
+  } catch (e) {
+    throw new Error((e as Error).message)
+  }
+  const parsed = parseAuthFields(raw)
+  const realm = detectRealmFromAuth(raw) === 'ai' ? 'ai' as const : 'cn' as const
+
+  // ① 本文件明文 token 直接用。
+  if (parsed.token !== '') return { token: parsed.token, uid: parsed.uid }
+
+  // ② 信封：先本文件 refreshToken，再同目录同 uid 的其它快照。
+  if (parsed.envelope) {
+    if (parsed.refreshToken) {
+      const refreshed = await wbRefreshSession(parsed.refreshToken, realm)
+      return { token: refreshed.accessToken, uid: parsed.uid }
+    }
+    const alt = findPlainRefreshTokenInDir(dirname(tokenPath), parsed.uid, tokenPath)
+    if (alt) {
+      const refreshed = await wbRefreshSession(alt, realm)
+      return { token: refreshed.accessToken, uid: parsed.uid }
+    }
+    throw new Error('登录态是加密信封且本机无明文 refreshToken（新版 WorkBuddy 客户端格式），无法自动刷新导入')
+  }
+  throw new Error('登录态文件不含有效 accessToken')
+}
+
+// 从登录态文件原始文本取三个字段（不抛，字段缺失返回空/undefined）。
+function parseAuthFields(raw: string): { token: string; uid?: string; envelope: boolean; refreshToken?: string } {
+  let token = ''
+  let uid: string | undefined
+  let envelope = false
+  let refreshToken: string | undefined
+  try {
+    const f: unknown = JSON.parse(raw)
+    if (isObj(f) && isObj(f.auth)) {
+      if (typeof f.auth.accessToken === 'string') token = f.auth.accessToken.trim()
+      else if (isObj(f.auth.accessToken) && f.auth.accessToken.$wbEncrypted) envelope = true
+      if (typeof f.auth.refreshToken === 'string' && f.auth.refreshToken.length > 50) {
+        refreshToken = f.auth.refreshToken
+      }
+    }
+    if (isObj(f) && isObj(f.account) && typeof f.account.uid === 'string') {
+      const value = f.account.uid.trim()
+      if (value.length > 0 && value.length <= 256 && !/[\s\x00-\x1f\x7f]/.test(value)) uid = value
+    }
+  } catch {}
+  return { token, uid, envelope, refreshToken }
+}
+
+// 在同目录的其它快照里找同账号的明文 refreshToken（最新优先）。
+// 只在「本文件是信封且无明文 refreshToken」时调用：多一次目录扫描换取
+// 「客户端重登后仍能刷新」的续命能力——旧明文快照的 refresh 凭据客户端
+// 自己也没加密（2026-09-29 实测）。找不到返回 undefined。
+function findPlainRefreshTokenInDir(dir: string, uid: string | undefined, excludePath: string): string | undefined {
+  if (!uid) return undefined // 没 uid 无法判定「同账号」，不猜
+  let names: string[]
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return undefined
+  }
+  const cands: Array<{ path: string; mtime: number; rt: string }> = []
+  for (const name of names) {
+    if (!name.startsWith('workbuddy-desktop') || !name.endsWith('.info')) continue
+    const p = join(dir, name)
+    if (p === excludePath) continue
+    let raw: string
+    try {
+      raw = readFileSync(p, 'utf8')
+    } catch {
+      continue
+    }
+    const f = parseAuthFields(raw)
+    if (!f.refreshToken || f.uid !== uid) continue
+    let mtime = 0
+    try {
+      mtime = statSync(p).mtimeMs
+    } catch { /* 取不到按 0 */ }
+    cands.push({ path: p, mtime, rt: f.refreshToken })
+  }
+  cands.sort((a, b) => b.mtime - a.mtime) // 最新快照的 refresh 凭据优先
+  return cands[0]?.rt
 }
 
 async function jsonBody(c: Context): Promise<unknown> {
@@ -86,28 +188,6 @@ export function credentialPathOK(p: string): boolean {
   return norm.startsWith('config/credentials/')
 }
 
-// 读登录态文件并取出 accessToken。
-function readSession(tokenPath: string): { token: string; uid?: string } {
-  let raw: string
-  try {
-    raw = readFileSync(tokenPath, 'utf8')
-  } catch (e) {
-    throw new Error((e as Error).message)
-  }
-  let token = ''
-  let uid: string | undefined
-  try {
-    const f: unknown = JSON.parse(raw)
-    if (isObj(f) && isObj(f.auth) && typeof f.auth.accessToken === 'string') token = f.auth.accessToken.trim()
-    if (isObj(f) && isObj(f.account) && typeof f.account.uid === 'string') {
-      const value = f.account.uid.trim()
-      if (value.length > 0 && value.length <= 256 && !/[\s\x00-\x1f\x7f]/.test(value)) uid = value
-    }
-  } catch {}
-  if (token === '') throw new Error('登录态文件不含有效 accessToken')
-  return { token, uid }
-}
-
 export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
   const { providers, accounts, changed, discover, lister } = ctx
 
@@ -173,7 +253,7 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     const probeWarn = adoptProbeWarning(found)
     if (probeWarn) warnings.push(probeWarn)
     const { warnings: importWarnings, imported } =
-      importSuggestedAccounts(key, found.suggestedAccounts, p)
+      await importSuggestedAccounts(key, found.suggestedAccounts, p)
     warnings.push(...importWarnings)
     if (imported > 0) changed()
     // 与 quick-import 同样自动补全模型目录（两条路径行为必须一致，
@@ -232,11 +312,16 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     // 永不显示——该按钮只认 importSource === 'workbuddy'（见 api.ts checkin）。
     let sess: { token: string; uid?: string }
     try {
-      sess = readSession(tokenPath)
+      sess = await readSession(tokenPath)
     } catch (e) {
       const msg = (e as Error).message
+      // 「读不出凭据」（无有效 token / 信封且无明文 refreshToken / 刷新被上游拒）
+      // 都是「这台机器导不了这个号」，归 400 + 原话；而 IO 失败（文件没了/权限）
+      // 仍然只是「读失败」。刷新失败的原文已带 http 状态，能定位是哪种。
+      const unreadable = msg === '登录态文件不含有效 accessToken' || msg.includes('加密信封')
+        || msg.includes('刷新')
       return errRes(c, 400, ERR.INVALID_REQUEST,
-        msg === '登录态文件不含有效 accessToken' ? msg : `读取登录态失败: ${msg}`)
+        unreadable ? msg : `读取登录态失败: ${msg}`)
     }
     try {
       writeFile0600(credentialFile, sess.token)
@@ -298,7 +383,7 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     // ③ 全量导入共存登录态（只导扫描结果里、活着的；按 token 内容去重；
     //    tokenPath 来自本次扫描结果，不收前端路径）。
     const { warnings: importWarnings, imported, skipped } =
-      importSuggestedAccounts(key, found.suggestedAccounts, p)
+      await importSuggestedAccounts(key, found.suggestedAccounts, p)
     if (imported > 0) changed()
     warnings.push(...importWarnings)
 
@@ -393,9 +478,10 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
   // owner：目标 Provider，用于版本守卫（账号版本必须与 Provider 版本一致）。
   // 传整个 Provider 而不是名字：版本要从 baseUrl 推导——名字可被用户改（UI 支持
   // 改名），按名字判版本会在改名后误拒正确账号（见 realmMismatch 的注释）。
-  function importSuggestedAccounts(
+  // async：信封文件的 token 要走官方刷新链路（网络请求），同步签名接不住。
+  async function importSuggestedAccounts(
     key: string, suggested: DiscoveredAccount[] | undefined, owner: Provider,
-  ): { warnings: string[]; imported: number; skipped: number } {
+  ): Promise<{ warnings: string[]; imported: number; skipped: number }> {
     const ownerId = owner.providerId
     const warnings: string[] = []
     let imported = 0
@@ -418,7 +504,7 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
       }
       let sess: { token: string; uid?: string }
       try {
-        sess = readSession(acc.tokenPath)
+        sess = await readSession(acc.tokenPath)
       } catch (e) {
         warnings.push(`${acc.nickname}：跳过（${(e as Error).message}）`)
         continue
