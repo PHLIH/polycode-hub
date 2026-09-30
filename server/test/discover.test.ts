@@ -642,6 +642,70 @@ describe('checkZCode', () => {
     expect(f.status).toBe('missing')
     expect(f.detail ?? '').not.toContain('unrelated-telemetry-key')
   })
+
+  // ---- 回归：采用草稿必须与登录态判定解耦产出 ----
+  //
+  // 历史缺陷：checkZCode 从不设 suggestedProvider，而 notAdoptableReason 的拦条件是
+  // `!found.suggestedProvider` —— 于是 Discover 页的「一键导入」对 ZCode 恒 400
+  // 「无法生成 Provider 配置」，按钮却按 status==='ready' 点亮。更远的影响：sidecar
+  // 管理面全程只认 'zcode-plan-local' 这个 Provider 名，它不存在时「改端口」静默
+  // 跳过同步、「自定义引擎地址」404、GET /sidecar 的 endpoint 退化成空串。
+  //
+  // 这三条断言分别锚住：草稿恒存在、状态判据不受影响、草稿形状合法且指向真实端口。
+  describe('suggestedProvider 采用草稿', () => {
+    test('任何状态下都产出草稿（缺失草稿 = 一键导入必失败）', () => {
+      // 不用 as const：readonly tuple 赋不进 checkZCode 的 string[] 形参（TS2345）。
+      const cases: { dirs: string[]; home: string }[] = [
+        { dirs: [join('/nonexistent', 'ZCode')], home: '/nonexistent-home' }, // 未安装
+        { dirs: [], home: '/nonexistent-home' },                              // 无安装目录候选
+      ]
+      for (const c of cases) {
+        const f = checkZCode(c.dirs, c.home)
+        expect(f.suggestedProvider, `dirs=${JSON.stringify(c.dirs)}`).toBeDefined()
+      }
+    })
+
+    test('草稿形状合法：providerValidate 通过且 riskNote 齐（risk=high 必填项）', () => {
+      const f = checkZCode([], '/nonexistent-home')
+      const p = f.suggestedProvider!
+      expect(p.providerId).toBe(0) // 0 = 新建，由存储层分配
+      expect(p.name).toBe('zcode-plan-local') // sidecar_app.ts 按此名查找，不可改名
+      expect(p.state).toBe('active')
+      expect(p.api).toBe('anthropic-messages')
+      expect(p.stability).toBe('beta')
+      expect(p.accessKind).toBe('reverse')
+      expect(p.priority).toBe(1)
+      // providerValidate 会在 risk=high 且缺 riskNote 时拒绝，那只是把 400 换个说法
+      expect(providerValidate(p)).toBeUndefined()
+      // 凭据必须引用 setup 阶段落下的 key 文件：sidecar 开了鉴权，不带 key 打 /v1/models 就是 401
+      expect(p.credential.apiKeyFile).toBe('config/credentials/zcode-proxy-key')
+      // 目录不预填猜的模型名（同 wbSuggestedProvider 教训），交由 fillModelsIfEmpty 拉真实的
+      expect(p.models).toEqual([])
+    })
+
+    test('草稿未泄漏登录凭据原文', async () => {
+      const home = await tempDir()
+      const cliDir = join(home, '.zcode', 'cli')
+      await mkdir(cliDir, { recursive: true })
+      await writeFile(join(cliDir, 'config.json'), JSON.stringify({
+        provider: { zai: { options: { apiKey: 'zcode-secret-key-0123456789abcdef' } } },
+      }))
+      const f = checkZCode([join('/nonexistent', 'ZCode')], home)
+      expect(f.status).toBe('ready')
+      expect(JSON.stringify(f.suggestedProvider)).not.toContain('zcode-secret-key')
+    })
+
+    test('baseUrl 指向传入的 sidecar 端口，缺省回落 8080', () => {
+      expect(checkZCode([], '/nh', '9090').suggestedProvider!.baseUrl).toBe('http://127.0.0.1:9090')
+      expect(checkZCode([], '/nh', '8080').suggestedProvider!.baseUrl).toBe('http://127.0.0.1:8080')
+      // 未注入端口（引擎未装 / config.yaml 读不到）= 引擎默认端口
+      expect(checkZCode([], '/nh', '').suggestedProvider!.baseUrl).toBe('http://127.0.0.1:8080')
+      // 非法值不能拼出 http://127.0.0.1:abc 这种打不通的地址
+      expect(checkZCode([], '/nh', 'abc').suggestedProvider!.baseUrl).toBe('http://127.0.0.1:8080')
+      // baseUrl 停在操作路径之前（不含 /v1）：由网关按 anthropic-messages 拼 /v1/messages
+      expect(checkZCode([], '/nh', '9090').suggestedProvider!.baseUrl).not.toContain('/v1')
+    })
+  })
 })
 
 describe('checkZen', () => {

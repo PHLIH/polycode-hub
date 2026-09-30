@@ -159,6 +159,18 @@ async function loadFindings() {
   try { findings.value = await api.discover() } catch { findings.value = [] } finally { scanning.value = false }
 }
 
+// 一键导入按钮的可见性判据，必须与后端 notAdoptableReason（server/src/adminapi/
+// discover_api.ts）**同源**：后端拦导入的条件是「status === missing」或
+// 「无 suggestedProvider」。
+//
+// 历史缺陷：模板里只写了 `f.status === 'ready'`，而 status 与能否生成草稿是两件事
+// ——发现登录痕迹即 ready，但草稿缺失时后端照样 400。于是按钮恒亮、点了恒失败
+// （ZCode 就是这一步踩中的：ready + 无 suggestedProvider）。
+//
+// 注意判 suggestedProvider 要用**真值**而不是 `'suggestedProvider' in f`：
+// 后端 JSON.stringify 会省略 undefined 字段，草稿缺失时这个键在响应里根本不存在。
+const canQuickImport = (f) => f.status !== 'missing' && !!f.suggestedProvider
+
 // discover 探测最慢 2~8 秒，不该挡卡片列表的首帧：等浏览器空闲再发。
 // quickImport / scQuickReady 里的刷新也走 loadFindings，但那是「有结果后刷新」，
 // 面板已在展示，即时执行不会造成白屏。
@@ -654,7 +666,7 @@ async function adoptModels() {
         <span class="dim qi-detail">{{ f.detail || QI_STATUS[f.status] || f.status }}</span>
         <span class="qi-action">
           <span v-if="f.adoptedProviderId" class="status-chip ok"><span class="dot ok" />已导入</span>
-          <button v-else-if="f.status === 'ready'" class="btn" :disabled="qiBusy === f.key" @click="quickImport(f)">
+          <button v-else-if="canQuickImport(f)" class="btn" :disabled="qiBusy === f.key" @click="quickImport(f)">
             {{ qiBusy === f.key ? '导入中…' : '一键导入' }}</button>
           <span v-else class="dim qi-hint">{{ QI_STATUS[f.status] || f.status }}{{ f.actions && f.actions.length ? '：' + f.actions[0] : '' }}</span>
         </span>

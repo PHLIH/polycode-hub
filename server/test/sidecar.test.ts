@@ -1682,6 +1682,65 @@ describe('pause / cancel 路由（真实接线）', () => {
   })
 })
 
+// —— Provider 未绑定时，管理面必须给出可执行的指引 ——
+//
+// 历史缺陷：'zcode-plan-local' 这个 Provider 由 Discover 一键导入创建，而
+// checkZCode 一度不产 suggestedProvider 导致它永远建不出来。此时 sidecar 的
+// 两个动作把「去哪修」藏了起来：
+//   · endpoint 裸报 `provider zcode-plan-local 不存在`（实现细节，用户无从下手）
+//   · GET / 的 endpoint 返回空串，前端只能显示成「没配地址」——而引擎其实是通的，
+//     用户因此去查引擎而不是去建 Provider
+// 这两条断言锚住修复后的可读性。
+describe('Provider 未绑定时 sidecar 管理面的可读性（真实缺陷回归）', () => {
+  // 打桩一个「引擎健康」的 Sidecar：正是最容易误判的场景——引擎没问题，缺的是 Provider。
+  const healthySvc = {
+    workDir: '/wd',
+    port: '8080',
+    credKey: '/k',
+    running: async () => true,
+    status: async () => 'running (127.0.0.1:8080)',
+    probe: async () => 'up',
+  }
+
+  test('endpoint 动作：404 且提示下一步该做什么，而不是裸报 Provider 名', async () => {
+    const app = sidecarAppFor(healthySvc)
+    const res = await app.request('/admin/api/sidecar/endpoint', {
+      method: 'POST',
+      body: JSON.stringify({ url: 'http://127.0.0.1:8080' }),
+      headers: { 'Content-Type': 'application/json' },
+    })
+    expect(res.status).toBe(404)
+    const b = await res.json() as { error: { message: string } }
+    // 要点一：指出去哪里修（一键导入），别只抛实现细节
+    expect(b.error.message).toContain('一键导入')
+    // 要点二：仍然可读——保留被拒的原因，不静默
+    expect(b.error.message).toContain('zcode-plan-local')
+  })
+
+  test('GET / ：endpointBound=false 把「未绑定」与「地址为空」区分开', async () => {
+    const app = sidecarAppFor(healthySvc)
+    const b = await (await app.request('/admin/api/sidecar')).json() as Record<string, unknown>
+    // 引擎是好的：不能因为缺 Provider 就谎报不可用
+    expect(b.running).toBe(true)
+    expect(b.probe).toBe('up')
+    // 地址确实为空，但必须能分辨「没绑」而不是留一个含义不明的空串
+    expect(b.endpoint).toBe('')
+    expect(b.endpointBound).toBe(false)
+  })
+
+  test('已绑定时 endpointBound=true 且回真实地址', async () => {
+    const app = new Hono()
+    app.route('/admin/api/sidecar', createSidecarApp(
+      healthySvc as never,
+      { getByName: () => ({ baseUrl: 'http://127.0.0.1:9090', egress: '' }), put: () => {} } as never,
+      () => {},
+    ))
+    const b = await (await app.request('/admin/api/sidecar')).json() as Record<string, unknown>
+    expect(b.endpoint).toBe('http://127.0.0.1:9090')
+    expect(b.endpointBound).toBe(true)
+  })
+})
+
 // —— 网页登录（beginLogin）——
 //
 // 用户原话：「为啥不能手动弹出登录界面呢？」此前登录只能走 CLI，管理台上

@@ -500,6 +500,12 @@ function gotoProviders() {
     <p v-if="sc && sc.endpoint" class="field-hint">
       引擎地址：<code>{{ sc.endpoint }}</code>（{{ sc.custom ? '自定义 —— 网关直接指向该地址，内置引擎不受影响' : '内置引擎' }}）
     </p>
+    <!-- 空地址必须说明原因：引擎在跑但没绑 Provider 时，用户看到的是「没配地址」，
+         会去查引擎而不是去建 Provider——而真正要做的是去 Providers 页一键导入 ZCode。
+         没绑定时明说下一步做什么（endpointBound=false），别让空串自己说话。 -->
+    <p v-else-if="sc && sc.endpointBound === false" class="field-hint sc-warn">
+      尚未绑定 ZCode Provider，网关还不知道该往哪个地址转发。请到 Providers 页的「一键导入」导入 ZCode。
+    </p>
     <!-- 下载走哪个代理要看得见：首次要下 ~66MB 的 release，直连会卡很久，
          只给一个转圈的「安装中…」用户没法判断是慢还是死了。 -->
     <p v-if="sc && sc.downloadProxy" class="field-hint">
@@ -670,6 +676,8 @@ function gotoProviders() {
 .sc-prog-fill.indet { width: 100%; opacity: .3; animation: sc-indet 1.4s ease-in-out infinite; }
 @keyframes sc-indet { 0%, 100% { opacity: .18; } 50% { opacity: .45; } }
 .sc-err { font-size: 12px; line-height: 1.6; color: var(--bad); margin: 8px 0 0; }
+/* 未绑定 Provider：介于「错误」与「提示」之间——不是故障，但会挡住转发，必须显眼 */
+.sc-warn { color: var(--warn, #b8860b); }
 .sc-panel code { font-family: var(--mono); background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
 .btn.danger { background: var(--bad, #c0392b); color: #fff; border: 0; }
 .co-accounts { margin-top: 10px; border-top: 1px dashed var(--line); padding-top: 8px; }

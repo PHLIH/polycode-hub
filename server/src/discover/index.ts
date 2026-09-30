@@ -640,8 +640,22 @@ export function checkWorkBuddyWithAccounts(
 // 之前这里恒报「登录态无法本地判定」，发现页对 ZCode 永远显示 unknown：
 // 用户配好了账号也看不出本机登录态是否被识别，只能开终端自己验证。改为读
 // 上述两处配置后，「已登录/未登录」在发现页直接可见。
-export function checkZCode(dirs: string[], home = homedir()): Finding {
-  const f: Finding = { key: 'zcode', harness: 'ZCode' }
+export function checkZCode(dirs: string[], home = homedir(), sidecarPort = ''): Finding {
+  const f: Finding = {
+    key: 'zcode',
+    harness: 'ZCode',
+    // 采用草稿必须与登录态判定**解耦**产出：ZCode 的通道是「本机 sidecar 引擎」，
+    // 登录痕迹（~/.zcode 两份 config.json）只决定 status 的措辞，不影响草稿是否成立。
+    //
+    // 历史缺陷：这里从不设 suggestedProvider，于是 notAdoptableReason 的
+    // `if (!found.suggestedProvider)` 恒真，Discovery 页的「一键导入」对 ZCode
+    // 100% 返回 400「无法生成 Provider 配置」——按钮按 status==='ready' 点亮
+    // （Providers.vue），点了却必然失败。而 sidecar 管理面（sidecar_app.ts）
+    // 全程只认 'zcode-plan-local' 这一个 Provider 名，它不存在时：
+    // 「改端口」静默跳过同步、「自定义引擎地址」404、GET /sidecar 的 endpoint
+    // 退化成空串（看着像没配地址）。一个缺失的草稿同时废掉了两条链路。
+    suggestedProvider: zcodeSuggestedProvider(sidecarPort),
+  }
   let installed = false
   for (const d of dirs) {
     try {
@@ -669,6 +683,48 @@ export function checkZCode(dirs: string[], home = homedir()): Finding {
     f.detail = '未发现安装目录与登录痕迹'
   }
   return f
+}
+
+// ZCode 通道的采用草稿：指向本机 sidecar 引擎（ TriDefender/zcode-proxy，127.0.0.1:<port> ）。
+//
+// 形状对齐 wbSuggestedProvider / zenSuggestedProvider：providerId=0（存储层分配）、
+// name 固定 'zcode-plan-local'（sidecar_app.ts 全程按这个对外名查找，改名会同时打断
+// 端口/endpoint/egress 三处联动）、models 留空交由 fillModelsIfEmpty 拉真实目录。
+//
+// 为什么 schema 必须逐字对齐不能漏 riskNote：providerValidate 明确要求
+// `risk` 为 medium/high 时必须填 riskNote，否则导入直接被拒——那会用一个新报错
+// 换掉用户眼前这个 400，问题依旧没解决。
+//
+// sidecarPort 为空（未装引擎 / 读不到 config.yaml）时回落引擎默认端口 8080，
+// 与原 Sidecar 的默认值同源；草稿仍可创建，用户改端口后由 sidecar_app 的
+// `port` 动作把 baseUrl 同步过来。
+export function zcodeSuggestedProvider(sidecarPort = ''): Provider {
+  const port = /^\d{1,5}$/.test(sidecarPort) ? sidecarPort : '8080'
+  return {
+    providerId: 0,
+    name: 'zcode-plan-local',
+    state: 'active' as const,
+    displayName: 'ZCode计划(本地sidecar)',
+    accessKind: 'reverse',
+    risk: 'high',
+    riskNote: '经本地第三方反代（TriDefender/zcode-proxy）转发 ZCode 免费 plan 额度；验证与封号风险自担，见 NOTICE.md 登记',
+    stability: 'beta',
+    api: 'anthropic-messages',
+    // baseURL 停在操作路径之前（不含 /v1）：网关按 anthropic-messages 拼 /v1/messages。
+    // 与 apps.example.yaml 的 zcode-plan-local 示例、以及 sidecar_app.ts 里
+    // `http://127.0.0.1:${port}` 的写法三方一致。
+    baseUrl: `http://127.0.0.1:${port}`,
+    // 凭据**不能留空**：sidecar 开了 auth.proxyApiKey，不带 key 访问 /v1/models
+    // 直接 401 Invalid or missing proxy API key。而 buildHeaders（router/upstream.ts）
+    // 只在 apiKeyEnv/apiKeyFile 存在时才注入 x-api-key + Authorization，
+    // 所以必须引用 setup 阶段落下的 config/credentials/zcode-proxy-key。
+    credential: { apiKeyFile: 'config/credentials/zcode-proxy-key' },
+    priority: 1,
+    // 模型目录不预填猜的名字（同 wbSuggestedProvider 的教训：占位名有时上游还认，
+    // 用户以为配好了，实际用的是随时可能消失的模型）。留空交由 quick-import 的
+    // fillModelsIfEmpty 从 sidecar /v1/models 拉真实目录。
+    models: [],
+  }
 }
 
 // ZCode 本机登录指纹：读 CLI/桌面配置里的 access_token 形态字段，返回脱敏指纹。
@@ -1401,6 +1457,11 @@ export interface ScanConfig {
   // ZCode 登录痕迹的 home（~/.zcode 所在目录）。不填 = 真实 HOME；
   // 测试显式注入，避免依赖运行环境有没有装 ZCode。
   zCodeHome?: string
+  // ZCode 本地 sidecar 引擎的监听端口：只用于拼采用草稿的 baseUrl
+  // （http://127.0.0.1:<port>）。不填/非法 = 回落引擎默认 8080。
+  // 由 cli.ts 从 Sidecar.loadPort 读工作目录 config.yaml 后注入——草稿必须指向
+  // 引擎**真实**在监听的端口，否则导入出来就是一条打不通的 Provider。
+  zCodeSidecarPort?: string
   zenBaseURL?: string
   zenTimeoutMs?: number // <=0 用 8000
   fetchImpl?: FetchLike // 不填用全局 fetch
@@ -1520,7 +1581,7 @@ export class Scanner {
         out.push(wb)
       }
     }
-    out.push(checkZCode(this.cfg.zCodeDirs ?? [], this.cfg.zCodeHome))
+    out.push(checkZCode(this.cfg.zCodeDirs ?? [], this.cfg.zCodeHome, this.cfg.zCodeSidecarPort))
     // 指纹自动识别：从本机 opencode 日志读真实 UA/会话（用户无需手抄任何东西）。
     const fp = this.cfg.openCodeDirs && this.cfg.openCodeDirs.length > 0
       ? discoverOpenCodeFingerprint(this.cfg.openCodeDirs)
