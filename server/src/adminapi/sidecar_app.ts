@@ -305,6 +305,14 @@ export function createSidecarApp(
     const p = providers.getByName('zcode-plan-local')
     const endpoint = p?.baseUrl ?? ''
     const builtin = `http://127.0.0.1:${svc.port}`
+    // endpoint 为空串有三种完全不同的原因，前端必须能分辨：
+    //   ① 没绑定 Provider（草稿缺失/未导入）——该去一键导入
+    //   ② 绑了但 baseUrl 被清空——配置异常
+    //   ③ 正常指向内置引擎
+    // 只回一个空串时，前端无法区分①和②，只能显示成「没配地址」——而引擎其实是通的，
+    // 用户因此以为哪里没配对（历史缺陷，见 issue：endpoint 为空但 probe=up）。
+    // 用 endpointBound 把「有没有绑定」显式化，空串不再有歧义。
+    const endpointBound = p !== undefined
     // 下载会走哪个代理（脱敏）：前端据此显示「下载走 clash（127.0.0.1:7897）」，
     // 让「装了老半天」有个可解释的出处，而不是一个转圈。
     const dl = downloadProxy()
@@ -334,6 +342,9 @@ export function createSidecarApp(
       credFile: svc.credKey,
       hasKey: existsSync(svc.credKey),
       endpoint,
+      // 有没有绑定 zcode-plan-local：endpoint 为空串时据此区分
+      // 「未绑定（去一键导入）」与「绑了但没地址（配置异常）」。
+      endpointBound,
       custom: endpoint !== '' && endpoint !== builtin,
       downloadProxy: maskProxyURI(dl.proxyURI),
       downloadProxySource: dl.source,
@@ -520,7 +531,12 @@ export function createSidecarApp(
           return c.json({ ok: alive, url })
         }
         const p = providers.getByName('zcode-plan-local')
-        if (!p) return err(c, 404, 'provider zcode-plan-local 不存在')
+        // Provider 缺失时不能只甩一句「provider zcode-plan-local 不存在」——那是
+        // 实现细节，用户据此无从下手。改成可执行指引：导入后 endpoint 才有落点。
+        //（该 Provider 通常由 Discover 一键导入创建，草稿见 zcodeSuggestedProvider；
+        //  历史上 checkZCode 不产草稿，用户走到这里必然吃这个 404。）
+        if (!p) return err(c, 404, '尚未创建 zcode-plan-local Provider，无法指定引擎地址。'
+          + '请先到 Providers 页的「一键导入」里导入 ZCode（或在Discovery 页重新扫描后导入）')
         providers.put({ ...p, baseUrl: url.replace(/\/+$/, '') })
         changed()
         return c.json({ ok: true, url: url.replace(/\/+$/, '') })

@@ -38,6 +38,9 @@ export interface SidecarView {
   credFile: string
   hasKey: boolean
   endpoint: string
+  // 是否绑定了 zcode-plan-local：endpoint 为空串时据此区分
+  // 「未绑定（该去一键导入）」与「绑了但没地址（配置异常）」。
+  endpointBound?: boolean
   custom: boolean
   downloadProxy: string
   downloadProxySource: string

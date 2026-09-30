@@ -459,7 +459,15 @@ export async function runServe(args: string[]): Promise<void> {
   // discover 扫描器提出来：监听成功后要拿它预热缓存（见下方 scan() 调用），
   // 让「服务刚重启 → 第一次进 Provider/发现页」直接命中缓存，
   // 而不是由第一个页面请求同步等一次 2~8 秒的 zen 联网探测。
-  const scanner = new Scanner({ ...defaultConfig(), zenCallProbe })
+  const scanner = new Scanner({
+    ...defaultConfig(),
+    zenCallProbe,
+    // ZCode 采用草稿要指向引擎**真实**在监听的端口：sidecarSvc.loadPort 已从
+    // config/zcode-proxy/config.yaml 恢复（第 263 行，先于本行执行）。不注入的话
+    // 草稿只能写死 8080，用户改过端口后一键导入出来的 Provider 就打不通——而那正是
+    // 本次要修的「连不上」的另一种形态。
+    zCodeSidecarPort: sidecarSvc.port,
+  })
   const admin = createAdminApi({
     adminKey: cfg.gateway.adminKey,
     // 概览页接入区：前端据此决定 API Key 那行是「随便填」还是「去配 gateway_key」。
