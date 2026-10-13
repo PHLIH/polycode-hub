@@ -174,7 +174,7 @@ npx tsx server/src/cli.ts <子命令>     # 或用 bin shim：node bin/polycode-
 |---|---|
 | Dashboard | 用量仪表盘：365 天热力图 + 归因表 |
 | Providers | Provider CRUD + 模型勾选/协议/出口/测试/一键导入 |
-| Accounts | 按源分组的账号池 + 健康/测试/重置/签到（一键导入的 WorkBuddy 账号才显示「签到」） |
+| Accounts | 按源分组的账号池 + 健康/测试/重置/签到（一键导入的 WorkBuddy 账号显示「签到」与「自动」开关：打开后网关每天自动代签，页面关着也生效） |
 | Discover | 本机 harness 扫描采用 + 共存登录态导入 + sidecar 管理 |
 | Projects | 本机项目一键启停 / 端口冲突 / 日志 |
 | Login | 管理口令登录 |

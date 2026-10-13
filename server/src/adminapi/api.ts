@@ -70,7 +70,11 @@ const PROVIDER_PATCH_ALLOW = new Set([
 
 const ACCOUNT_PATCH_ALLOW = new Set([
   'status', 'displayName', 'credential', 'weight', 'credentialInput', 'credentialKind',
+  'autoCheckin',
 ])
+
+// 签到相关字段（只允许服务端定时器/签到 handler 写）：出现在新建/编辑请求体里直接 400。
+const ACCOUNT_CHECKIN_STATE_FIELDS = ['lastCheckinAt', 'lastCheckinStatus', 'lastCheckinResult', 'lastCheckinTokenHash'] as const
 
 // ---- 小件 ----
 
@@ -674,8 +678,9 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
   app.post('/admin/api/accounts', async (c) => {
     const raw = await jsonBody(c)
     if (raw === undefined) return errRes(c, 400, ERR.INVALID_REQUEST, '请求体不是合法 JSON')
-    if (isObj(raw) && ['importSource', 'workbuddyUid', 'workbuddyTokenHash'].some((k) => k in raw)) {
-      return errRes(c, 400, ERR.INVALID_REQUEST, '导入来源与身份字段只读')
+    if (isObj(raw) && ['importSource', 'workbuddyUid', 'workbuddyTokenHash', ...ACCOUNT_CHECKIN_STATE_FIELDS]
+      .some((k) => k in raw)) {
+      return errRes(c, 400, ERR.INVALID_REQUEST, '导入来源、身份与签到记录字段只读')
     }
     const ac = parseAccount(raw)
     if (ac.id === '') {
@@ -733,6 +738,11 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
         return errRes(c, 400, ERR.INVALID_REQUEST, `字段 ${k} 只读`)
       }
     }
+    // 签到记录是定时器/签到 handler 的写入物：PATCH 只读，防止用户手写一条
+    // 假记录把「自动签到」的去重判据骗过去（当天不再签）。
+    for (const k of ACCOUNT_CHECKIN_STATE_FIELDS) {
+      if (k in patch) return errRes(c, 400, ERR.INVALID_REQUEST, `字段 ${k} 只读`)
+    }
     if ('status' in patch) {
       const s = patch.status
       if (typeof s !== 'string') return errRes(c, 400, ERR.INVALID_REQUEST, 'status 非法')
@@ -756,6 +766,13 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
         // 流量权重：正整数；<=0/非数字拒绝（调用方应显式传，不静默归一）。
         if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) return false
         ac.weight = Math.floor(v)
+        return true
+      },
+      // 自动签到开关：布尔，false 会显式删字段（关就是关，不留 true 的残影）。
+      autoCheckin: (v) => {
+        if (typeof v !== 'boolean') return false
+        if (v) ac.autoCheckin = true
+        else delete ac.autoCheckin
         return true
       },
     }
@@ -816,20 +833,42 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     return ok(c, 200, res)
   })
 
+  // ---- accounts/checkin ----
+
+  // 签到并发闸（进程内）：同一账号同时在跑两次签到会重复上游调用，双击/定时器与
+  // 手动点击撞车都要拦。键用账号 id（不是 uid：uid 是上游身份，这里是本地资源锁）。
   const checkins = new Set<string>()
-  app.post('/admin/api/accounts/:id/checkin', async (c) => {
-    const ac = accounts.get(c.req.param('id'))
-    if (!ac) return errRes(c, 404, ERR.NOT_FOUND, '账号不存在')
+
+  // 签到结果 → 落盘记录的映射（**唯一定义**）：响应文案、自动签到去重判据、
+  // 前端徽标都读同一份，不各自拼字符串。
+  //   invalid       = 本地就没过关（来源/归属/UID/凭据指纹）——请求本身有问题，400
+  //   unauthorized  = 上游（401/403）拒了登录态——要人重新登录，502（老口径）
+  //   not_available = 上游明确答复「活动未开启/已过期」——今天确实不用签，不是未知状态
+  //   fail          = 超时/未知响应——结果未确认，502
+  type CheckinResult = 'accepted' | 'already_checked_in' | 'invalid' | 'unauthorized' | 'not_available' | 'fail'
+  const CHECKIN_RESULT_TEXT: Record<CheckinResult, string> = {
+    accepted: '已签到',
+    already_checked_in: '今天已签到',
+    invalid: '登录态或身份信息有误',
+    unauthorized: '登录态失效，需重新登录',
+    not_available: '签到活动未开启或已过期',
+    fail: '结果未确认',
+  }
+
+  // 真正的签到调用：账号校验（来源/归属/身份/凭据指纹）+ 上游请求。
+  // 手动端点与自动定时器走**同一条**，不允许各写一份——身份头与错误口径
+  // 一旦分叉，会出现「手动能签、自动签不了」这类难查的分裂。
+  async function runCheckin(ac: Account): Promise<{ result: CheckinResult; message: string }> {
     // 两个发行版都支持签到：只认 'workbuddy' 会让海外版账号恒被 400 拒掉
     // （importSource 现在是 'workbuddy' 或 'workbuddy-ai'，见 discover_api 的
     // 版本分区——两版 UID 命名空间不同，必须分开标记）。
     const src = ac.importSource ?? ''
     if (src !== 'workbuddy' && src !== 'workbuddy-ai') {
-      return errRes(c, 400, ERR.INVALID_REQUEST, '仅支持一键导入的 WorkBuddy 账号')
+      return { result: 'invalid', message: '仅支持一键导入的 WorkBuddy 账号' }
     }
     const owner = providerForAccount(ac.providerId)
     if (!owner) {
-      return errRes(c, 400, ERR.INVALID_REQUEST, '账号归属 Provider 不存在或已删除')
+      return { result: 'invalid', message: '账号归属 Provider 不存在或已删除' }
     }
     // 签到端点的 host 与 X-Domain 必须跟账号所属版本走：两版是独立后端，
     // 拿国内域去签到海外账号请求必然失败（认证域不同，见 model 的 realm 判定）。
@@ -839,15 +878,13 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
     const checkinHost = realm === 'ai' ? 'www.workbuddy.ai' : 'copilot.tencent.com'
     const uid = ac.workbuddyUid
     if (!uid || !/^[\x21-\x7e]{1,256}$/.test(uid)) {
-      return errRes(c, 400, ERR.INVALID_REQUEST, '缺少有效 WorkBuddy UID，请重新登录后扫描导入')
+      return { result: 'invalid', message: '缺少有效 WorkBuddy UID，请重新登录后扫描导入' }
     }
     const [token, resolved] = credentialResolve(ac.credential, (name) =>
       process.env[name] === undefined ? ['', false] : [process.env[name]!, true])
     if (!resolved || !token || workbuddyTokenHash(token) !== ac.workbuddyTokenHash) {
-      return errRes(c, 400, ERR.INVALID_REQUEST, '凭据缺失或已变更，请重新扫描导入以核对身份')
+      return { result: 'invalid', message: '凭据缺失或已变更，请重新扫描导入以核对身份' }
     }
-    if (checkins.has(uid)) return errRes(c, 409, ERR.INVALID_REQUEST, '该 WorkBuddy 账号正在签到，请勿重复点击')
-    checkins.add(uid)
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), 15_000)
     const checkinFetch = deps.workbuddyCheckinFetch ?? globalThis.fetch
@@ -875,26 +912,97 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
       })
       if (response.status === 401 || response.status === 403) {
         await response.body?.cancel()
-        return errRes(c, 502, ERR.API, 'WorkBuddy 登录态失效或无权限，请重新登录后导入')
+        return { result: 'unauthorized', message: 'WorkBuddy 登录态失效或无权限，请重新登录后导入' }
       }
       const data: unknown = await response.json().catch(() => undefined)
       if (response.status === 200 && isObj(data) && data.code === 0 && data.msg === 'OK') {
-        return ok(c, 200, { status: 'accepted', message: 'WorkBuddy 已接受本次签到请求' })
+        return { result: 'accepted', message: 'WorkBuddy 已接受本次签到请求' }
       }
-      if (response.status === 400 && isObj(data) && data.code === 10001
-        && data.msg === '今天已签到，请明天再来') {
-        return ok(c, 200, { status: 'already_checked_in', message: '今天已签到，请明天再来' })
+      // 400 + code 10001 = 上游的**业务级答复**（不是网关/网络故障）。已知两种：
+      //   · '今天已签到，请明天再来' —— 当天已完成；
+      //   · '签到活动未开启或已过期' —— 海外版（www.workbuddy.ai）实测答复，
+      //     活动不开放时当天本就没得签（2026-10-13 真机抓取）。
+      // 同码不同文案说明「10001」是「本次不能签」的统称，所以按其文案分流而
+      // **不是**按码硬编码一句固定文案——把上游的原话透给用户，不替它编语义。
+      if (response.status === 400 && isObj(data) && data.code === 10001) {
+        const msg = typeof data.msg === 'string' ? data.msg : ''
+        if (msg === '今天已签到，请明天再来') {
+          return { result: 'already_checked_in', message: '今天已签到，请明天再来' }
+        }
+        if (msg !== '') {
+          return { result: 'not_available', message: `WorkBuddy：${msg}` }
+        }
       }
-      return errRes(c, 502, ERR.API, 'WorkBuddy 返回未识别的签到结果，请在客户端核对；未自动重试')
+      return { result: 'fail', message: 'WorkBuddy 返回未识别的签到结果，请在客户端核对；未自动重试' }
     } catch {
-      return errRes(c, 502, ERR.API, controller.signal.aborted
+      return { result: 'fail', message: controller.signal.aborted
         ? '签到请求超时，结果未确认；请在客户端核对，未自动重试'
-        : '签到请求失败，结果未确认；请在客户端核对，未自动重试')
+        : '签到请求失败，结果未确认；请在客户端核对，未自动重试' }
+    }
+  }
+
+  // 签到记录落盘：**必须用账号表里的最新对象覆盖后再 put**。
+  // 曾经的写法是就地改一个内存副本再整体写回，会把签名期间用户刚做的修改
+  // （权重/显示名/凭据）一起回滚掉——一次后台签到不该撤销前台编辑。
+  //
+  // status/自动开关/凭据指纹都记：徽标要显示「已签到/失败」，定时器要据此跳过
+  // 当天已完成的号，指纹变了要立刻重新签（重新登录导入过的新凭据必须生效）。
+  function markCheckin(ac: Account, result: CheckinResult): void {
+    const fresh = accounts.get(ac.id)
+    if (!fresh) return // 签名期间账号被删：如实丢弃，不复活
+    fresh.lastCheckinAt = new Date().toISOString()
+    fresh.lastCheckinStatus = CHECKIN_RESULT_TEXT[result]
+    fresh.lastCheckinResult = result
+    // 记下当时用的凭据指纹：重新登录导入换了 token 后，即使当天已试过，
+    // 定时器也应该立即对新凭据重试一次（否则用户要等到明天）。
+    fresh.lastCheckinTokenHash = fresh.workbuddyTokenHash
+    accounts.put(fresh)
+    changed()
+  }
+
+  // 手动签到（账号页按钮）。自动定时器直接调 runCheckin，不走 HTTP，避免
+  // 自己打自己还带上「请勿重复点击」这类面向人的文案。
+  app.post('/admin/api/accounts/:id/checkin', async (c) => {
+    const ac = accounts.get(c.req.param('id'))
+    if (!ac) return errRes(c, 404, ERR.NOT_FOUND, '账号不存在')
+    if (checkins.has(ac.id)) return errRes(c, 409, ERR.INVALID_REQUEST, '该 WorkBuddy 账号正在签到，请勿重复点击')
+    checkins.add(ac.id)
+    try {
+      const r = await runCheckin(ac)
+      if (r.result === 'invalid') return errRes(c, 400, ERR.INVALID_REQUEST, r.message)
+      if (r.result === 'unauthorized' || r.result === 'fail') return errRes(c, 502, ERR.API, r.message)
+      markCheckin(ac, r.result)
+      // 三种「通知类」成功码：已签/今天已签/本次活动未开启，都如实回 status，
+      // 由前端决定提示级别（不是错误，但也不该报成「签到成功」）。
+      return ok(c, 200, { status: r.result, message: r.message })
     } finally {
-      clearTimeout(timer)
-      checkins.delete(uid)
+      checkins.delete(ac.id)
     }
   })
+
+  // 自动签到（定时器调用入口）：**进程内**自调这个端点（cli 的定时器用 app.request，
+  // 不走网络）。这样「手动」与「自动」共享同一条签名路径（runCheckin + 并发闸 +
+  // markCheckin），不会出现两套身份头 / 两套错误口径。
+  app.post('/admin/api/accounts/:id/auto-checkin', async (c) => {
+    const ac = accounts.get(c.req.param('id'))
+    if (!ac) return errRes(c, 404, ERR.NOT_FOUND, '账号不存在')
+    if (!ac.autoCheckin) {
+      return ok(c, 200, { status: 'skipped', message: '该账号未开启自动签到' })
+    }
+    if (checkins.has(ac.id)) {
+      return ok(c, 200, { status: 'skipped', message: '该账号正在签到，本次跳过（下一轮再看）' })
+    }
+    checkins.add(ac.id)
+    let r: { result: CheckinResult; message: string }
+    try {
+      // runCheckin 内部已含「无 await 的校验段」（来源/归属/UID/凭据指纹），
+      // 那一段天然原子；上游调用有 await，故并发闸（checkins）必须先于它加上。
+      r = await runCheckin(ac)
+    } finally {
+      checkins.delete(ac.id)
+    }
+    markCheckin(ac, r.result)
+    return ok(c, 200, { status: r.result, message: r.message })  })
 
   // ---- stats ----
 

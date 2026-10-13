@@ -179,13 +179,72 @@ async function checkin(a) {
   checkingIn.add(a.id)
   try {
     const r = await api.checkinAccount(a.id)
-    if (r.status === 'already_checked_in') ElMessage.info(r.message)
+    // 三种「今天不必再签」的回复都不是错误：已签成功 / 今天已签过 / 活动未开启。
+    // 前三者用 success/info，只有真的失败才走 catch。
+    if (r.status === 'already_checked_in' || r.status === 'not_available') ElMessage.info(r.message)
     else ElMessage.success(r.message)
+    // 签完记录变了（lastCheckinAt/Status），不重新拉的话徽标还是旧的。
+    await load()
   } catch (e) {
     ElMessage.error(`签到失败：${e.message}`)
   } finally {
     checkingIn.delete(a.id)
   }
+}
+
+// ---- WorkBuddy 自动签到（开关 + 值守记录）----
+//
+// 开关的真相源是后端账号记录（账号页只是它的显示面）：打开后由**网关进程里的定时器**
+// 在每天本地 04:00 后自动代签（见 server/src/pool/auto_checkin.ts），页面关着也照签。
+// 前端因此不需要任何本地定时器/轮询计数——刷新页面就能看到后台写下的记录。
+
+// 是否 WorkBuddy 导入账号（两版都能签）。
+function isWorkbuddy(a) {
+  return a.importSource === 'workbuddy' || a.importSource === 'workbuddy-ai'
+}
+
+// 「星期几」文案：后端下发 ISO 串，这里只做展示（按本地时区渲染）。
+const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六']
+function weekdayOf(d) { return WEEKDAYS[d.getDay()] }
+
+// 记录徽标：把后端字段翻成一条能悬停看的人话。没有任何记录时返回 null（不显示徽标）。
+function checkinBadge(a) {
+  if (!a.lastCheckinResult) return null
+  const at = a.lastCheckinAt ? new Date(a.lastCheckinAt) : null
+  const valid = at !== null && !Number.isNaN(at.getTime())
+  const time = valid
+    ? `${at.getMonth() + 1}-${at.getDate()}（周${weekdayOf(at)}）${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`
+    : '—'
+  const ok = a.lastCheckinResult === 'accepted' || a.lastCheckinResult === 'already_checked_in'
+  // 徽标分色：绿=今天已签（含活动未开启，那也是「今天没得签」）；
+  // 红=要人动手（登录态失效/身份不对）；琥珀=结果未确认（超时/unrecognized）。
+  const cls = ok || a.lastCheckinResult === 'not_available'
+    ? 'ok'
+    : (a.lastCheckinResult === 'unauthorized' || a.lastCheckinResult === 'invalid') ? 'bad' : 'warn'
+  return {
+    cls,
+    text: `上次签到 ${time}`,
+    title: `${a.lastCheckinStatus || '结果未知'}\n签到时间：${valid ? at.toLocaleString() : '—'}\n\n自动签到开启后会每天代签一次（本地凌晨 4 点后算新的一天）`
+      + (a.autoCheckin ? '\n状态：已开启自动签到' : '\n状态：仅手动签到'),
+  }
+}
+
+const autoCheckinBusy = ref('')
+async function toggleAutoCheckin(a, on) {
+  autoCheckinBusy.value = a.id
+  try {
+    await api.setAutoCheckin(a.id, on)
+    // 本地即时反映（后端 200 即已落库）；开关没落库的话下次开发还会再拉一次修正。
+    if (on) a.autoCheckin = true
+    else delete a.autoCheckin
+    ElMessage.success(on
+      ? `${a.id} 已开启自动签到：网关每天自动代签（页面关着也生效）`
+      : `${a.id} 已关闭自动签到`)
+    await load()
+  } catch (e) {
+    ElMessage.error(e.message)
+    await load()
+  } finally { autoCheckinBusy.value = '' }
 }
 
 const testing = ref('')
@@ -491,11 +550,24 @@ async function setWeight(a, v) {
             @change="v => toggleEnabled(a, v)" />
           <!-- 两个发行版都能签到（后端已按 Provider 版本推导 host 与 X-Domain）；
                只显示 'workbuddy' 会让海外版账号永远没有签到入口。 -->
-          <button v-if="a.importSource === 'workbuddy' || a.importSource === 'workbuddy-ai'" class="linklike"
+          <button v-if="isWorkbuddy(a)" class="linklike"
             :disabled="checkingIn.has(a.id)" @click="checkin(a)"
             title="使用此账号的导入登录态签到一次，不自动重试">
             {{ checkingIn.has(a.id) ? '签到中…' : '签到' }}
           </button>
+          <!-- 自动签到开关：打开 = 网关定时器在本地 04:00 后的新一天自动代签。
+               关（非 WorkBuddy 账号）不显示——那些源没有签到接口，显示只会造成误解。 -->
+          <span v-if="isWorkbuddy(a)" class="auto-ck"
+            :title="a.autoCheckin
+              ? '已开启：网关每天自动代签（页面关着也生效）；关闭后不再代签'
+              : '开启后由网关每天自动代签一次，不用再手动点'">
+            <span class="dim">自动</span>
+            <el-switch :model-value="a.autoCheckin === true" size="small"
+              :loading="autoCheckinBusy === a.id"
+              @change="v => toggleAutoCheckin(a, v)" />
+          </span>
+          <span v-if="checkinBadge(a)" class="ck-badge" :class="checkinBadge(a).cls"
+            :title="checkinBadge(a).title">{{ checkinBadge(a).text }}</span>
           <button class="linklike" @click="openEdit(a)">编辑</button>
           <button class="linklike danger" @click="remove(a)">删除</button>
         </span>
@@ -734,6 +806,18 @@ async function setWeight(a, v) {
 .weight-input { width: 96px; }
 .weight-input :deep(.el-input__inner) { text-align: center; }
 .acct-actions { display: flex; gap: 4px; flex: none; }
+
+/* 自动签到：开关 + 计时记录徽标（都只在 WorkBuddy 账号行出现）。
+   行内元素，用 inline-flex 对齐 el-switch 与文字基线。 */
+.auto-ck { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; flex: none; }
+.ck-badge {
+  font-size: 11px; padding: 0 7px; border-radius: 999px; white-space: nowrap;
+  border: 1px solid var(--line); color: var(--dim); cursor: help; flex: none;
+}
+/* 颜色语义与健康徽标同口径：绿=已成功、琥珀=不确定、红=要人处理。 */
+.ck-badge.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+.ck-badge.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
+.ck-badge.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); }
 
 /* 健康状态标识：绿=健康，琥珀=连败超阈值/冷却，红=耗尽/停用 */
 .acct-health {

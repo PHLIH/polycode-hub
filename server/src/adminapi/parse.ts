@@ -124,6 +124,11 @@ export function parseAccount(raw: unknown): Account {
   if (typeof o.weight === 'number' && Number.isFinite(o.weight) && o.weight > 0) {
     a.weight = Math.floor(o.weight)
   }
+  // 自动签到（WorkBuddy）：开关落库，定时器按它挑账号。
+  if (o.autoCheckin === true) a.autoCheckin = true
+  // 值守记录（lastCheckinAt / lastCheckinStatus）**不在这里收敛**：它们是定时器/手动
+  // 签到的写入物，不是用户输入。允许请求体写会让「新建账号」顺带伪造一条签到历史。
+  // 写入走 PATCH 白名单之外的专用路径（见 api.ts 的 markCheckin）。
   const cooldownUntil = parseDate(o.cooldownUntil)
   if (cooldownUntil) a.cooldownUntil = cooldownUntil
   const lastUsed = parseDate(o.lastUsed)

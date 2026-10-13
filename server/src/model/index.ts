@@ -297,6 +297,20 @@ export interface Account {
   // 关（disabled）/失效（exhausted/cooldown）时权重自动失效——eligible 只收可用者，
   // 分母是可用者的权重和，不用手动重算。
   weight?: number
+  // ---- WorkBuddy 自动签到（定时器值守）----
+  // 开关：true = 由网关定时器每天（本地日）代签。缺省/未设 = 不签（与老库兼容）。
+  autoCheckin?: boolean
+  // 最近一次签到**尝试**时间（ISO 串，含失败）。落 JSON 不 decl。Date（见 store 的
+  // reviveAccountDates 那条注释：Date 经 JSON round-trip 会变 string，比大小恒 false）。
+  lastCheckinAt?: string
+  // 给人看的一句话（成功/已签到/失败原因）。
+  lastCheckinStatus?: string
+  // 机器判据：accepted / already_checked_in / invalid / unauthorized / fail。
+  // 只信这个值做去重，不比对文案（文案随时会改，比对文本是脆的）。
+  lastCheckinResult?: string
+  // 最近一次签到用的凭据指纹：重新登录导入换了 token 后，定时器据此立即重试
+  // （否则当天已试过就得到明天才轮上）。
+  lastCheckinTokenHash?: string
 }
 
 // 冷却到期自动复位（不回写，读取时判定）。

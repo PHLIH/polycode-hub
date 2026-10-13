@@ -13,6 +13,7 @@ import { Upstream, egressProxyURI } from './router/upstream.ts'
 import { Proxy } from './gateway/proxy.ts'
 import { Probe } from './gateway/probe.ts'
 import { AccountPool } from './pool/account.ts'
+import { AutoCheckin, type CheckinOutcome } from './pool/auto_checkin.ts'
 import type { Account, Provider } from './model/index.ts'
 import { Store as UsageStore, backfillSemantics } from './usage/store.ts'
 import {
@@ -522,6 +523,34 @@ export async function runServe(args: string[]): Promise<void> {
   const distDir = join(distRoot, 'web', 'dist')
   app.route('/', createAdminUI(distDir))
 
+  // ---- WorkBuddy 自动签到值守 ----
+  //
+  // 目标：用户不必每天手动点「签到」。由网关定时器在**本地逻辑日**切换后自动代签。
+  //
+  // 为什么要走进程内 HTTP 自调，而不是直接调 api.ts 里的函数：
+  //   签到路径上有并发闸、结果落盘、错误口径三层逻辑，全在 admin 路由里。
+  //   定时器直接调函数要么复制这三层（必然漂移），要么把它们下沉到新模块
+  //   （动到现有契约）。走自调端点 = 复用同一条路径，且不需要网络（Hono 的
+  //   app.request 是纯函数式调用，监听还没建立也能工作）。
+  //
+  // 为什么用 X-Admin-Key 带上 adminKey：管理面若开了鉴权（admin_key 非空），
+  //   不带 key 的请求会被 401；这里与前端同口径地用同一个 key（**不绕鉴权**）。
+  const autoCheckin = new AutoCheckin({
+    listAccounts: () => accounts.list(),
+    run: async (id): Promise<CheckinOutcome | undefined> => {
+      const res = await app.request(
+        `/admin/api/accounts/${encodeURIComponent(id)}/auto-checkin`,
+        { method: 'POST', headers: { 'X-Admin-Key': cfg.gateway.adminKey } },
+      )
+      if (res.status !== 200) return undefined
+      const body = await res.json().catch(() => undefined) as
+        { status?: string; message?: string } | undefined
+      if (!body || typeof body.status !== 'string') return undefined
+      return { status: body.status as CheckinOutcome['status'], message: body.message ?? '' }
+    },
+    log: (m) => console.log(m),
+  })
+
   const server = serve({ fetch: app.fetch, port: cfg.gateway.port, hostname: cfg.gateway.host })
 
   // 绑定失败必须显式处理，否则 Node 会以「未处理的 'error' 事件」直接抛栈退出：
@@ -585,6 +614,11 @@ export async function runServe(args: string[]): Promise<void> {
   // 开工先立刻 tick 一次——网关重启后引擎若是死的，不该等满一个周期才动手。
   void sidecarGuard.tick()
   const stopGuard = sidecarGuard.run()
+  // 自动签到值守：开工立刻 tick 一次（与 sidecar 同口径）——网关可能是早上重启的，
+  // 当天的签到不该因为「还没到一个周期」而拖着。之后按周期轮询（默认 5 分钟），
+  // 每次 tick 现取开关与记录，因此用户在页面上的改动下一轮即生效。
+  void autoCheckin.tick()
+  const stopAutoCheckin = autoCheckin.run_timer()
   // 优雅退出（SIGINT/SIGTERM）：按序收摊，而不是打一行日志就 process.exit(0)。
   // 旧实现 `void server.close()` 后立即 exit —— close 回调永不执行，在途请求
   // （包括正在转发中的 SSE 流）被硬杀，SIGTERM 优雅退出形同虚设；
@@ -614,6 +648,7 @@ export async function runServe(args: string[]): Promise<void> {
     void (async () => {
       stopSweeper() // 先停巡检，再关服务，避免退出期间还在改状态文件
       stopGuard()   // 停保活：退出过程中不该再拉起引擎
+      stopAutoCheckin() // 停自动签到：退出期间不该再打上游
       // server.close() 的回调要等**在途请求全部结束**才触发，所以先发起、
       // 走完第 3 步再 await —— 直接 void 掉就等于没人等它（旧实现的病根）。
       const closing = new Promise<void>((resolve) => { server.close(() => resolve()) })
