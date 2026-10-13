@@ -2,6 +2,7 @@
 
 import { describe, expect, test, vi } from 'vitest'
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
+import { utimesSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -218,9 +219,26 @@ describe('多快照去重：档位优先于时间', () => {
   const UID = 'same-uid-0001'
 
   // 两份快照放同一目录（去重按目录扫）。
+  //
+  // mtime 必须**显式指定**，不能靠写入顺序碰运气：`writeFile` 是两次顺序 await，
+  // 偶尔会跨毫秒，于是「后写的那份 mtime 更新」——而本组用例里被后写的恰好是
+  // 带时间戳的旧快照，用例就翻了（实测约 1/5 概率，是仓库里长期存在的 flake）。
+  // 被测函数的第一判据是档位、第二判据才是 mtime，两个判据都要能独立验证，
+  // 所以时间轴由测试自己固定。
+  //
+  // files 的第一项 = 最新那份（语义与用例注释里的「最新/较旧」一致）；
+  // 时间基准取固定时刻，不依赖现在几点。
+  const BASE = new Date('2026-10-13T10:00:00.000Z')
   async function dirWith(files: Array<[string, Record<string, unknown>]>): Promise<string> {
     const dir = await tempDir()
-    for (const [name, raw] of files) await writeFile(join(dir, name), JSON.stringify(raw), 'utf8')
+    // 首项最新，随后的每项各早 1 分钟（明确区分，不靠同毫秒平手）。
+    for (let i = 0; i < files.length; i++) {
+      const [name, raw] = files[i]!
+      const p = join(dir, name)
+      await writeFile(p, JSON.stringify(raw), 'utf8')
+      const t = new Date(BASE.getTime() - i * 60_000)
+      utimesSync(p, t, t)
+    }
     return dir
   }
   const plain = (expDays: number): string => craftJWT(new Date(Date.now() + expDays * 86400_000))
@@ -237,6 +255,7 @@ describe('多快照去重：档位优先于时间', () => {
   })
 
   test('新份是信封、旧份是活明文 → 选旧明文（这才是能入池的那份）', async () => {
+    // 档位不同：旧明文是档 3、新信封是档 2 → 旧明文胜，与 mtime 相反。
     const dir = await dirWith([
       ['workbuddy-desktop.info', envelopeFile(Date.now() + 29 * 86400_000)], // 最新：信封，alive
       ['workbuddy-desktop.2026-09-16T01-06-33-028Z.9.x.info', plainFile(17)],   // 较旧：明文，alive
@@ -248,6 +267,7 @@ describe('多快照去重：档位优先于时间', () => {
   })
 
   test('新份已过期、旧份是活明文 → 选活的旧份（不被死的最新版压掉）', async () => {
+    // 档位不同：旧份 3，新份 1（已过期但有明文）→ 旧份胜。
     const dir = await dirWith([
       ['workbuddy-desktop.info', plainFile(-11)],  // 最新：明文但已过期
       ['workbuddy-desktop.2026-09-13T13-53-30-073Z.9.y.info', plainFile(44)], // 较旧：明文且活
@@ -259,6 +279,7 @@ describe('多快照去重：档位优先于时间', () => {
   })
 
   test('两份都活且都是明文 → 仍取最新（原有行为不变）', async () => {
+    // 同档（都是 3）平手 → 回到 mtime 规则：dirWith 里首项 mtime 最新。
     const dir = await dirWith([
       ['workbuddy-desktop.info', plainFile(30)],
       ['workbuddy-desktop.2026-09-16T01-06-33-028Z.9.z.info', plainFile(17)],
@@ -266,6 +287,23 @@ describe('多快照去重：档位优先于时间', () => {
     const accts = discoverWorkBuddyAccounts(dir)
     expect(accts).toHaveLength(1)
     expect(accts[0]!.tokenPath).toContain('workbuddy-desktop.info') // 最新那份
+  })
+
+  test('同档平手时按 mtime 取新（时间轴由测试给定的方向不会被写入顺序影响）', async () => {
+    // 这条专门盯 mtime 判据：两份都是档 3（明文且活），结论只能来自 mtime。
+    // 若谁把 dirWith 的 mtime 固定改回「不设」，本用例会与上一条一起红，
+    // 直接指出是「时间判据没被测到」而不是去猜 flake。
+    const dir = await dirWith([
+      ['workbuddy-desktop.info', plainFile(30)],                          // BASE      → 最新
+      ['workbuddy-desktop.2026-09-16T01-06-33-028Z.9.z.info', plainFile(17)], // BASE - 1min
+    ])
+    expect(discoverWorkBuddyAccounts(dir)[0]!.tokenPath).toContain('workbuddy-desktop.info')
+    // 反向：把两者调换位置，胜者应变成带时间戳的那份（证明不是「永远选某个文件名」）。
+    const dir2 = await dirWith([
+      ['workbuddy-desktop.2026-09-16T01-06-33-028Z.9.z.info', plainFile(17)], // BASE      → 最新
+      ['workbuddy-desktop.info', plainFile(30)],                          // BASE - 1min
+    ])
+    expect(discoverWorkBuddyAccounts(dir2)[0]!.tokenPath).toContain('2026-09-16')
   })
 
   test('同档平手仍按 mtime/exp 取最新（原有平手规则保留）', async () => {
