@@ -34,7 +34,7 @@ describe('errorKind 落库（ACCOUNT-HEALTH 步骤 1–3）', () => {
     await store.close()
   })
 
-  test('迁移范本：v1 库（无 error_kind 列）打开后重建到最新形态、数据无损、user_version=5', async () => {
+  test('迁移范本：v1 库（无 error_kind 列）打开后重建到最新形态、数据无损、user_version=6', async () => {
     const path = join(dir, 'legacy.db')
     // 手工造一个 v1 形态的库（模拟 Go 时代产物）：有 source_id 列、provider_id 还是 TEXT
     const raw = new DatabaseSync(path)
@@ -67,7 +67,7 @@ describe('errorKind 落库（ACCOUNT-HEALTH 步骤 1–3）', () => {
     await store.close()
 
     const after = new DatabaseSync(path)
-    expect((after.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(5)
+    expect((after.prepare('PRAGMA user_version').get() as { user_version: number }).user_version).toBe(6)
     // 列清单按最新 schema：source_id（已删概念的残留）不复存在，
     // provider_name 快照存在，provider_id 是 INTEGER（数字内部 id）。
     const cols = after.prepare('PRAGMA table_info(usage_logs)').all() as unknown as
@@ -295,6 +295,45 @@ describe('账号维度聚合（ACCOUNT-HEALTH §3.4）', () => {
     expect(m2.inputTokens).toBe(1)
     expect(m2.outputTokens).toBe(2)
     await store.close()
+  })
+
+  // 回归：同一账号同一模型曾裂成两行（真实缺陷，2026-10-13 账号页看到「两个一样的模型」）。
+  //
+  // 成因：sem 列历史上出现过两种同义字面量——''（=未知/待回填）与 'subset'。
+  // 读取侧两者都当 subset，但聚合的 `GROUP BY sem` **按字面分组**，于是同一模型
+  // 被拆成两行。新版两处都堵：插入侧只写确定值；聚合改按派生语义分组。
+  //
+  // 这里用「库层面」造出两行不同字面量（'' 与 'subset'）：公共写入接口已经造不出
+  // 这种状态了，而恰恰是这种旧库状态会触发裂行。
+  test('回归：同一模型的两种 sem 字面量不再裂成两行', async () => {
+    const path = join(dir, 'sem-dup.db')
+    const store = await Store.open(path)
+    const mk = (over: Partial<UsageLog>) => log({
+      ts: new Date('2026-10-13T12:00:00Z'), providerId: 9, providerName: 'wb', modelId: 'same-model',
+      accountId: 'acc-sem', ...over,
+    })
+    await store.insertLog(mk({ requestId: 's1', inputTokens: 100, outputTokens: 10, cacheReadTokens: 50 }))
+    await store.insertLog(mk({ requestId: 's2', inputTokens: 200, outputTokens: 20, cacheReadTokens: 80 }))
+    await store.close()
+
+    // 把其中一行退回「未知」字面量，模拟 v6 之前的库（两种字面量并存）。
+    const raw = new DatabaseSync(path)
+    raw.prepare(`UPDATE usage_logs SET sem = '' WHERE request_id = 's2'`).run()
+    raw.close()
+
+    const store2 = await Store.open(path)
+    const acc = (await store2.accountBreakdown(new Date(0))).find((r) => r.accountId === 'acc-sem')!
+    // 关键断言：同名模型只能有一行，请求/输入是两笔之和（不是被分组拆开）。
+    expect(acc.models.filter((m) => m.modelId === 'same-model')).toHaveLength(1)
+    expect(acc.models[0]!.requests).toBe(2)
+    expect(acc.models[0]!.inputTokens).toBe(300)
+    // 分组是按派生语义算的，不该依赖「字面量已被归并」——所以此处两种字面量仍并存。
+    const check = new DatabaseSync(path)
+    const st = check.prepare(`SELECT sem, COUNT(*) AS n FROM usage_logs GROUP BY sem`).all() as
+      unknown as { sem: string; n: number }[]
+    expect(st.find((r) => r.sem === '')?.n).toBe(1)
+    check.close()
+    await store2.close()
   })
 })
 

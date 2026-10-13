@@ -414,6 +414,16 @@ describe('缓存语义分流（CACHE-SEMANTICS：sem 列 + inputSideTokens）', 
       inputTokens: 1000, outputTokens: 10, cacheReadTokens: 800 }))
     await store.close()
 
+    // 把这 4 行退回 sem=''（= 「未知/待回填」哨兵），模拟 v6 之前写入的库。
+    // 插入侧已不产出 ''（生产方一律写确定值），历史状态只能直接改库造出来——
+    // 回填的前提正是「库里存在未知行」，用 insertLog 造不出被测场景。
+    {
+      const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite')
+      const raw = new DatabaseSync(join(dir, 'sem-backfill.db'))
+      raw.exec(`UPDATE usage_logs SET sem = ''`)
+      raw.close()
+    }
+
     // 直接再打开验证落盘（backfill 由 cli 接线，这里手动调用与 cli 相同逻辑）
     const store2 = await Store.open(join(dir, 'sem-backfill.db'))
     const fixed = store2.backfillSemantics((id) =>

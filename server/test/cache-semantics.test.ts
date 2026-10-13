@@ -26,6 +26,18 @@ function log(over: Record<string, unknown>): Parameters<Store['insertLog']>[0] {
   } as unknown as Parameters<Store['insertLog']>[0]
 }
 
+
+// 把刚写入的行改回 sem=''（= 「未知/待回填」哨兵），模拟 v5 及更早的库。
+//
+// 为什么要专门造这个状态，而不是直接 insertLog({sem:''})：
+// 插入侧自 v6 起**不再**产出 ''（生产方一律写确定值 'subset'/'separate'，
+// 见 store.insertLog 的注释）——'' 只可能是历史遗留。用公共写入接口已经
+// 造不出「未知行」，所以退回直改 SQL；这也顺带把「谁能写 ''」钉死成库层面的事实。
+function markUnknown(s: Store): void {
+  const db = (s as unknown as { db: Parameters<typeof backfillSemantics>[0] }).db
+  db.exec(`UPDATE usage_logs SET sem = ''`)
+}
+
 describe('缓存语义（CACHE-SEMANTICS）聚合口径', () => {
   test('subset 与 separate 行混合：命中率不越界、分母按行内语义分流', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'polycode-sem-mix-'))
@@ -75,8 +87,9 @@ describe('缓存语义（CACHE-SEMANTICS）聚合口径', () => {
     const dir = mkdtempSync(join(tmpdir(), 'polycode-sem-legacy-'))
     try {
       const s = await Store.open(join(dir, 'usage.db'))
-      // 直接写库模拟历史行：sem 列留空（insertLog 会补 'subset'，故不用它）
-      s.insertLog(log({ inputTokens: 500, cacheReadTokens: 400, cacheCreationTokens: 0, sem: '' as never }))
+      // 写完后标回 ''：插入侧已不产出「未知」，历史行只能这样造（见 markUnknown）
+      await s.insertLog(log({ inputTokens: 500, cacheReadTokens: 400, cacheCreationTokens: 0 }))
+      markUnknown(s)
       const b = await s.breakdown(new Date(0))
       expect(b.totals.inputSideTokens).toBe(500) // subset：input 就是输入侧
       expect(b.totals.cacheHitRate).toBeCloseTo(400 / 500, 6) // 80%
@@ -101,12 +114,13 @@ describe('backfillSemantics 回填计数与幂等', () => {
     // p1 配 anthropic-messages → separate（5 行）；p2 配 openai → subset（3 行）
     for (let i = 0; i < 5; i++) {
       await s.insertLog(log({ providerId: 1, requestId: 'a' + String(i),
-        inputTokens: 100, cacheReadTokens: 300, sem: '' as never }))
+        inputTokens: 100, cacheReadTokens: 300 }))
     }
     for (let i = 0; i < 3; i++) {
       await s.insertLog(log({ providerId: 2, requestId: 'b' + String(i),
-        inputTokens: 500, cacheReadTokens: 400, sem: '' as never }))
+        inputTokens: 500, cacheReadTokens: 400 }))
     }
+    markUnknown(s) // 模拟「全部待回填」的历史库
     return { s, dir }
   }
 
@@ -148,9 +162,10 @@ describe('backfillSemantics 回填计数与幂等', () => {
     try {
       const s = await Store.open(join(dir, 'usage.db'))
       // p9 无任何协议配置：read(300) > input(100) → 必是 separate
-      await s.insertLog(log({ providerId: 9, inputTokens: 100, cacheReadTokens: 300, sem: '' as never }))
+      await s.insertLog(log({ providerId: 9, inputTokens: 100, cacheReadTokens: 300 }))
       // p10 无配置且 read(50) <= input(500) → 钉成 subset
-      await s.insertLog(log({ providerId: 10, inputTokens: 500, cacheReadTokens: 50, sem: '' as never }))
+      await s.insertLog(log({ providerId: 10, inputTokens: 500, cacheReadTokens: 50 }))
+      markUnknown(s) // 无协议可依，待启发式兜底
       const db = (s as unknown as { db: Parameters<typeof backfillSemantics>[0] }).db
       const n = backfillSemantics(db, () => undefined)
       expect(n).toBe(2)
@@ -227,9 +242,10 @@ describe('回填：混合协议源与贴错纠错', () => {
       const s = await Store.open(join(dir, 'usage.db'))
       // 同一个 providerId=4，两个模型各 3 行
       for (let i = 0; i < 3; i++) {
-        await s.insertLog(log({ providerId: 4, modelId: 'ma', requestId: 'x' + String(i), sem: '' as never }))
-        await s.insertLog(log({ providerId: 4, modelId: 'mo', requestId: 'y' + String(i), sem: '' as never }))
+        await s.insertLog(log({ providerId: 4, modelId: 'ma', requestId: 'x' + String(i) }))
+        await s.insertLog(log({ providerId: 4, modelId: 'mo', requestId: 'y' + String(i) }))
       }
+      markUnknown(s) // 待按模型级协议回填
       const db = (s as unknown as { db: Parameters<typeof backfillSemantics>[0] }).db
       // 只有 ma 声明 anthropic-messages；mo 声明 openai-completions
       const n = backfillSemantics(db, (_pid, mid) =>
@@ -252,7 +268,8 @@ describe('回填：混合协议源与贴错纠错', () => {
       const s = await Store.open(join(dir, 'usage.db'))
       // 配置说这是 openai（subset），但数据 read=65842 >> input=112 —— 反例
       await s.insertLog(log({ providerId: 11, modelId: 'union-alpha',
-        inputTokens: 112, cacheReadTokens: 65842, sem: '' as never }))
+        inputTokens: 112, cacheReadTokens: 65842 }))
+      markUnknown(s)
       const db = (s as unknown as { db: Parameters<typeof backfillSemantics>[0] }).db
       // 先由配置贴成 subset（模拟旧行为把混合源压扁）
       const first = backfillSemantics(db, () => 'openai-completions')

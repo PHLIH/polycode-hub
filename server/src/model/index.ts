@@ -378,7 +378,8 @@ export interface UsageLog {
   // 缓存语义（CACHE-SEMANTICS）：该行三桶（input/read/creation）的计量关系，
   // 聚合层分流公式的唯一依据。'subset' = OpenAI 系（prompt_tokens 已含 cached
   // 全量）；'separate' = Anthropic 系（input 只算未命中部分，三桶互斥）。
-  // 可选，缺省按 subset 处理（历史行由 store.backfillSemantics 回填）。
+  // 可选；缺省按 'subset' 落库（生产方都写确定值）。库里读到 '' 只意味着
+  // 「历史行尚未回填」——读取侧一律当 subset（见 store 的 SEM_GROUP）。
   sem?: 'subset' | 'separate'
 }
 

@@ -13,6 +13,13 @@
 //     标记该行三桶的计量语义。OpenAI 系 input 已含缓存命中（subset）；Anthropic 系
 //     input 只算未命中部分，三桶互斥（separate）。聚合公式按行内 sem 分流，
 //     不再一刀切 subset——那曾把 zcode 系（anthropic 协议）的命中率算成 1117%。
+//   v5 → v6（2026-10-13）：sem 语义补注。**无 DDL 变化**，是插入期的口径修正：
+//     v5 的插入把已知 subset 写成了 ''，而 '' 是 backfillSemantics 的「待回填」
+//     哨兵（三态：''=未知 / 'subset' / 'separate'）。新行冒充「未知」与回填写下的
+//     'subset' 成了两种字面量，而 accountBreakdown/breakdown 的 `GROUP BY … sem`
+//     按字面分组——同一模型的用量被拆成两行，账号页上就是「两个一样的模型」。
+//     修正分两处：insertLog 写规范 'subset'；聚合改按**派生语义**分组（见
+//     SEM_GROUP），使存储字面量再怎么变都不会拆散同一模型。
 //   迁移模式：建表 DDL 恒为最新形态；旧库按 user_version 判断，缺列则 ALTER，
 //   迁移必须幂等（重复打开不重复迁）。
 
@@ -24,7 +31,17 @@ import { createRequire } from 'node:module'
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite')
 import type { UsageLog, UsageStatus } from '../model/index.ts'
 
-const SCHEMA_VERSION = 5
+const SCHEMA_VERSION = 6 // v6 无 DDL：仅借版本号让曾按旧口径写入的库重跑一次回填
+
+// sem 的**派生语义**（聚合分组一律用它，不用裸列）。
+//
+// 为何不直接 GROUP BY sem（真实缺陷，2026-10-13）：本列历史上出现过三种字面量
+//（''=未知/待回填、'subset'、'separate'），而 '' 与 'subset' 语义相同。
+// 按裸列分组就把同一模型的用量拆成两行（一行 ''、一行 'subset'），
+// 账号页上表现为「两个一模一样的模型」。派生后只剩两种取值，
+// 存储字面量再怎么变都不会拆散同一模型（migrate/回填只负责把 '' 消掉，
+// 不再兼任「防裂行」的职责）。
+const SEM_GROUP = `(CASE WHEN sem = 'separate' THEN 'separate' ELSE 'subset' END)`
 
 // 缓存语义。与 ir/types.ts 的 CacheSemantics 同词汇，此处独立声明避免
 // usage 层反向依赖 ir（model → ir 已是依赖边，store 只依赖 model）。
@@ -181,7 +198,12 @@ export class Store {
   }
 
   // 写入一条用量记录。total_tokens = input + output（subset 口径，旧列保留只为
-  // 兼容；读路径一律重算，见各聚合查询的 totalExpr）。sem 缺省落 ''（= subset）。
+  // 兼容；读路径一律重算，见各聚合查询的 totalExpr）。sem 缺省按 'subset' 落库。
+  //
+  // sem 落库值只有两种：'subset' / 'separate'（都是**确定值**）。库里的 '' 是
+  // 历史遗留的「未知/待回填」哨兵（backfillSemantics 的输入），插入侧不再产出——
+  // 旧写法把已确定的 subset 也写成 ''，与回填写下的 'subset' 成了两种字面量，
+  // 聚合 `GROUP BY` 按字面分组，就把同一模型拆成两行（见 v5→v6 注释）。
   // 旧库曾有 7 条 account_id='-' 脏数据（历史写入，已整体清空），此处守卫防复发。
   async insertLog(l: UsageLog): Promise<void> {
     const total = Store.totalOf(l.inputTokens, l.outputTokens, l.cacheCreationTokens)
@@ -197,7 +219,16 @@ export class Store {
         l.inputTokens, l.outputTokens, l.cacheReadTokens, l.cacheCreationTokens,
         l.reasoningTokens, total, l.accuracy, l.latencyMs, l.status,
         l.egressId ?? '', l.nodeId ?? '', l.stream ? 1 : 0, l.firstTokenMs ?? 0, l.errorKind ?? '',
-        l.sem === 'separate' ? 'separate' : '',
+        // 写**规范字面量**，不要 "not separate → ''"。
+        //
+        // 为何（真实缺陷）：'' 在本列是 backfillSemantics 的「未知/待回填」哨兵
+        // （三态：''=未知 / 'subset' / 'separate'）。旧写法把已确定的 subset
+        // 也归一成 ''，于是新行冒充「未知」；而回填写下的老行是 'subset'，
+        // 两种字面量共存，`GROUP BY … sem` 就把同一个模型拆成两行——
+        // 账号页上表现为「两个一模一样的模型」（2026-10-13 实测）。
+        // 归一只能有一个方向：都落到 'subset'，而不是都落到 ''（那会让
+        // 「未知」永远无法与「已知 subset」区分）。
+        l.sem === 'separate' ? 'separate' : 'subset',
       )
   }
 
@@ -277,7 +308,7 @@ export class Store {
       COALESCE(SUM(reasoning_tokens),0) AS reasoningTokens,
       COALESCE(SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END),0) AS errors
       FROM usage_logs WHERE ts >= @since${Store.range(until)}${acct}
-      GROUP BY provider_id, sem`).all(this.params(since, until, accountId)) as unknown as
+      GROUP BY provider_id, ${SEM_GROUP}`).all(this.params(since, until, accountId)) as unknown as
       { requests: number; providerId: number; sem: string; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number; reasoningTokens: number; errors: number }[]
     const sum: Summary = {
       requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
@@ -388,7 +419,7 @@ export class Store {
       COALESCE(SUM(reasoning_tokens),0) AS reasoningTokens,
       COALESCE(SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END),0) AS errors
       FROM usage_logs WHERE ts >= @since${Store.range(until)}${acct}
-      GROUP BY day, provider_id, sem ORDER BY day ASC`)
+      GROUP BY day, provider_id, ${SEM_GROUP} ORDER BY day ASC`)
       .all(p) as unknown as (DailyPoint & { providerId: number; sem: string })[]
     // daily 按 (day, provider, sem) 分开算输入侧与总量再合——总量/分母是逐行
     // 按语义算的，混组求和会算错（separate 行的 read 不能混进 subset 组）。
@@ -465,7 +496,7 @@ export class Store {
 
     interface AggRow { accountId: string; providerId: number; sem: string; requests: number; errors: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number }
     const agg = this.db.prepare(`SELECT
-      account_id AS accountId, provider_id AS providerId, sem AS sem,
+      account_id AS accountId, provider_id AS providerId, ${SEM_GROUP} AS sem,
       COUNT(*) AS requests,
       COALESCE(SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END),0) AS errors,
       COALESCE(SUM(input_tokens),0) AS inputTokens,
@@ -473,11 +504,11 @@ export class Store {
       COALESCE(SUM(cache_read_tokens),0) AS cacheReadTokens,
       COALESCE(SUM(cache_creation_tokens),0) AS cacheCreationTokens
       FROM usage_logs WHERE ts >= @since${range}
-      GROUP BY account_id, provider_id, sem`).all(p) as unknown as AggRow[]
+      GROUP BY account_id, provider_id, ${SEM_GROUP}`).all(p) as unknown as AggRow[]
 
     interface ModelAggRow { accountId: string; providerId: number; modelId: string; sem: string; requests: number; errors: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number }
     const modelAgg = this.db.prepare(`SELECT
-      account_id AS accountId, provider_id AS providerId, model_id AS modelId, sem AS sem,
+      account_id AS accountId, provider_id AS providerId, model_id AS modelId, ${SEM_GROUP} AS sem,
       COUNT(*) AS requests,
       COALESCE(SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END),0) AS errors,
       COALESCE(SUM(input_tokens),0) AS inputTokens,
@@ -485,7 +516,7 @@ export class Store {
       COALESCE(SUM(cache_read_tokens),0) AS cacheReadTokens,
       COALESCE(SUM(cache_creation_tokens),0) AS cacheCreationTokens
       FROM usage_logs WHERE ts >= @since${range}
-      GROUP BY account_id, provider_id, model_id, sem`).all(p) as unknown as ModelAggRow[]
+      GROUP BY account_id, provider_id, model_id, ${SEM_GROUP}`).all(p) as unknown as ModelAggRow[]
 
     interface KindRow { accountId: string; errorKind: string; n: number }
     const kinds = this.db.prepare(`SELECT
@@ -656,6 +687,8 @@ function migrate(db: InstanceType<typeof DatabaseSync>): void {
   if (!has('sem')) {
     db.exec(`ALTER TABLE usage_logs ADD COLUMN sem TEXT NOT NULL DEFAULT ''`)
   }
+  // v6 无 DDL 变化：只把版本号推一格，让「曾按旧口径写入」的库在下次启动时
+  // 再跑一遍 backfillSemantics（它会把这些行按协议/硬证据归类成规范字面量）。
   db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`)
 }
 
@@ -715,6 +748,8 @@ export function backfillSemantics(
   let fixed = 0
   const updSep = db.prepare(
     `UPDATE usage_logs SET sem = 'separate' WHERE sem = '' AND provider_id = ? AND model_id = ?`)
+  // 这里是写**规范字面量** 'subset'（不是 ''）：'' 在本列是「未知/待回填」的
+  // 哨兵（见文件头 v5→v6），回填的职责正是把 '' 消掉并留下确定值。
   const updSub = db.prepare(
     `UPDATE usage_logs SET sem = 'subset' WHERE sem = '' AND provider_id = ? AND model_id = ?`)
   for (const k of sepKeys) {
@@ -744,7 +779,12 @@ export function backfillSemantics(
   const fixWrong = db.prepare(`UPDATE usage_logs SET sem = 'separate'
     WHERE sem = 'subset' AND cache_read_tokens > input_tokens AND input_tokens > 0`).run()
   fixed += Number(fixWrong.changes)
-  // 3) 剩余行全部钉成 subset（显式标记，避免每次启动重复扫描）。
+  // 3) 剩余的行全部标成规范的 'subset'（认领为「已知 subset」）。
+  //
+  // 为什么必须写确定值而不是留 ''：'' 是「未知/待回填」哨兵，留着会让
+  // 每次启动都重扫全表；而且同一模型若既有 '' 行又有 'subset' 行，聚合时
+  // 会分成两组（历史缺陷：页面上出现「两个一样的模型」）。
+  // 聚合侧的 SEM_GROUP 已按派生语义分组兜底，这里是存储侧的正本清源。
   const rest = db.prepare(`UPDATE usage_logs SET sem = 'subset' WHERE sem = ''`).run()
   fixed += Number(rest.changes)
   return fixed
