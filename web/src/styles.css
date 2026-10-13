@@ -49,6 +49,31 @@ body {
 .linklike:disabled { opacity: .5; cursor: default; }
 .linklike.danger { color: var(--bad); }
 
+/* 行内动作组（ProviderCard / Accounts 共用）：文字按钮 + 1px 竖线分组 + 带标签开关。
+   为什么上收全局：两页原本各写一份，账号页那份完全是另一套（裸 linklike + 两个
+   无名开关挤在 gap:4px 里），同一个界面两种按钮语言，看起来就是“没统一过”。
+   分组规则：左边是「对这条数据做的事」，竖线右边是「常驻开关」——
+   开关带文字标签，裸开关没人知道它管什么。 */
+.acts { display: flex; align-items: center; gap: 4px; }
+.vr { flex: none; width: 1px; height: 14px; background: var(--line); margin: 0 6px; }
+
+.act {
+  border: 1px solid transparent; background: none; color: var(--dim);
+  border-radius: var(--r-ctl); padding: 4px 10px; font-size: 12px; cursor: pointer; white-space: nowrap;
+}
+.act:hover { color: var(--text); border-color: var(--line); }
+.act:disabled { opacity: .45; cursor: default; }
+.act:disabled:hover { color: var(--dim); border-color: transparent; }
+.act.danger:hover { color: var(--bad); border-color: var(--bad); }
+.act.tiny { padding: 2px 6px; font-size: 11px; }
+.act.busy { color: var(--warn); border-color: var(--warn); }
+
+/* 带标签的开关（自动签到 / 启用）：标签是必需的——两个裸开关并排，
+   用户只能靠位置猜哪个是哪个。label 包裹后点文字也能切，命中区更大。
+   与 .act 同处全局：账号页与 ProviderCard 的开关一律用它，不再各写一份。 */
+.sw-labeled { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--dim); cursor: pointer; }
+.sw-labeled:hover { color: var(--text); }
+
 /* 度量与代码形态的数据用 mono */
 .num, .ph-id, .ph-url { font-family: var(--mono); }
 .num { font-variant-numeric: tabular-nums; }

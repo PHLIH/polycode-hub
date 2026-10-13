@@ -207,25 +207,37 @@ function isWorkbuddy(a) {
 const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六']
 function weekdayOf(d) { return WEEKDAYS[d.getDay()] }
 
-// 记录徽标：把后端字段翻成一条能悬停看的人话。没有任何记录时返回 null（不显示徽标）。
+// 签到结果 → 徽标短标签与颜色（只在这里映射一次，行内文案不散到模板里）。
+// 完整说明用后端下发的 lastCheckinStatus 原话，放在悬停提示里——
+// 行内只留“状态 + 时间”，否则一枚髪标会比旁边的按钮还长。
+const CK_BADGE = {
+  accepted: { label: '已签到', cls: 'ok' },
+  already_checked_in: { label: '今天已签', cls: 'ok' },
+  not_available: { label: '活动未开', cls: '' },
+  unauthorized: { label: '需重登', cls: 'bad' },
+  invalid: { label: '身份有误', cls: 'bad' },
+  fail: { label: '未确认', cls: 'warn' },
+}
+
+// 记录徽标：没有签到记录时返回 null（不占位）。
 function checkinBadge(a) {
-  if (!a.lastCheckinResult) return null
+  const b = CK_BADGE[a.lastCheckinResult]
+  if (!b) return null
   const at = a.lastCheckinAt ? new Date(a.lastCheckinAt) : null
   const valid = at !== null && !Number.isNaN(at.getTime())
-  const time = valid
-    ? `${at.getMonth() + 1}-${at.getDate()}（周${weekdayOf(at)}）${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`
-    : '—'
-  const ok = a.lastCheckinResult === 'accepted' || a.lastCheckinResult === 'already_checked_in'
-  // 徽标分色：绿=今天已签（含活动未开启，那也是「今天没得签」）；
-  // 红=要人动手（登录态失效/身份不对）；琥珀=结果未确认（超时/unrecognized）。
-  const cls = ok || a.lastCheckinResult === 'not_available'
-    ? 'ok'
-    : (a.lastCheckinResult === 'unauthorized' || a.lastCheckinResult === 'invalid') ? 'bad' : 'warn'
   return {
-    cls,
-    text: `上次签到 ${time}`,
-    title: `${a.lastCheckinStatus || '结果未知'}\n签到时间：${valid ? at.toLocaleString() : '—'}\n\n自动签到开启后会每天代签一次（本地凌晨 4 点后算新的一天）`
-      + (a.autoCheckin ? '\n状态：已开启自动签到' : '\n状态：仅手动签到'),
+    cls: b.cls,
+    // 行内只放状态（与旁边「健康/不稳定」徽标同口径：细节一律进 tooltip）。
+    // 时间也进 tooltip——原来把「已签到 · 10-13 11:03」整条写进行内，
+    // 一枚髪标比旁边的按钮还长，把动作区挤到换行（实测 119px）。
+    text: b.label,
+    title: [
+      `最近一次签到：${valid ? `${at.toLocaleString()}（周${weekdayOf(at)}）` : '时间未知'}`,
+      `结果：${a.lastCheckinStatus || '未知'}`,
+      `自动签到：${a.autoCheckin ? '已开启，网关每天代签（页面关着也生效）' : '未开启，只能手动点「签到」'}`,
+      '',
+      '自动签到按本地凌晨 4 点分天：4 点后才算新的一天，连签一次不会重复签。',
+    ].join('\n'),
   }
 }
 
@@ -538,38 +550,46 @@ async function setWeight(a, v) {
         <span v-if="a.realmWarn" class="realm-warn" :title="a.realmWarn">版本不符</span>
         <span class="acct-metric num" :title="rangeLabel + '该账号处理的请求数（含失败）'">{{ healthText(a) }}</span>
         <span class="acct-metric num" :class="errRateClass(a)" :title="rangeLabel + '失败次数与失败率'">{{ errRateText(a) }}</span>
-        <span class="acct-status">{{ (STATUS[a.status] || {}).label || a.status }}</span>
-        <span class="acct-weight" title="同源账号间按权重分配流量（默认 1）；关/失效的账号权重自动失效，不用手动重算">
-          <span class="dim">权重</span>
-          <el-input-number :model-value="weightOf(a)" :min="1" :max="100" :step="1" size="small"
-            class="weight-input" @change="v => setWeight(a, v)" />
-        </span>
+        <span class="acct-status">{{ (STATUS[a.status] || {}).label || a.status }}</span>        <!-- 动作区：与 ProviderCard 同一套语言（.act 文字按钮 + .vr 竖线分组）。
+             分组规则：左边是「对这个号做的事」（签到/编辑/删除；测试与重置不放这
+             ——它们在展开区，那里有模型下拉要选，放行内会挤成一排而且还重复一份），
+             竖线右边是「日常开关」——开关是常驻地调、按钮是偶尔动手，两类操作混在
+             一起就是“一坨”；每个开关都带文字标签，裸开关没人知道它管什么。 -->
         <span class="acct-actions" @click.stop>
-          <el-switch :model-value="isEnabled(a)" size="small"
-            :title="isEnabled(a) ? '启用中：参与轮询，点击停用' : '已停用：不接请求，点击启用'"
-            @change="v => toggleEnabled(a, v)" />
-          <!-- 两个发行版都能签到（后端已按 Provider 版本推导 host 与 X-Domain）；
-               只显示 'workbuddy' 会让海外版账号永远没有签到入口。 -->
-          <button v-if="isWorkbuddy(a)" class="linklike"
-            :disabled="checkingIn.has(a.id)" @click="checkin(a)"
-            title="使用此账号的导入登录态签到一次，不自动重试">
+          <button v-if="isWorkbuddy(a)" class="act" :disabled="checkingIn.has(a.id)"
+            title="用这个号导入的登录态签到一次；不自动重试（失败后当天不再自动试）"
+            @click="checkin(a)">
             {{ checkingIn.has(a.id) ? '签到中…' : '签到' }}
           </button>
-          <!-- 自动签到开关：打开 = 网关定时器在本地 04:00 后的新一天自动代签。
-               关（非 WorkBuddy 账号）不显示——那些源没有签到接口，显示只会造成误解。 -->
-          <span v-if="isWorkbuddy(a)" class="auto-ck"
-            :title="a.autoCheckin
-              ? '已开启：网关每天自动代签（页面关着也生效）；关闭后不再代签'
-              : '开启后由网关每天自动代签一次，不用再手动点'">
-            <span class="dim">自动</span>
-            <el-switch :model-value="a.autoCheckin === true" size="small"
-              :loading="autoCheckinBusy === a.id"
-              @change="v => toggleAutoCheckin(a, v)" />
-          </span>
-          <span v-if="checkinBadge(a)" class="ck-badge" :class="checkinBadge(a).cls"
-            :title="checkinBadge(a).title">{{ checkinBadge(a).text }}</span>
-          <button class="linklike" @click="openEdit(a)">编辑</button>
-          <button class="linklike danger" @click="remove(a)">删除</button>
+          <button class="act" @click="openEdit(a)">编辑</button>
+          <button class="act danger" @click="remove(a)">删除</button>
+
+          <span class="vr" aria-hidden="true" />
+
+          <!-- 自动签到（仅 WorkBuddy：别的源没有签到接口）：
+               开关 + 标签 + 上次结果徽标紧跟着——「开了没」与「上次签成什么」
+               是同一个问题的两面，分开摆就得多扫一眼才能对上。 -->
+          <template v-if="isWorkbuddy(a)">
+            <label class="sw-labeled"
+              :title="a.autoCheckin
+                ? '已开启：网关每天自动代签（页面关着也生效）。点击关闭'
+                : '开启后由网关每天自动代签，不用再手动点'">
+              <el-switch :model-value="a.autoCheckin === true" size="small"
+                :loading="autoCheckinBusy === a.id"
+                @change="v => toggleAutoCheckin(a, v)" />
+              <span>自动签到</span>
+            </label>
+            <span v-if="checkinBadge(a)" class="ck-badge" :class="checkinBadge(a).cls"
+              :title="checkinBadge(a).title">{{ checkinBadge(a).text }}</span>
+          </template>
+
+          <span class="vr" aria-hidden="true" />
+          <label class="sw-labeled"
+            :title="isEnabled(a) ? '启用中：参与轮询，点击停用' : '已停用：不接请求，点击启用'">
+            <el-switch :model-value="isEnabled(a)" size="small"
+              @change="v => toggleEnabled(a, v)" />
+            <span>启用</span>
+          </label>
         </span>
       </div>
 
@@ -586,6 +606,14 @@ async function setWeight(a, v) {
           </button>
           <button class="btn sm ghost" :disabled="testing === a.id" @click="reset(a)"
             title="只清连败与冷却，不发请求">重置</button>
+          <!-- 权重：同源账号间按权重分配流量（默认 1）。放这里而不是行内——
+               它是「偶尔设一次」的参数，而请求数/失败率是运维一眼要看的，
+               行内塞不下时优先让位（行内挤到换行会毁掉整行的可扫读性）。 -->
+          <span class="acct-weight" title="同源账号间按权重分配流量（默认 1）；关/失效的账号权重自动失效，不用手动重算">
+            <span class="dim">权重</span>
+            <el-input-number :model-value="weightOf(a)" :min="1" :max="100" :step="1" size="small"
+              class="weight-input" @change="v => setWeight(a, v)" />
+          </span>
           <span class="dim test-note">
             用该账号的 API Key 打一次真实请求；测通即解除冷却、连败归零，测挂则计一次失败
           </span>
@@ -805,16 +833,23 @@ async function setWeight(a, v) {
 .acct-weight { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; flex: none; }
 .weight-input { width: 96px; }
 .weight-input :deep(.el-input__inner) { text-align: center; }
-.acct-actions { display: flex; gap: 4px; flex: none; }
+.acct-actions {
+  display: flex; align-items: center; gap: 2px; flex: none;
+  /* margin-left:auto：元信息宽度随数据变（长邮箱、两个用量列），动作区经常放不下。
+     换行时若要它“落到第二行右边”而不是孤零零贴在左边，就得靠这条自动外边距。
+     窄屏换行是兜底，不是常态——1500px 以上的行宽基本都不换。 */
+  margin-left: auto;
+}
 
-/* 自动签到：开关 + 计时记录徽标（都只在 WorkBuddy 账号行出现）。
-   行内元素，用 inline-flex 对齐 el-switch 与文字基线。 */
-.auto-ck { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; flex: none; }
+
+/* 上次签到结果徽标：行内只放状态（与「健康/不稳定」同口径），细节进 title。
+   margin-left 留一格：紧贴「自动签到」标签会读成「自动签到已签到」一个词。 */
 .ck-badge {
   font-size: 11px; padding: 0 7px; border-radius: 999px; white-space: nowrap;
   border: 1px solid var(--line); color: var(--dim); cursor: help; flex: none;
+  margin-left: 2px;
 }
-/* 颜色语义与健康徽标同口径：绿=已成功、琥珀=不确定、红=要人处理。 */
+/* 颜色语义与健康徽标同口径：绿=已成（含“今天没得签”）、琥珀=不确定、红=要人处理。 */
 .ck-badge.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
 .ck-badge.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); }
 .ck-badge.bad { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); }

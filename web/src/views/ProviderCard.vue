@@ -632,19 +632,9 @@ async function toggle() {
 .count-label, .small { font-size: 11px; color: var(--dim); }
 .none { font-size: 11px; color: var(--warn); }
 
-.acts { flex: none; display: flex; align-items: center; gap: 4px; }
-.vr { width: 1px; height: 14px; background: var(--line); margin: 0 6px; }
-
-.act {
-  border: 1px solid transparent; background: none; color: var(--dim);
-  border-radius: var(--r-ctl); padding: 4px 10px; font-size: 12px; cursor: pointer; white-space: nowrap;
-}
-.act:hover { color: var(--text); border-color: var(--line); }
-.act:disabled { opacity: .45; cursor: default; }
-.act:disabled:hover { color: var(--dim); border-color: transparent; }
-.act.danger:hover { color: var(--bad); border-color: var(--bad); }
-.act.tiny { padding: 2px 6px; font-size: 11px; }
-.act.busy { color: var(--warn); border-color: var(--warn); }
+/* .acts / .vr / .act 基础样式已上收 styles.css（与账号页共用同一套按钮语言）。
+   这里只保留本组件特有的布局覆盖。 */
+.acts { flex: none; }
 
 /* 头部与下面的内容之间的 1px 规则 */
 .underline { height: 1px; background: var(--line); margin: 10px 0 0; }
