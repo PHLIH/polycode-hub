@@ -7,10 +7,16 @@ import { SidecarCancelledError, validatePort, type FetchLike, type Sidecar, type
 import { maskProxyURI, resolveSidecarDownloadFetch } from '../sidecar/httpproxy.ts'
 import type { SidecarGuard } from '../sidecar/guard.ts'
 
-// sidecar 只关心「zcode-plan-local」这一个 Provider 的 baseUrl 与 egress 引用，
+// sidecar 只关心「zcode-plan-local」这一个 Provider 的 baseUrl、egress 引用与活性，
 // 按对外名查（名字比内部 id 更适合这类固定目标）。
+//
+// state 必须出现在这里：Provider 删除是**软删**（行留着给历史用量回溯），
+// 而 getByName 会把软删行一并返回（它不负责活性判定，见 store 的实现）。
+// 本文件的每一处取用都必须自己判掉 deleted——否则用户删了 Provider，面板仍
+// 显示“已绑定”、改端口还“成功”地写回一条已删行（而转发不会再经过它）。
+// 真实 ProviderStore 本就带 state（Provider 实体有），这里只是把契约如实写全。
 export interface SidecarStoreAdapter {
-  getByName(name: string): { baseUrl?: string; egress?: string } | undefined
+  getByName(name: string): { baseUrl?: string; egress?: string; state?: string } | undefined
   put(p: { baseUrl?: string; egress?: string }): void
 }
 
@@ -113,13 +119,29 @@ export function createSidecarApp(
   const dir = () => svc.workDir
   let job: InstallJob = idleJob()
 
+  // 本通道的 Provider（对外名固定 zcode-plan-local）。
+  //
+  // 必须过滤 state==='deleted'：Provider 删除是**软删**（行留着给历史用量回溯），
+  // 而 getByName 对软删行也会返回（它的语义是「改名后用新名查旧行」，不负责活性）。
+  // 不过滤的后果：用户删掉 zcode-plan-local 后，本文件的每一处都仍把它当存在——
+  //   · endpointBound 仍是 true（页面看不出「未绑定」，会去查配置而不是去导入）
+  //   · custom（是否自定义引擎地址）仍按旧 baseUrl 算
+  //   · 改端口“联动同步 baseUrl”会写回一条已删的行，改完还是不通
+  //   · endpoint 动作不报 404，而是“成功”地改一条已删行——用户以为配好了
+  // 全仓其它地方（adminapi/api.ts、discover_api.ts 共 9 处）都是 getByName 后再判
+  // `state !== 'deleted'`，这里之前漏了；收敛成一个函数，避免 5 处各写一遍再漂移。
+  const liveProvider = () => {
+    const p = providers.getByName('zcode-plan-local')
+    return p && p.state !== 'deleted' ? p : undefined
+  }
+
   // downloadProxy 决议本次下载用的代理（复用项目 egress 配置，不写死地址）：
   // 优先 zcode-plan-local Provider 的 egress 引用 → 仅一项时自动采用 → 环境变量
   // → darwin scutil / windows 注册表读系统代理 → 直连。egress 表来自管理面注入
   // （DB 真相源）。
   // 显式 ?egress=<id> 由「必须命中」的语义决定（不存在就报错，不静默换出口）。
   function downloadProxy(egressId = ''): { proxyURI: string | null; source: string; fetch: FetchLike } {
-    const p = providers.getByName('zcode-plan-local')
+    const p = liveProvider()
     return resolveSidecarDownloadFetch({
       egressId,
       providerEgressId: p?.egress ?? '',
@@ -287,7 +309,7 @@ export function createSidecarApp(
     // 未安装 = 用户没打算用这条通道，不算降级。
     if (!sidecarInstalled(svc)) return null
     if (running) return null
-    const p = providers.getByName('zcode-plan-local')
+    const p = liveProvider()
     const endpoint = p?.baseUrl ?? ''
     return {
       // 这里无法得知「何时开始降级」（状态是探出来的，没有起止记录），
@@ -302,7 +324,7 @@ export function createSidecarApp(
   }
 
   app.get('/', async (c) => {
-    const p = providers.getByName('zcode-plan-local')
+    const p = liveProvider()
     const endpoint = p?.baseUrl ?? ''
     const builtin = `http://127.0.0.1:${svc.port}`
     // endpoint 为空串有三种完全不同的原因，前端必须能分辨：
@@ -493,7 +515,7 @@ export function createSidecarApp(
             return err(c, 400, (e as Error).message)
           }
         }
-        const p = providers.getByName('zcode-plan-local')
+        const p = liveProvider()
         if (p && p.baseUrl !== `http://127.0.0.1:${port}`) {
           providers.put({ ...p, baseUrl: `http://127.0.0.1:${port}` })
           changed()
@@ -530,7 +552,7 @@ export function createSidecarApp(
           } catch { alive = false }
           return c.json({ ok: alive, url })
         }
-        const p = providers.getByName('zcode-plan-local')
+        const p = liveProvider()
         // Provider 缺失时不能只甩一句「provider zcode-plan-local 不存在」——那是
         // 实现细节，用户据此无从下手。改成可执行指引：导入后 endpoint 才有落点。
         //（该 Provider 通常由 Discover 一键导入创建，草稿见 zcodeSuggestedProvider；

@@ -1739,6 +1739,41 @@ describe('Provider 未绑定时 sidecar 管理面的可读性（真实缺陷回�
     expect(b.endpoint).toBe('http://127.0.0.1:9090')
     expect(b.endpointBound).toBe(true)
   })
+
+  // 软删（state='deleted'）的 Provider 不得当「还绑着」。
+  //
+  // 为何要盯：Provider 删除是软删（行留着给历史用量回溯），而 getByName 会返回
+  // 软删行（它不负责活性判定）。本文件 5 处取 Provider 都靠它——不过滤的后果是
+  // 用户删掉 zcode-plan-local 后，面板仍显示 endpointBound=true、改端口仍“成功”地
+  // 写回一条已删行，而转发根本不会再经过它。
+  // 全仓其它地方（adminapi/api.ts、discover_api.ts）都是 getByName 后再判
+  // `state !== 'deleted'`，这里同一个口径。
+  const deletedStore = () => ({
+    getByName: () => ({ baseUrl: 'http://127.0.0.1:9090', egress: '', state: 'deleted' }),
+    put: () => { throw new Error('不该往已删除的 Provider 上写') },
+  }) as never
+
+  test('软删的 Provider 不算绑定：endpointBound=false 且不回它的地址', async () => {
+    const app = new Hono()
+    app.route('/admin/api/sidecar', createSidecarApp(healthySvc as never, deletedStore(), () => {}))
+    const b = await (await app.request('/admin/api/sidecar')).json() as Record<string, unknown>
+    expect(b.endpointBound).toBe(false)
+    expect(b.endpoint).toBe('')
+    expect(b.custom).toBe(false) // custom 也不该按已删行的 baseUrl 算
+  })
+
+  test('软删的 Provider 上不能改引擎地址：404 且提示去导入', async () => {
+    const app = new Hono()
+    app.route('/admin/api/sidecar', createSidecarApp(healthySvc as never, deletedStore(), () => {}))
+    const res = await app.request('/admin/api/sidecar/endpoint', {
+      method: 'POST',
+      body: JSON.stringify({ url: 'http://127.0.0.1:9090' }),
+      headers: { 'Content-Type': 'application/json' },
+    })
+    // 修复前这里会 200“成功”地写回一条已删行（put 抛错即证明走到了那一步）
+    expect(res.status).toBe(404)
+    expect(((await res.json()) as { error: { message: string } }).error.message).toContain('一键导入')
+  })
 })
 
 // —— 网页登录（beginLogin）——
