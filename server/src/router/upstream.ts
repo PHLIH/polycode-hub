@@ -18,10 +18,11 @@ import type { AccountPool } from '../pool/account.ts'
 import { accountUnavailableSummary } from '../pool/account.ts'
 import { autoProtocol, forgetProtocol, rememberProtocol,
   capabilitiesFrom, credentialResolve, dynamicHeadersTimeout,
-  findHeaderKey, isWorkBuddyAiBaseUrl, isZenBaseUrl, mintZenRequestId, validZenToken,
+  findHeaderKey, isWorkBuddyAiBaseUrl, isZenBaseUrl, mintZenRequestId, validZenRequestId,
+  validZenToken,
   zenHeadersWithFingerprint,
   parseZenSessionPool, writeZenSessionPool,
-  ZEN_REQUEST_HEADER, ZEN_SESSION_HEADER, ZEN_SESSION_POOL_HEADER,
+  ZEN_REQUEST_HEADER, ZEN_SESSION_HEADER, ZEN_SESSION_ID_HEADER, ZEN_SESSION_POOL_HEADER,
   type Account, type Capabilities, type DynamicHeadersSpec, type Provider } from '../model/index.ts'
 
 // egress 定义 → 代理 URI（EGRESS-SPIKE §4 方案 A）。
@@ -72,9 +73,15 @@ const defaultLookup: Lookup = (name) =>
 //   Authorization: Bearer public
 //   x-opencode-client: cli
 //   x-opencode-project: global（或该目录的 hex projectID）
-//   x-opencode-request: msg_<24位>（一次会话内稳定）
+//   x-opencode-request: msg_<12位小写hex><14位base62>（共 30 字符，一次会话内稳定）
 //   x-opencode-session: ses_<…>（本次运行的真实会话）
+//   x-opencode-session-id: 与 x-opencode-session 同值（2026-10-15 真机取证补录）
 // 真客户端不发 x-session-id / x-session-affinity（ai-sdk 给别的上游用的）。
+//
+// 2026-10-15 补录（TLS 中间人抓 1.19.0 客户端 + 在线二分）：上游对
+// x-opencode-session-id 是**条件必需**——UA 版本 ≥ 1.19.0 时缺它一律 403
+// FreeTierError，两个头值不一致也是 403；UA < 1.18.29 则被回 426。
+// 详见 model.ZEN_SESSION_ID_HEADER 的取证注释。
 //
 // 历史教训：网关曾把四件套当“毒头”删掉（臆测官方不发），与真机行为完全相反；
 // 上游 2026-09 要求 x-opencode-session 后全量 403。现在按取证原样发送。
@@ -91,8 +98,11 @@ const defaultLookup: Lookup = (name) =>
 //   为什么忽略客户端透传：第三方 harness 也会发自家的 x-session-id（如 ZCode
 //   的 UUID），上游根本不认识，照透则百分百 403（2026-09-18 实测）。网关算定
 //   的指纹不容上游（客户端）覆盖，来什么请求都用网关自己这一套头发出去。
-//   x-opencode-request：静态值优先（真机一次会话内稳定）；缺时现铸一个
-//     （mintZenRequestId，格式与观测一致；唯一性有收益，时间绑定则听天由命）。
+//   x-opencode-request：静态值优先（真机一次会话内稳定）；值不合形状时现铸一个
+//     （mintZenRequestId）。上游只校验形状不校验真伪（2026-10-15 在线二分），
+//     所以现铸值与真值等效；形状不对则必 403，宁可现铸也不原样发出。
+//   x-opencode-session-id：恒跟随 x-opencode-session（同值）——由
+//     zenHeadersWithFingerprint 一并写出，这里不另算。
 //   x-opencode-client/project：静态优先，缺省 cli/global。
 //   注入安全：透传/配置的 UA 只收单行可打印 ASCII（防 CR/LF 头注入），
 //   超长（>512）截断；会话 token 仍走 validZenToken 白名单（非法不写头）。
@@ -106,13 +116,23 @@ const defaultLookup: Lookup = (name) =>
 // 2026-09-18 真机取证 + 在线二分（`opencode-echo` 本地陷阱抓真机原文，
 // 进程内复打逐变量排除）：FreeTierError 的另一半开关在请求体——上游要求
 // 请求长得像真正的 agent 回合，缺一不可：
-//   1. tools 声明里必须同时含 `read` 与 `bash`（按 function 名判定；schema
-//      内容不校验，空 parameters 照过；10 个假名工具 / 单个真名 / read+write
-//      等组合全部 403，只有含 read+bash 的集合返回 2xx）；
+//   1. tools 声明里必须同时含 `read` 与 `bash`（按 function 名判定；10 个假名工具 /
+//      单个真名 / read+write 等组合全部 403，只有含 read+bash 的集合返回 2xx）；
 //   2. tool_choice 必须显式出现（有工具无 choice 照样 403）；
-//   3. 必须流式（stream:false 即使体裁全对也 403，chat 与 responses 同此）。
+//   3. 必须流式（stream:false 即使体裁全对也 403，chat 与 responses 同此）；
+//   4. 每个工具的 parameters.properties 必须**非空**（2026-10-15 修正，见下）。
 // 头/UA/会话/TLS（Bun 1.3.14 内嵌栈）/请求体形状逐项对齐后仍 403，
 // 唯独补上 read+bash+choice 当次转 200——体裁是独立判定维度。
+//
+// 【2026-10-15 修正】第 1 条原先写作「schema 内容不校验，空 parameters 照过」——
+// 该结论已失效。新路径（/inference/v1）下在线二分实测：
+//   parameters={type:'object',properties:{command:{…}}} → 200
+//   parameters={type:'object',properties:{x:{…}}}       → 200（假字段也过）
+//   parameters={type:'object',properties:{}}             → 403
+//   parameters={type:'object'} / null                    → 403
+// 即：上游只看 properties **非空**，字段名与内容不校验。旧结论之所以成立，
+// 是因为当时走的旧路径判定更宽；换成新路径后空 schema 的垫片工具反而成了
+// 新的恒 403 源（客户端没带 read/bash 时网关补的正是这个形状）。
 //
 // 落点：Upstream 发往 zen 前统一补（转发与探针同一入口，见 ensureZenAgentShape）。
 // 开销：缺时才补，最多两个空 schema 工具（~30 input tokens）+ choice auto；
@@ -127,9 +147,19 @@ const defaultLookup: Lookup = (name) =>
 // 体裁保底要求的工具名（子集语义：缺哪个补哪个，不碰已有的）。
 export const ZEN_FLOOR_TOOL_NAMES = ['read', 'bash'] as const
 
-// 垫片工具的最小形态（与取证时通过的那次一致：名 + 一句话描述 + 空对象 schema）。
+// 垫片工具的最小形态（名 + 一句话描述 + **非空** properties 的 schema）。
+//
+// properties 里那个占位字段不是装饰：空 properties 会被上游判 403（见上方第 4 条）。
+// 用真字段名（bash→command / read→filePath）而不是随手编一个：万一模型真的
+// 点了这个垫片工具，参数名至少与官方客户端一致，下游处理不会莫名其妙。
+const ZEN_FLOOR_TOOL_PARAMS: Record<string, string> = { bash: 'command', read: 'filePath' }
 function zenFloorTool(name: string): { name: string; description: string; inputSchema: unknown } {
-  return { name, description: `${name} file operation.`, inputSchema: { type: 'object', properties: {} } }
+  const arg = ZEN_FLOOR_TOOL_PARAMS[name] ?? 'input'
+  return {
+    name,
+    description: `${name} file operation.`,
+    inputSchema: { type: 'object', properties: { [arg]: { type: 'string' } } },
+  }
 }
 
 // zen 上游发包前落实 agent 体裁（纯函数：不改入参，缺时返回补齐后的浅拷贝）。
@@ -254,22 +284,33 @@ export function applyZenFingerprint(
     ? (h[findHeaderKey(h, 'x-session-id')!] ?? '').trim() : ''
   const sid = validZenToken(staticZen) ? staticZen
     : validZenToken(legacySid) ? legacySid : ''
-  // request 取值：静态优先；缺了现铸（真机一次会话内稳定，网关侧持久化由刷新流程做，
-  // 这里只保证每次发出的请求都带一个合法值）。
+  // request 取值：静态优先，形状不合就现铸（真机一次会话内稳定，网关侧持久化
+  // 由刷新流程做，这里只保证每次发出的请求都带一个**形状合规**的值）。
+  // 注意这里必须按 validZenRequestId（严格形状）而不是 validZenToken（宽松白名单）
+  // 判定：历史库里存着旧实现写下的 28 位残值，用宽松白名单会放它过关 → 恒 403。
   let rid = findHeaderKey(h, ZEN_REQUEST_HEADER) !== undefined
     ? (h[findHeaderKey(h, ZEN_REQUEST_HEADER)!] ?? '').trim() : ''
-  if (!validZenToken(rid)) rid = mintZenRequestId()
+  if (!validZenRequestId(rid)) rid = mintZenRequestId()
   if (sid !== '') zenHeadersWithFingerprint(h, sid, rid)
-  // 旧 x-session-id/affinity 行为保留（既有配置与未知工具链可能依赖；真客户端虽不发，
-  // 实测多带不影响 403 判定——403 只与四件套缺失有关）。
   if (!validZenToken(sid)) return // 无可用会话：不硬凑，失败信息更干净
-  // affinity 恒跟 sid（真机两者同值；客户端 affinity 同会话一样不采用）。
-  const affKey = findHeaderKey(h, 'x-session-affinity')
+  // 旧 x-session-id 行为保留（既有配置与未知工具链可能依赖；实测多带无害）。
   const sidKey = findHeaderKey(h, 'x-session-id')
   if (sidKey !== undefined) h[sidKey] = sid
   else h['x-session-id'] = sid
-  if (affKey !== undefined) h[affKey] = sid
-  else h['x-session-affinity'] = sid
+  // x-session-affinity **必须删掉**（2026-10-15 在线二分实测，3/3 稳定复现）：
+  //
+  //   同会话、同请求体、同 UA、同路径，只加减这一个头——
+  //     不带 x-session-affinity           → 200
+  //     带 x-session-affinity（任何值）   → 403 FreeTierError
+  //
+  // 旧结论「真客户端虽不发，多带经实测不影响判定」已失效：上游现在把它当
+  // 「非官方客户端」的判定依据（官方客户端确实从不发这个头，那是 ai-sdk 给
+  // 别的上游用的）。它是本项目恒 403 的**直接原因**，必须从出站头上抹掉。
+  //
+  // 注意与 x-session-id 的区别：那个实测无害（带/不带都是 200），保留不动，
+  // 以免影响依赖它的旧配置。
+  const affKey = findHeaderKey(h, 'x-session-affinity')
+  if (affKey !== undefined) delete h[affKey]
 }
 
 // 瞬时重试的时间预算：只有在 fetch 起点 5s 内就失败才值得同条件再打一次。
@@ -324,6 +365,11 @@ export function shiftZenSessionHeaders(
   const sk = findHeaderKey(h, ZEN_SESSION_HEADER)
   if (sk !== undefined) h[sk] = sid
   else h[ZEN_SESSION_HEADER] = sid
+  // 孪生头必须跟着换：只换 session 不换 session-id，上游按新客户端校验时
+  // 两个头值不一致 → 403（实测），轮换反而变成 100% 失败。
+  const sik = findHeaderKey(h, ZEN_SESSION_ID_HEADER)
+  if (sik !== undefined) h[sik] = sid
+  else h[ZEN_SESSION_ID_HEADER] = sid
 }
 
 // 旧签名兼容（测试用）：只动传进来的 Provider.headers，不写库。

@@ -790,8 +790,9 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 // fp：从本机 opencode 日志自动识别出的指纹（没有则 undefined）。
 // 有就把真实 UA + 会话直接写进草稿——新用户「一键导入」即可用，不需要手抄任何东西。
 // 没有也不伪造：留空头，由「opencode 做客户端时的透传 / ZEN_UA / 静态配置」兜底。
-// 头集合与真客户端对齐（2026-09-18 取证）：x-opencode-* 四件套必带
-// （上游要求 x-opencode-session），旧 x-session-id/affinity 附带兼容。
+// 头集合与真客户端对齐（2026-09-18 取证，2026-10-15 补录 session-id）：
+// x-opencode-* 头必带（上游要求 x-opencode-session；UA ≥ 1.19.0 时还要求
+// x-opencode-session-id 且两者同值，见 model.ZEN_SESSION_ID_HEADER）。
 function zenSuggestedProvider(baseURL: string, fp?: OpenCodeFingerprint | null): Provider {
   return {
     providerId: 0, name: 'opencode', state: 'active' as const, displayName: 'Zen免费档（自动发现）',
@@ -812,10 +813,13 @@ function zenSuggestedProvider(baseURL: string, fp?: OpenCodeFingerprint | null):
         'x-opencode-client': 'cli',
         'x-opencode-project': 'global',
         'x-opencode-session': fp.sessionID,
+        // 孪生头：UA ≥ 1.19.0 时上游必查，且必须与 session 同值。
+        'x-opencode-session-id': fp.sessionID,
         'x-opencode-request': mintZenRequestId(),
-        // 旧键附带：历史工具链可能读它们；真客户端虽不发，多带经实测不影响判定。
+        // x-session-id 附带（旧工具链可能读它；实测多带无害）。
+        // ⚠️ 不要加 x-session-affinity：2026-10-15 实测它是毒头，带则恒 403
+        // （官方客户端从不发它，上游拿它当「非官方客户端」判据）。见 applyZenFingerprint。
         'x-session-id': fp.sessionID,
-        'x-session-affinity': fp.sessionID,
       } : {}),
     },
     priority: 1,
@@ -1008,7 +1012,7 @@ export async function checkZen(
       f.actions = [
         'Zen 免费档只接受 opencode 官方客户端的指纹。最省事：安装并运行一次 opencode（opencode run "hi"），它会写入真实指纹，再回本页重扫即可',
         '已装但重扫仍无效？确认数据目录在默认位置，或用 OPENCODE_DATA_DIR 指定其数据目录后重启网关',
-        '若不打算用 opencode：在该 Provider 头里手填 User-Agent 与 x-opencode-session（抓包取真值），或设 ZEN_UA 环境变量；x-opencode-request 缺了网关会自动现铸',
+        '若不打算用 opencode：在该 Provider 头里手填 User-Agent 与 x-opencode-session（抓包取真值），或设 ZEN_UA 环境变量；x-opencode-request 缺了或形状不对，网关会按上游要求的形状自动现铸',
         '以上都不想：改用付费档凭据（免费档的限制与额度无关，是客户端身份校验）',
         '仍可点「采用」导入（导入是本地动作，不受探测结果限制）',
       ]
@@ -1198,7 +1202,7 @@ export function parseFingerprintFromLog(text: string): { sessionID: string; vers
 // msg_…（同一会话后续请求沿用同一个，见 2026-09-18 取证：1285 次请求同一 msg）。
 // 网关刷新策略与之对齐：取最新会话 + 该会话在日志里最后一次出现的 msg ID（
 // message=process 行同时带 session.id 与 messageID）；找不到 msg 时现铸一个
-// （格式与观测一致即可，见 mintZenRequestId），绝不复用别的会话的。
+// （上游只校验形状不校验真伪，见 model.mintZenRequestId），绝不复用别的会话的。
 // key+sid 出现后必须跟分隔符（空白/逗号/引号）或行尾才算命中。
 function ownsSessionRef(line: string, sessionID: string): boolean {
   for (const key of ['session.id=', 'id=']) {
@@ -1487,7 +1491,9 @@ export function defaultConfig(): ScanConfig {
     zCodeHome: home,
     // opencode 数据目录（指纹自动识别的来源）。
     openCodeDirs: openCodeDataDirs(goos, home, profile),
-    zenBaseURL: 'https://opencode.ai/zen',
+    // 接口路径 2026-10 已由 /zen 改为 /inference（旧路径仍通但恒 403
+    // FreeTierError，见 adminapi/store.migrateZenBaseUrl 的取证）。
+    zenBaseURL: 'https://opencode.ai/inference',
   }
 }
 
@@ -1591,7 +1597,7 @@ export class Scanner {
     // 只报 zen 这一环不可达，不影响其他行。
     try {
       out.push(await checkZen(
-        this.cfg.zenBaseURL ?? 'https://opencode.ai/zen',
+        this.cfg.zenBaseURL ?? 'https://opencode.ai/inference',
         this.cfg.fetchImpl ?? globalThis.fetch,
         this.zenTimeoutMs,
         this.cfg.zenCallProbe,

@@ -463,6 +463,55 @@ export function migrateWorkBuddyAttributionHeaders(s: ProviderStore): number {
   return fixed
 }
 
+// Zen 接口路径迁移：`/zen/v1` → `/inference/v1`（存量修复）。
+//
+// 为什么需要：上游 2026-10 把接口路径换了（官方文档 https://opencode.ai/v2/docs/console/models/
+// 现在全部写 /inference/v1；旧文档页还留着 /zen/v1，所以升级悄无声息）。
+// 新路径下旧路径**仍然接受连接**，只是恒定回 403 FreeTierError
+// 「OpenCode's free tier can only be used from within OpenCode」——一句看似
+// 「指纹不对/免费额度没了」的话，实际是路径已废弃。2026-10-15 同一会话、
+// 同一请求体、同一头，只换路径实测：/zen/v1 → 403，/inference/v1 → 200。
+//
+// 草稿模板（discover.zenSuggestedProvider）只影响**新建**的 Provider；
+// 已入库的行不会自己变，所以必须在这里按 baseUrl 迁一遍，否则升级后
+// 老用户永远拿 403，且报错文案把他引向重配指纹——永远修不好。
+//
+// 只改路径部分，保留尾部（如 /v1 后缀与用户自定路径）；幂等；不碰其它字段。
+export function migrateZenBaseUrl(s: ProviderStore): number {
+  let fixed = 0
+  for (const p of s.list()) {
+    if (p.state === 'deleted') continue
+    const next = zenBaseUrlMigrated(p.baseUrl)
+    if (next === p.baseUrl) continue
+    p.baseUrl = next
+    s.put(p)
+    fixed++
+  }
+  return fixed
+}
+
+// 纯函数（导出供测试）：把 opencode.ai 上的 /zen 路径段换成 /inference。
+// 非 opencode.ai 域、或路径里没有 /zen 段时原样返回。
+//
+// 用逐段替换而不是全局替换：`/zen/v1` → `/inference/v1`，而像
+// `https://opencode.ai/foo/zen/bar` 这种意外路径也会被正确换掉中间那一段。
+export function zenBaseUrlMigrated(baseUrl: string): string {
+  let u: URL
+  try {
+    u = new URL(baseUrl)
+  } catch {
+    return baseUrl
+  }
+  const host = u.hostname.toLowerCase()
+  if (host !== 'opencode.ai' && !host.endsWith('.opencode.ai')) return baseUrl
+  const segs = u.pathname.split('/')
+  if (!segs.includes('zen')) return baseUrl
+  u.pathname = segs.map((s) => (s === 'zen' ? 'inference' : s)).join('/')
+  // URL 序列化会把 `https://opencode.ai` 这类无路径的形态补成 `/`；
+  // 这里路径必定含 /zen（上面刚判过），所以不会碰到那种情形。
+  return u.toString().replace(/\/$/, '')
+}
+
 // 缺失补种：种子表里有、库里没有、且**从没播过种**的账号补进去。
 //
 // 为什么不能只认「空库才播种」：账号表一旦有别的渠道（如 workbuddy 先导了几行），

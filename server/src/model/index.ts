@@ -401,10 +401,11 @@ export * from './autoproto.ts'
 //   user-agent: opencode/<ver> ai-sdk/provider-utils/<ver> runtime/bun/<ver>
 //   x-opencode-client: cli
 //   x-opencode-project: global（或该目录的 hex projectID）
-//   x-opencode-request: msg_<24位>（一次会话内稳定）
+//   x-opencode-request: msg_<12位小写hex><14位base62>（共 30 字符，一次会话内稳定）
 //   x-opencode-session: ses_<…>（本次运行的真实会话）
+//   x-opencode-session-id: 与 x-opencode-session 同值（2026-10-15 真机取证补录）
 // 真客户端**不发** x-session-id / x-session-affinity（那是 ai-sdk 给别的上游用的，
-// zen 内建通道只认上面四件套）。此前网关把四件套当“毒头”删掉并只发 x-session-*，
+// zen 内建通道只认上面那套）。此前网关把四件套当“毒头”删掉并只发 x-session-*，
 // 与真机行为完全相反——上游收紧校验（2026-09 要求 x-opencode-session）后全量 403。
 // 这里只定义头名常量与纯函数，取值（会话发现/刷新）由 discover 与 cli 层负责。
 
@@ -412,6 +413,18 @@ export const ZEN_CLIENT_HEADER = 'x-opencode-client'
 export const ZEN_PROJECT_HEADER = 'x-opencode-project'
 export const ZEN_REQUEST_HEADER = 'x-opencode-request'
 export const ZEN_SESSION_HEADER = 'x-opencode-session'
+
+// x-opencode-session-id：与 x-opencode-session **同值**的孪生头。
+//
+// 2026-10-15 真机取证（TLS 中间人抓 1.19.0 客户端）发现上游对它是**条件必需**：
+//   同一会话、同一请求体、同一路径，只改 UA 与这个头——
+//     UA=opencode/1.18.29 + 无此头 → 200；UA=opencode/1.19.0 + 无此头 → 403 FreeTierError；
+//     UA=opencode/1.19.0 + 有此头 → 200。
+// 即：UA 版本 ≥ 1.19.0 时上游按「新客户端」校验，缺这个头一律 403；
+// 而 UA < 1.18.29 会被回 426（要求升级）。旧版本之所以没踩到，纯粹因为当时
+// 静态 UA 恰好是 1.18.29——指纹刷新一旦把 UA 同步到新版，缺这个头立刻全量 403。
+// 两个头值必须一致（真机同值）：只发其中一个、或两者不一致，实测都是 403。
+export const ZEN_SESSION_ID_HEADER = 'x-opencode-session-id'
 // 会话池头（网关自定义，上游不认识）：本机近期真实用过的全部会话，逗号分隔、新→旧。
 // 免费档限流按会话算（2026-09-18 实测），撞 429 时在池内换会话重打；定义放这里供
 // discover（写入池）与 router（轮换取用）共用，避免两侧反向依赖。
@@ -594,9 +607,10 @@ export function writeZenSessionPool(h: Record<string, string>, sessions: string[
   else h[ZEN_SESSION_POOL_HEADER] = clean.join(',')
 }
 
-// 把指纹会话落实为 x-opencode-* 四件套（纯函数，就地改 h 并返回是否写过）：
+// 把指纹会话落实为 x-opencode-* 头集合（纯函数，就地改 h 并返回是否写过）：
 //   sessionID 必填（无效则什么都不写）；requestID 缺省时保留静态值（真机一次会话内稳定）。
 //   client/project 缺省时保留静态值，都没有才填默认值——显式配置优先，不覆盖运维手填。
+//   session-id 恒与 session 同值写出（见 ZEN_SESSION_ID_HEADER 的取证说明）。
 //   UA 不在这里动（upstream.sanitizeUA 按 静态 > 透传 > ZEN_UA 另行补位）。
 export function zenHeadersWithFingerprint(
   h: Record<string, string>, sessionID: string, requestID?: string,
@@ -609,32 +623,58 @@ export function zenHeadersWithFingerprint(
     else h[name] = value
   }
   set(ZEN_SESSION_HEADER, sid)
+  // 孪生头必须同值：上游（UA ≥ 1.19.0）按新客户端校验时缺它即 403。
+  set(ZEN_SESSION_ID_HEADER, sid)
+  // request 头按**形状**校验，不是泛泛的 token 白名单：上游只认
+  // `msg_` + 12 小写 hex + 14 base62（共 30），形状差一点就 403。
+  // 传进来的值合规就写；不合规且库里存的值也不合规时必须**删掉**——
+  // 旧实现写进库的 28 位残值（字母数字前缀 + 12 位后缀）就属于这种，
+  // 留着它比不带该头更糟：不带是 200（该头可选），带着必然 403。
   const rid = (requestID ?? '').trim()
-  if (validZenToken(rid)) set(ZEN_REQUEST_HEADER, rid)
-  else if (findHeaderKey(h, ZEN_REQUEST_HEADER) === undefined) {
-    // 连静态值都没有：调用方应先铸一个再调（见本文件 mintZenRequestId），
-    // 这里不凭空编——缺了就缺了，报 403 时指引会点名。
+  if (validZenRequestId(rid)) set(ZEN_REQUEST_HEADER, rid)
+  else {
+    const curKey = findHeaderKey(h, ZEN_REQUEST_HEADER)
+    if (curKey !== undefined && !validZenRequestId(h[curKey] ?? '')) delete h[curKey]
   }
   if (findHeaderKey(h, ZEN_CLIENT_HEADER) === undefined) h[ZEN_CLIENT_HEADER] = ZEN_DEFAULT_CLIENT
   if (findHeaderKey(h, ZEN_PROJECT_HEADER) === undefined) h[ZEN_PROJECT_HEADER] = ZEN_DEFAULT_PROJECT
   return true
 }
 
-const ZEN_REQ_LOWER = '0123456789abcdefghijklmnopqrstuvwxyz'
-const ZEN_REQ_MIXED = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+const ZEN_REQ_HEX = '0123456789abcdef'
+const ZEN_REQ_SUFFIX = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
 
-// 现铸一个 x-opencode-request ID。观测形状：msg_ + 前 12 位小写字母数字 +
-// 后 12 位混合大小写（如 msg_0b20f9fce001SFZUUtZpYDSXKH）。
-// 前缀疑似含时间分量——网关无法复刻其编码，随机填之：
-// 若上游只验格式/唯一性则可用；若验时间绑定则与现状（陈旧复用）同样 403，不回归。
+// x-opencode-request 的**格式**（2026-10-15 在线二分实测，每格 3 次稳定）：
+//   msg_ + 12 位小写 hex + 14 位 base62，合计 30 个字符。
+//
+// 上游**不校验真伪**，只校验这个形状——这是本轮二分的关键发现，推翻了此前
+// 「必须是真机发过的真值」的误判（那个结论来自测试脚本把真值截断成 28 位：
+// 长度 28/29/31/32 一律 403，恰好 30 才是分界，见下）。
+//
+// 实测矩阵（会话为真值 ses_…，UA opencode/1.19.0）：
+//   省略该头            → 200（该头其实**可选**）
+//   msg_+26 随机 base62 → 403   ← 第 12 位落在字母上就废
+//   前 12 位含非 hex 字符 → 403
+//   前 12 位纯小写 hex、后 14 位任意 base62 → 200（12/12 样本）
+//   msg_000000000000… / msg_ffffffffffff… → 200（时间戳可以任意，不验时效）
+//   长度 28 / 29 / 31 / 32 → 403（必须恰好 30）
+// 前 12 位恰好是「毫秒时间戳 << 12 | 计数器」的十六进制（同日样本斜率实测
+// ≈4096/ms），但既然不校验数值，现铸时按同形状随机填即可。
+//
+// 注意别退回旧实现：它生成 msg_ + 12 位**小写字母数字**（字母可达 z）+ 12 位
+// 混合 = 28 位，两处都不合规，于是每次现铸都必然 403。
 export function mintZenRequestId(pick: (chars: string) => string = defaultPick): string {
   let pre = ''
   let suf = ''
-  for (let i = 0; i < 12; i++) {
-    pre += pick(ZEN_REQ_LOWER)
-    suf += pick(ZEN_REQ_MIXED)
-  }
+  for (let i = 0; i < 12; i++) pre += pick(ZEN_REQ_HEX)
+  for (let i = 0; i < 14; i++) suf += pick(ZEN_REQ_SUFFIX)
   return `msg_${pre}${suf}`
+}
+
+// 形状自检：现铸值/静态值是否满足上面的格式要求。
+// 用途是「别把明显不合规的值发出去」——上游只认形状，发错形状等于自伤。
+export function validZenRequestId(s: string): boolean {
+  return /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test((s ?? '').trim())
 }
 
 function defaultPick(chars: string): string {

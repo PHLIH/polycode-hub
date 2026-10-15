@@ -582,26 +582,45 @@ test('setEgresses 热更新：换表并清 dispatcher 缓存（旧表引用失�
 // （网关权威：第三方 harness 的会话/UA 上游不认，照透必 403）。
 describe('zen 指纹校准 applyZenFingerprint', () => {
   test('x-opencode-* 四件套保留并补全（大小写不敏感，不再删除）', () => {
+    // 用真值形状（msg_ + 12 小写 hex + 14 base62）：形状不对的值会被换掉，
+    // 这里要验证的是「合规静态值原样保留」，所以给合规值。
+    const realRid = 'msg_0b20f9fce001SFZUUtZpYDSXKH'
     const h: Record<string, string> = {
       'x-opencode-client': 'cli', 'X-OpenCode-Project': 'global',
-      'x-opencode-request': 'msg_x', 'x-opencode-session': 'ses_x',
+      'x-opencode-request': realRid, 'x-opencode-session': 'ses_x',
       'Content-Type': 'application/json',
     }
     applyZenFingerprint(h, { id: 'ses_real' }, true, '')
     expect(h['x-opencode-session']).toBe('ses_x') // 客户端透传不再覆盖静态
-    expect(h['x-opencode-request']).toBe('msg_x') // 静态 request 保留（真机一次会话内稳定）
+    // 孪生头必须同值（UA ≥ 1.19.0 时上游必查它，不一致即 403）。
+    expect(h['x-opencode-session-id']).toBe('ses_x')
+    expect(h['x-opencode-request']).toBe(realRid) // 合规静态 request 保留（真机一次会话内稳定）
     expect(h['Content-Type']).toBe('application/json') // 无关头不动
     // 大小写不敏感：X-OpenCode-Project 就地识别，不新增重复键
     expect(Object.keys(h).filter((k) => k.toLowerCase() === 'x-opencode-project')).toHaveLength(1)
   })
 
-  test('旧 x-session-id 晋升为 x-opencode-session；缺 request 则现铸', () => {
+  test('旧 x-session-id 晋升为 x-opencode-session；缺 request 则按形状现铸', () => {
     const h: Record<string, string> = { 'x-session-id': 'ses_legacy' }
     applyZenFingerprint(h, undefined, true, '')
     expect(h['x-opencode-session']).toBe('ses_legacy')
-    expect(h['x-opencode-request']).toMatch(/^msg_[A-Za-z0-9]{24}$/)
+    expect(h['x-opencode-session-id']).toBe('ses_legacy') // 孪生头同值
+    // 2026-10-15 实测：上游只校验形状（msg_ + 12 小写hex + 14 base62 = 30）。
+    // 旧实现现铸 28 位值，每发必 403——这条断言就是防那个回归的。
+    expect(h['x-opencode-request']).toMatch(/^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$/)
     expect(h['x-opencode-client']).toBe('cli')
     expect(h['x-opencode-project']).toBe('global')
+  })
+
+  test('库里存着旧实现的 28 位残值时，换成合规新值而不是原样发出', () => {
+    // 真实历史值：旧 mintZenRequestId 写进库的残值（28 位，前缀含非 hex 字母）。
+    const legacyBad = 'msg_8nkftogpegx0D8cf4x9koRTT'
+    const h: Record<string, string> = {
+      'x-opencode-session': 'ses_real', 'x-opencode-request': legacyBad,
+    }
+    applyZenFingerprint(h, undefined, true, '')
+    expect(h['x-opencode-request']).not.toBe(legacyBad)
+    expect(h['x-opencode-request']).toMatch(/^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$/)
   })
 
   test('显式配的 client/project 不覆盖；脏会话不硬凑', () => {
@@ -611,11 +630,13 @@ describe('zen 指纹校准 applyZenFingerprint', () => {
     }
     applyZenFingerprint(h, { id: 'has space!' }, true, '')
     expect(h['x-opencode-session']).toBe('ses_static') // 脏透传回退静态
+    expect(h['x-opencode-session-id']).toBe('ses_static') // 孪生头同值
     expect(h['x-opencode-client']).toBe('mine')
     expect(h['x-opencode-project']).toBe('proj9')
     const h2: Record<string, string> = {}
     applyZenFingerprint(h2, { id: '' }, true, '')
     expect(h2['x-opencode-session']).toBeUndefined()
+    expect(h2['x-opencode-session-id']).toBeUndefined() // 无会话则不凭空编
     expect(h2['x-session-id']).toBeUndefined()
   })
 
@@ -655,25 +676,30 @@ describe('zen 指纹校准 applyZenFingerprint', () => {
     expect(sanitizeUA('x'.repeat(600))?.length).toBe(512)
   })
 
-  test('会话头：静态为准，affinity 恒跟 sid；客户端透传一律忽略', () => {
+  // x-session-affinity 是**毒头**（2026-10-15 在线二分，3/3 稳定复现）：
+  // 同会话/同请求体/同 UA/同路径，只加减这一个头——不带 → 200，带（任何值）→ 403
+  // FreeTierError。官方客户端从不发它，上游现在拿它当「非官方客户端」的判据。
+  // 所以它必须从出站头上**被删掉**，而不是「跟 sid 同步」。
+  test('会话头：静态 x-session-id 保留，x-session-affinity 必须被删', () => {
     const h1: Record<string, string> = { 'x-session-id': 'ses_static', 'x-session-affinity': 'ses_static' }
     applyZenFingerprint(h1, { id: 'ses_live', affinity: 'ses_live' })
     expect(h1['x-session-id']).toBe('ses_static')
-    expect(h1['x-session-affinity']).toBe('ses_static')
+    expect(h1['x-session-affinity']).toBeUndefined() // 毒头：出站前抹掉
     const h2: Record<string, string> = {}
     applyZenFingerprint(h2, { id: 'ses_live' })
     expect(h2['x-session-id']).toBeUndefined()
-    expect(h2['x-session-affinity']).toBeUndefined() // 无静态可退：不硬凑
+    expect(h2['x-session-affinity']).toBeUndefined()
     const h3: Record<string, string> = { 'x-session-id': 'ses_static' }
-    applyZenFingerprint(h3) // 无透传：静态保留并补 affinity
+    applyZenFingerprint(h3) // 无透传：静态保留，不得凭空补 affinity
     expect(h3['x-session-id']).toBe('ses_static')
-    expect(h3['x-session-affinity']).toBe('ses_static')
+    expect(h3['x-session-affinity']).toBeUndefined()
   })
 
   test('非法会话值不硬凑：透传脏值时回退静态，静态也脏则不写', () => {
     const h1: Record<string, string> = { 'x-session-id': 'ses_static', 'x-session-affinity': 'ses_static' }
     applyZenFingerprint(h1, { id: 'has space!' })
     expect(h1['x-session-id']).toBe('ses_static')
+    expect(h1['x-session-affinity']).toBeUndefined()
     const h2: Record<string, string> = {}
     applyZenFingerprint(h2, { id: '' })
     expect(h2['x-session-id']).toBeUndefined()
@@ -686,9 +712,8 @@ describe('zen 指纹校准 applyZenFingerprint', () => {
     const h1: Record<string, string> = { 'x-opencode-session': 'ses_static' }
     applyZenFingerprint(h1, { id: '8a843b90-a9c1-4d2e-8f01-xyz123456789', affinity: '8a843b90-a9c1-4d2e-8f01-xyz123456789' })
     expect(h1['x-opencode-session']).toBe('ses_static')
-    // affinity 同规则：UUID 不收，跟 sid（真机两者同值）
-    expect(h1['x-session-affinity']).toBe('ses_static')
     expect(h1['x-session-id']).toBe('ses_static')
+    expect(h1['x-session-affinity']).toBeUndefined() // 毒头：无论何值都不发
     // 无静态可退：宁可不写会话头，也不把 UUID 发给上游
     const h2: Record<string, string> = {}
     applyZenFingerprint(h2, { id: '8a843b90-a9c1-4d2e-8f01-xyz123456789' })
@@ -701,7 +726,7 @@ describe('zen 指纹校准 applyZenFingerprint', () => {
     const h: Record<string, string> = { 'x-opencode-session': 'ses_static' }
     applyZenFingerprint(h, { id: 'ses_live123', affinity: 'ses_live123' })
     expect(h['x-opencode-session']).toBe('ses_static')
-    expect(h['x-session-affinity']).toBe('ses_static')
+    expect(h['x-session-affinity']).toBeUndefined()
   })
 })
 
@@ -896,5 +921,39 @@ describe('zen agent 体裁保底 ensureZenAgentShape（2026-09-18 真机取证�
     }
     expect(wire.tools.map((t) => t.name)).toEqual(['read', 'bash'])
     expect(wire.tool_choice).toBe('auto')
+  })
+
+  // 2026-10-15 修正：垫片工具的 parameters.properties 必须**非空**。
+  //
+  // 旧结论（「schema 内容不校验，空 parameters 照过」）已失效。新路径下在线二分：
+  //   properties={command:{…}} → 200；properties={x:{…}}（假字段）→ 200；
+  //   properties={} → 403；properties 缺字段 / null → 403。
+  // 即上游只看 properties 非空，字段名与内容不校验。
+  //
+  // 这条曾是真缺陷：客户端没带 read/bash 时网关补的就是空 schema 垫片，
+  // 结果补齐动作本身反而成了恒 403 源。这里把「非空」锁成契约。
+  test('垫片工具的 properties 必须非空（空 schema 会被上游判 403）', () => {
+    const out = ensureZenAgentShape(bare(), ZEN)
+    for (const t of out.tools ?? []) {
+      const schema = t.inputSchema as { type?: string; properties?: Record<string, unknown> }
+      expect(schema.type).toBe('object')
+      expect(Object.keys(schema.properties ?? {}).length).toBeGreaterThan(0)
+    }
+    // 出站到 wire 后同样非空（序列化不得把它抺成空）
+    const wire = JSON.parse(Buffer.from(getOutbound('openai-completions').serializeRequest(out)).toString()) as {
+      tools: { function: { name: string; parameters?: { properties?: Record<string, unknown> } } }[]
+    }
+    for (const t of wire.tools) {
+      expect(Object.keys(t.function.parameters?.properties ?? {}).length).toBeGreaterThan(0)
+    }
+  })
+
+  // 垫片工具的参数名用真字段名（bash→command / read→filePath）而不是随手编：
+  // 万一模型真点了这个垫片，参数名与官方客户端一致，下游处理不会莫名其妙。
+  test('垫片工具的参数名与官方客户端一致（bash→command，read→filePath）', () => {
+    const out = ensureZenAgentShape(bare(), ZEN)
+    const byName = new Map((out.tools ?? []).map((t) => [t.name, t.inputSchema as { properties?: Record<string, unknown> }]))
+    expect(Object.keys(byName.get('bash')?.properties ?? {})).toEqual(['command'])
+    expect(Object.keys(byName.get('read')?.properties ?? {})).toEqual(['filePath'])
   })
 })

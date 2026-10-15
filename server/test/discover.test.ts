@@ -1020,7 +1020,11 @@ describe('opencode 指纹自动识别', () => {
     const h = (f.suggestedProvider as Provider).headers!
     expect(h['User-Agent']).toBe('opencode/9.9.9')
     expect(h['x-session-id']).toBe('ses_TEST')
-    expect(h['x-session-affinity']).toBe('ses_TEST')
+    // 孪生头必写（UA ≥ 1.19.0 时上游必查它，且须与 session 同值）
+    expect(h['x-opencode-session']).toBe('ses_TEST')
+    expect(h['x-opencode-session-id']).toBe('ses_TEST')
+    // 毒头绝不能写进草稿（带则恒 403，见 applyZenFingerprint）
+    expect(h['x-session-affinity']).toBeUndefined()
     expect(f.detail).toContain('自动识别')
   })
 
@@ -1267,7 +1271,7 @@ describe('defaultConfig', () => {
     expect(cfg.workBuddyPaths!.length).toBeGreaterThan(0)
     expect(cfg.workBuddyAuthDirs!.length).toBeGreaterThan(0)
     expect(cfg.zCodeDirs!.length).toBeGreaterThan(0)
-    expect(cfg.zenBaseURL).toBe('https://opencode.ai/zen')
+    expect(cfg.zenBaseURL).toBe('https://opencode.ai/inference')
   })
 })
 

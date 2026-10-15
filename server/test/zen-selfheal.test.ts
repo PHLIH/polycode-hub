@@ -11,7 +11,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Hono } from 'hono'
 import {
-  isZenBaseUrl, mintZenRequestId, parseZenSessionPool, zenHeadersWithFingerprint,
+  isZenBaseUrl, mintZenRequestId, parseZenSessionPool, validZenRequestId,
+  zenHeadersWithFingerprint,
 } from '../src/model/index.ts'
 import { latestSessionMessageId, parseAllFingerprintsFromLog } from '../src/discover/index.ts'
 import {
@@ -38,20 +39,40 @@ describe('isZenBaseUrl', () => {
 })
 
 describe('zenHeadersWithFingerprint', () => {
-  test('写入四件套；显式配置的 client/project 不覆盖', () => {
+  test('写入头集合；显式配置的 client/project 不覆盖', () => {
     const h: Record<string, string> = { 'x-opencode-client': 'mine' }
     expect(zenHeadersWithFingerprint(h, 'ses_abc')).toBe(true)
     expect(h['x-opencode-session']).toBe('ses_abc')
+    // 孪生头恒与 session 同值：UA ≥ 1.19.0 时上游必查它，缺了或值不同都是 403
+    // （2026-10-15 在线二分实测）。
+    expect(h['x-opencode-session-id']).toBe('ses_abc')
     expect(h['x-opencode-client']).toBe('mine')
     expect(h['x-opencode-project']).toBe('global')
   })
 
+  test('孪生头跟随 session 变化（两个头值绝不允许不一致）', () => {
+    const h: Record<string, string> = {
+      'x-opencode-session': 'ses_old', 'x-opencode-session-id': 'ses_old',
+    }
+    zenHeadersWithFingerprint(h, 'ses_new')
+    expect(h['x-opencode-session']).toBe('ses_new')
+    expect(h['x-opencode-session-id']).toBe('ses_new')
+  })
+
   test('大小写不敏感：已有 X-OpenCode-Session 就地更新', () => {
     const h: Record<string, string> = { 'X-OpenCode-Session': 'ses_old' }
-    zenHeadersWithFingerprint(h, 'ses_new', 'msg_new')
+    // request 头按上游要求的形状校验（msg_ + 12 小写hex + 14 base62 = 30）。
+    zenHeadersWithFingerprint(h, 'ses_new', 'msg_0b20f9fce001SFZUUtZpYDSXKH')
     expect(h['X-OpenCode-Session']).toBe('ses_new')
-    expect(h['x-opencode-request']).toBe('msg_new')
+    expect(h['x-opencode-request']).toBe('msg_0b20f9fce001SFZUUtZpYDSXKH')
     expect(Object.keys(h).filter((k) => k.toLowerCase() === 'x-opencode-session')).toHaveLength(1)
+  })
+
+  test('形状不合法的 request 值不写出（旧实现的 28 位残值就属此类，带着必 403）', () => {
+    const h: Record<string, string> = { 'x-opencode-request': 'msg_8nkftogpegx0D8cf4x9koRTT' }
+    zenHeadersWithFingerprint(h, 'ses_new', 'msg_new')
+    // 新旧值都不合形状 → 该头被删掉（上游对它是可选的：不带 200，带错形状 403）。
+    expect(h['x-opencode-request']).toBeUndefined()
   })
 
   test('非法会话不写任何头', () => {
@@ -64,11 +85,22 @@ describe('zenHeadersWithFingerprint', () => {
 })
 
 describe('mintZenRequestId', () => {
-  test('形状与观测一致：msg_ + 12 小写 + 12 混合', () => {
+  test('形状与上游要求一致：msg_ + 12 小写 hex + 14 base62 = 30 字符', () => {
     const id = mintZenRequestId(() => 'a')
-    expect(id).toBe('msg_' + 'a'.repeat(24))
+    expect(id).toBe('msg_' + 'a'.repeat(26))
+    expect(id).toHaveLength(30)
     const live = mintZenRequestId()
-    expect(live).toMatch(/^msg_[0-9a-z]{12}[A-Za-z0-9]{12}$/)
+    // 2026-10-15 在线二分实测：上游只认这个形状（第 12 位落字母 / 长度非 30 必 403）。
+    expect(live).toMatch(/^msg_[0-9a-f]{12}[A-Za-z0-9]{14}$/)
+    expect(validZenRequestId(live)).toBe(true)
+  })
+
+  test('validZenRequestId 认旧实现的 28 位残值不认', () => {
+    // 旧 mint 的产形：小写字母数字前缀（可达 z）+ 12 位后缀，共 28 位。
+    expect(validZenRequestId('msg_8nkftogpegx0D8cf4x9koRTT')).toBe(false)
+    expect(validZenRequestId('msg_' + 'a'.repeat(24))).toBe(false)
+    // 真值形状（历史库里的真实 ID）仍然有效。
+    expect(validZenRequestId('msg_13d9f0aa7001xEQrq1o8taMmJc')).toBe(true)
   })
 })
 
@@ -143,8 +175,11 @@ describe('refreshZenProvider', () => {
       // 缺了它会补写一次，见下方“池补齐”用例。
       const store = new MemoryProviderStore([zenProvider({
         // UA 也要对上版本才算“最新”（网关权威后客户端 UA 不再补充，见下组测试）
+        // 孪生头 x-opencode-session-id 也算：存量行没有它，必须补一次
+        // （UA ≥ 1.19.0 时上游必查它，不补则升级即全量 403）。
         headers: {
           'User-Agent': 'opencode/1.18.29', 'x-opencode-session': SESSION,
+          'x-opencode-session-id': SESSION,
           'x-opencode-request': 'msg_0b209c3fc001LViMJFLn53xddn',
           'x-polycode-session-pool': SESSION,
         },
@@ -364,6 +399,7 @@ describe('refreshZenProvider 同步 UA（网关权威后客户端 UA 不再补�
         headers: {
           'User-Agent': 'opencode/1.18.29 old',
           'x-opencode-session': 'ses_aaaabbbbccccddddeeeeffff00',
+          'x-opencode-session-id': 'ses_aaaabbbbccccddddeeeeffff00',
           'x-opencode-request': 'msg_0b209c3fc001LViMJFLn53xddn',
         },
       })])
@@ -425,11 +461,14 @@ describe('会话池：收集本机全部会话并轮换', () => {
     expect(parseZenSessionPool({ 'X-Polycode-Session-Pool': S1 })).toEqual([S1]) // 头名大小写不敏感
   })
 
-  test('shiftZenSession：把指定会话提到池首并同步 x-opencode-session', () => {
+  test('shiftZenSession：把指定会话提到池首并同步 x-opencode-session 与孪生头', () => {
     const p = zenProvider({ headers: { 'x-polycode-session-pool': `${S1},${S2}`, 'x-opencode-session': S1 } })
     shiftZenSession(p, S2)
     expect(parseZenSessionPool(p.headers!)).toEqual([S2, S1])
     expect(p.headers!['x-opencode-session']).toBe(S2)
+    // 孪生头必须跟着换：只换 session 不换 session-id，UA ≥ 1.19.0 时
+    // 两个头值不一致 → 403，轮换反而变成 100% 失败。
+    expect(p.headers!['x-opencode-session-id']).toBe(S2)
     // 不在池里的会话不动（防凭空的会话被塞进去）
     const q = zenProvider({ headers: { 'x-polycode-session-pool': `${S1},${S2}` } })
     shiftZenSession(q, 'ses_zzzz')

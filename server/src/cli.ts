@@ -18,7 +18,7 @@ import type { Account, Provider } from './model/index.ts'
 import { Store as UsageStore, backfillSemantics } from './usage/store.ts'
 import {
   SQLiteEgressStore, SQLiteProviderStore, SQLiteAccountStore,
-  seedProvidersIfEmpty, seedAccountsIfEmpty, migrateWorkBuddyAttributionHeaders,
+  seedProvidersIfEmpty, seedAccountsIfEmpty, migrateWorkBuddyAttributionHeaders, migrateZenBaseUrl,
 } from './adminapi/store.ts'
 import { createAdminApi } from './adminapi/api.ts'
 // 来源体检：Host 检查（防 DNS rebinding）+ 回环主机判据（下文两处口令守卫共用）。
@@ -222,6 +222,13 @@ export async function runServe(args: string[]): Promise<void> {
     const n = migrateWorkBuddyAttributionHeaders(providers)
     if (n > 0) console.log(`WorkBuddy 归因头迁移：${n} 个 Provider 已补使用端归因头（用量页「使用端」列将显示 WorkBuddy）`)
   }
+  // Zen 接口路径迁移（存量修复）：上游把 /zen/v1 换成了 /inference/v1，旧路径
+  // 仍通但恒 403 FreeTierError。草稿模板只影响新建，已入库的行必须在这里迁，
+  // 否则老用户升级后永远拿 403，还会被报错文案引去重配指纹。见 store 里该函数的注释。
+  {
+    const n = migrateZenBaseUrl(providers)
+    if (n > 0) console.log(`Zen 接口路径迁移：${n} 个 Provider 的 baseUrl 已由 /zen/v1 迁到 /inference/v1（旧路径已被上游废弃，恒 403）`)
+  }
   // 账号归属解析：YAML 里写的是 Provider 名，落库要的是数字 providerId。
   // 必须在 provider 入库（拿到自增 id）之后做。
   {
@@ -415,8 +422,10 @@ export async function runServe(args: string[]): Promise<void> {
     const configured = providers.list().find((x) => x.state !== 'deleted'
       && (x.name === 'opencode' || x.name === 'zen' || x.baseUrl.includes('opencode.ai')))
     // 与发现页同源：从本机 opencode 日志识别指纹（识别不到则为 null，不伪造）。
-    // 头集合与真机对齐（2026-09-18 取证）：x-opencode-* 四件套必带，
-    // 旧 x-session-id/affinity 附带兼容（真机不发但多带无害）。
+    // 头集合与真机对齐（2026-09-18 取证，2026-10-15 补录 session-id）：
+    // x-opencode-* 头必带；UA ≥ 1.19.0 时上游还要求 x-opencode-session-id
+    // 且与 session 同值（见 model.ZEN_SESSION_ID_HEADER）。旧 x-session-id/affinity
+    // 附带兼容（真机不发但多带无害）。
     const fp = discoverOpenCodeFingerprint(
       workBuddyDataNullsafe(draft.openCodeDirs))
     const autoHeaders: Record<string, string> = fp
@@ -425,9 +434,10 @@ export async function runServe(args: string[]): Promise<void> {
         'x-opencode-client': 'cli',
         'x-opencode-project': 'global',
         'x-opencode-session': fp.sessionID,
+        'x-opencode-session-id': fp.sessionID,
         'x-opencode-request': mintZenRequestId(),
         'x-session-id': fp.sessionID,
-        'x-session-affinity': fp.sessionID,
+        // 不加 x-session-affinity：毒头，带则恒 403（见 applyZenFingerprint）。
       }
       : {}
     const p: Provider = configured
@@ -435,7 +445,7 @@ export async function runServe(args: string[]): Promise<void> {
       : {
         providerId: 0, name: 'opencode-zen-probe', state: 'active', displayName: 'probe',
         accessKind: 'reverse', risk: 'high', riskNote: 'probe', stability: 'beta',
-        api: 'openai-completions', baseUrl: (draft.zenBaseURL ?? 'https://opencode.ai/zen') + '/v1',
+        api: 'openai-completions', baseUrl: (draft.zenBaseURL ?? 'https://opencode.ai/inference') + '/v1',
         credential: { apiKeyEnv: 'ZEN_KEY' },
         headers: autoHeaders,
         // 出口代理：还没配过 zen Provider 的用户走这条草稿分支，**必须把项目已配的

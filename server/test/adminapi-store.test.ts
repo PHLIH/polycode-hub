@@ -10,7 +10,7 @@ import { createRequire } from 'node:module'
 const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite')
 import {
   MemoryAccountStore, MemoryProviderStore, SQLiteAccountStore, SQLiteProviderStore,
-  seedAccountsIfEmpty, seedProvidersIfEmpty,
+  seedAccountsIfEmpty, seedProvidersIfEmpty, migrateZenBaseUrl, zenBaseUrlMigrated,
 } from '../src/adminapi/store.ts'
 import type { Account, Provider } from '../src/model/index.ts'
 
@@ -32,8 +32,7 @@ const account: Account = {
   id: 'a1', providerId: 1, status: 'available', fails: 0, credential: {},
 }
 
-describe('SQLite 存储（admin.db 两表 + 内存实现）', () => {
-  test('落盘→重开→可查；两类存储同库共存；删除返回布尔', async () => {
+describe('SQLite 存储（admin.db 两表 + 内存实现）', () => {  test('落盘→重开→可查；两类存储同库共存；删除返回布尔', async () => {
     const path = join(dir, 'admin.db')
     const ps = await SQLiteProviderStore.open(path)
     // put 对 providerId>0 走 UPDATE：行不存在就等于没写，所以新建时给 0 由存储层分配。
@@ -284,5 +283,48 @@ describe('删账号不得动用量历史（首页预览数据）', () => {
     expect(after.totals).toEqual(before.totals) // 首页合计纹丝不动
     expect(after.byModel).toEqual(before.byModel) // 归因也完整保留
     us.close(); as.close()
+  })
+})
+
+// Zen 接口路径迁移（2026-10-15 上游把 /zen 换成 /inference）。
+//
+// 旧路径仍通但恒 403 FreeTierError——一句看着像「指纹坏了/免费额度没了」的话，
+// 实际是路径已废弃。已入库的 Provider 不会自己变（草稿模板只影响新建），
+// 所以必须靠这条迁移，否则老用户升级后永远 403，还会被报错引去重配指纹。
+describe('Zen 接口路径迁移 zenBaseUrlMigrated', () => {
+  test('opencode.ai 上的 /zen 段换成 /inference（含子域）', () => {
+    expect(zenBaseUrlMigrated('https://opencode.ai/zen/v1')).toBe('https://opencode.ai/inference/v1')
+    expect(zenBaseUrlMigrated('https://opencode.ai/zen')).toBe('https://opencode.ai/inference')
+    expect(zenBaseUrlMigrated('https://s1.opencode.ai/zen/v1')).toBe('https://s1.opencode.ai/inference/v1')
+  })
+
+  test('非 opencode.ai 域一律不动（防误改别的上游）', () => {
+    expect(zenBaseUrlMigrated('https://api.example.com/zen/v1')).toBe('https://api.example.com/zen/v1')
+    expect(zenBaseUrlMigrated('https://opencode.ai.evil.com/zen/v1')).toBe('https://opencode.ai.evil.com/zen/v1')
+  })
+
+  test('已是新路径 / 无 zen 段 / 非法 URL：原样返回（幂等）', () => {
+    expect(zenBaseUrlMigrated('https://opencode.ai/inference/v1')).toBe('https://opencode.ai/inference/v1')
+    expect(zenBaseUrlMigrated('https://opencode.ai/v1')).toBe('https://opencode.ai/v1')
+    expect(zenBaseUrlMigrated('not a url')).toBe('not a url')
+    // 幂等：迁过的再迁一次不变
+    const once = zenBaseUrlMigrated('https://opencode.ai/zen/v1')
+    expect(zenBaseUrlMigrated(once)).toBe(once)
+  })
+
+  test('migrateZenBaseUrl：只动 baseUrl，不碰 headers/models；软删行跳过', () => {
+    const s = new MemoryProviderStore([
+      { ...provider, providerId: 11, name: 'zen', baseUrl: 'https://opencode.ai/zen/v1' },
+      { ...provider, providerId: 12, name: 'other', baseUrl: 'https://api.example.com/zen/v1' },
+      { ...provider, providerId: 13, name: 'dead', state: 'deleted', baseUrl: 'https://opencode.ai/zen/v1' },
+    ])
+    const n = migrateZenBaseUrl(s)
+    expect(n).toBe(1)
+    expect(s.get(11)!.baseUrl).toBe('https://opencode.ai/inference/v1')
+    expect(s.get(12)!.baseUrl).toBe('https://api.example.com/zen/v1') // 别的域不动
+    expect(s.get(13)!.baseUrl).toBe('https://opencode.ai/zen/v1') // 软删不动
+    expect(s.get(11)!.models).toEqual(provider.models) // 其它字段原样
+    // 幂等：再跑一次不写库
+    expect(migrateZenBaseUrl(s)).toBe(0)
   })
 })

@@ -14,9 +14,9 @@ import {
   type OpenCodeFingerprint,
 } from './index.ts'
 import {
-  findHeaderKey, isZenBaseUrl, mintZenRequestId, validZenToken, parseZenSessionPool,
-  writeZenSessionPool,
-  ZEN_REQUEST_HEADER, ZEN_SESSION_HEADER,
+  findHeaderKey, isZenBaseUrl, mintZenRequestId, parseZenSessionPool,
+  validZenRequestId, writeZenSessionPool,
+  ZEN_REQUEST_HEADER, ZEN_SESSION_HEADER, ZEN_SESSION_ID_HEADER,
   type Provider,
 } from '../model/index.ts'
 import type { FingerprintRefreshReport } from '../adminapi/types.ts'
@@ -66,13 +66,14 @@ export function refreshZenProvider(
   const curKey = findHeaderKey(h, ZEN_SESSION_HEADER)
   const cur = (curKey !== undefined ? h[curKey] : undefined) ?? ''
   // msg 取该会话在日志里最后一次的（一次会话内稳定）；没有则沿用静态值，
-  // 还没有才现铸（格式与观测一致；唯一性有收益，时间绑定则听天由命）。
+  // 还没有才现铸（上游只校验形状不校验真伪，见 model.mintZenRequestId）。
   let msg = readSessionMessage(fp.logPath, fp.sessionID)
   if (!msg) {
-    // 静态值先过白名单再沿用：脏值只脏发送头、不再写回库（upstream 发包侧同样现铸兜底）。
+    // 静态值必须先过**严格形状**校验再沿用：旧实现往库里写过 28 位残值，
+    // 那种值带出去恒 403；它该被现铸值覆盖，而不是当作新鲜值保留。
     const staticReqKey = findHeaderKey(h, ZEN_REQUEST_HEADER)
     const sv = ((staticReqKey !== undefined ? h[staticReqKey] : undefined) ?? '').trim()
-    if (validZenToken(sv)) msg = sv
+    if (validZenRequestId(sv)) msg = sv
   }
   if (!msg) msg = mintZenRequestId()
   // UA 同步（网关权威后客户端 UA 不再补充，静态 UA 必须自己跟上版本，
@@ -89,11 +90,22 @@ export function refreshZenProvider(
   const oldPool = parseZenSessionPool(h)
   const poolChanged = oldPool.join(',') !== poolIDs.join(',')
   const primary = poolIDs[0] ?? fp.sessionID
-  if (cur === primary && hasValidRequest(h) && !uaStale && !poolChanged) {
+  // 孪生头是否缺失/过期：存量 Provider 里没有这个头（它是 2026-10-15 才补录的），
+  // 不把它算进「要不要刷新」的话，那些行永远补不上，UA 一旦升级到 1.19.0 就全量 403。
+  const sidKey = findHeaderKey(h, ZEN_SESSION_ID_HEADER)
+  const curSid = ((sidKey !== undefined ? h[sidKey] : undefined) ?? '').trim()
+  const sidStale = curSid !== primary
+  if (cur === primary && !sidStale && hasValidRequest(h) && !uaStale && !poolChanged) {
     return { ...base, detail: `已是最新（与本机会话 ${primary} 一致，池 ${poolIDs.length} 个），无需刷新` }
   }
+  // sessionChanged 只描述「主会话变了」这一件事（它驱动调度器的会话热重载）。
+  // 补孪生头不是会话变更，不往这里塞——两件事混在一起，调用方就再也分不清
+  // 「该重载会话」还是「只是补了个头」。
   const sessionChanged = cur !== primary
   setHeader(h, ZEN_SESSION_HEADER, primary)
+  // 孪生头必须同步：UA ≥ 1.19.0 时上游必查它，且要求与 session 同值。
+  // 刷新只换 session 不换它 → 两个头不一致 → 403（实测）。
+  setHeader(h, ZEN_SESSION_ID_HEADER, primary)
   setHeader(h, ZEN_REQUEST_HEADER, msg)
   writeZenSessionPool(h, poolIDs)
   let uaNote = ''
@@ -101,9 +113,12 @@ export function refreshZenProvider(
     setHeader(h, 'User-Agent', fp.userAgent)
     uaNote = `；UA 已同步为 ${fp.userAgent}`
   }
-  // 旧版 x-session-id/affinity 若还在（历史配置），同步跟上——它们是晋升路径的输入。
+  // 旧版 x-session-id 若还在（历史配置），同步跟上——它是晋升路径的输入。
   if (findHeaderKey(h, 'x-session-id') !== undefined) setHeader(h, 'x-session-id', primary)
-  if (findHeaderKey(h, 'x-session-affinity') !== undefined) setHeader(h, 'x-session-affinity', primary)
+  // x-session-affinity 是毒头（带则恒 403，见 applyZenFingerprint）：顺手清掉，
+  // 否则历史配置里存着的这一行会一直把请求毒死，用户看不出是配置里多了一行。
+  const affKey = findHeaderKey(h, 'x-session-affinity')
+  if (affKey !== undefined) delete h[affKey]
   p.headers = h
   store.put(p)
   notify()
@@ -156,7 +171,9 @@ function readSessionMessage(logPath: string, sessionID: string): string | undefi
 function hasValidRequest(h: Record<string, string>): boolean {
   const k = findHeaderKey(h, ZEN_REQUEST_HEADER)
   const v = (k !== undefined ? h[k] : undefined) ?? ''
-  return validZenToken(v.trim())
+  // 严格形状（不是 validZenToken）：库里存着旧实现写的 28 位残值时，
+  // 这里要判「不合格」才能触发刷新把它换成现铸值。
+  return validZenRequestId(v)
 }
 
 function setHeader(h: Record<string, string>, name: string, value: string): void {

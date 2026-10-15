@@ -53,8 +53,9 @@ export function bearerMatch(authHeader: string | undefined, key: string): boolea
 }
 
 // 客户端指纹透传（zen 免费档指纹的一部分）：会话头 + UA 原样带给上游。
-// opencode 发出的每个请求都带 x-session-id/x-session-affinity（同值 ses_…），
-// 网关原样递给上游，上游才认这是"官方客户端内部"流量；它的 UA 本来就是真串，
+// opencode 发出的每个请求都带 x-session-id（真机实测还带 x-session-affinity，但那个
+// 头是上游的「非官方客户端」判据，不得转发——见 upstream.applyZenFingerprint）。
+// 网关原样递会话头与 UA，上游才认这是"官方客户端内部"流量；它的 UA 本来就是真串，
 // 透传即指纹，无需网关伪造。非 opencode 客户端不带会话头时 hint 为 undefined，
 // 上游侧回退到 Provider 静态头里的那一份。
 // 通用原则：来什么透什么，网关不判断、不改写、不伪造（UA 的合法性由
