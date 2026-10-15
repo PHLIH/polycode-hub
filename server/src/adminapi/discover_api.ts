@@ -12,7 +12,7 @@ import { detectRealmFromAuth } from '../discover/index.ts'
 import { ERR } from '../ir/index.ts'
 import { looksFree, newCatalogModel, providerValidate, workBuddyRealmOfBaseUrl, type Account, type Provider } from '../model/index.ts'
 import type { Context, Hono } from 'hono'
-import type { DiscoveredAccount, Finding } from './types.ts'
+import type { DiscoveredAccount, Finding, ImportSuggestion } from './types.ts'
 import type { AdminCtx } from './api.ts'
 
 function isObj(v: unknown): v is Record<string, unknown> {
@@ -208,6 +208,10 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
       const draft = f.suggestedProvider
       const hit = draft ? active.get(draft.name) : undefined
       if (hit) f.adoptedProviderId = hit.providerId // 报真实行 id，前端据此定位/删除
+      // 导入建议随发现结果一起下发：账号行上的「导入账号池（id）」按钮需要它，
+      // 而用户点开页面时往往还没「采用」过（= 没有 adopt 响应可拿）。
+      // 与 adopt / import-account 用同一个函数，三处口径不可能漂移。
+      f.suggestions = importSuggestions(f.key, f.suggestedAccounts)
     }
     return ok(c, 200, { findings })
   })
@@ -230,7 +234,34 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     const verr = providerValidate(p)
     if (verr) return errRes(c, 400, ERR.INVALID_REQUEST, verr)
     const existing = providers.getByName(p.name)
-    if (existing && existing.state !== 'deleted') return ok(c, 200, existing) // 幂等：重复采用直接返回已有的
+    if (existing && existing.state !== 'deleted') {
+      // 幂等：Provider 已存在就不重复建行。但**不能直接返回**——真实死路：
+      //
+      //   ① 第一次「采用」时登录态是加密信封 → 导入被跳过（imported=0），
+      //      Provider 落库但账号池是空的；
+      //   ② 用户按提示去客户端重新登录（现在有明文了），回来再点「采用」；
+      //   ③ 旧实现走到这行就直接 200 返回，**根本不跑导入** —— 用户被永久卡死，
+      //      无论重登多少次、点多少次都进不去账号，而界面上看起来一切正常。
+      //
+      // 所以幂等只省「建行」，不省「导账号」：账号导入本来就是幂等的
+      // （findSameIdentity 按身份判重，重复导只是刷新凭据）。
+      const w: string[] = []
+      w.push(...applyCredentialDefaults(existing))
+      const probeWarn2 = adoptProbeWarning(found)
+      if (probeWarn2) w.push(probeWarn2)
+      const r2 = await importSuggestedAccounts(key, found.suggestedAccounts, existing)
+      w.push(...r2.warnings)
+      if (r2.imported > 0 || r2.skipped > 0) changed()
+      if (r2.imported === 0 && r2.skipped === 0) {
+        w.push(`采用成功，但**没有任何登录态进入账号池**：${zeroImportWhy(key, found)}`)
+      }
+      const mv = await fillModelsIfEmpty(existing)
+      if (mv) w.push(mv)
+      const res2: Record<string, unknown> = { ...(providers.get(existing.providerId) ?? existing) }
+      res2.suggestions = importSuggestions(key, found.suggestedAccounts)
+      if (w.length > 0) res2.warnings = w
+      return ok(c, 200, res2)
+    }
 
     // 顺序关键：必须先 providers.put(p) 落库，再导入账号。
     // providerId 是在 put 里由存储层分配并回填 p.providerId 的（store.ts 内存实现
@@ -252,15 +283,25 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     // 转头调用才发现 403，又得回来猜是导错了还是没配好）。
     const probeWarn = adoptProbeWarning(found)
     if (probeWarn) warnings.push(probeWarn)
-    const { warnings: importWarnings, imported } =
+    const { warnings: importWarnings, imported, skipped } =
       await importSuggestedAccounts(key, found.suggestedAccounts, p)
     warnings.push(...importWarnings)
     if (imported > 0) changed()
+    // 一个号都没进池（imported=0 且 skipped=0）：把真因进 warnings。
+    // 以前这种情况下 warnings 是空的（没有导入就没有导入错误），用户只看到
+    // 「采用成功」——而这正是「Provider 成了空壳、调用时报 WB_TOKEN 未设置」
+    // 那条故障链的起点。这里必须把「为什么一个都没进」说出来。
+    if (imported === 0 && skipped === 0) {
+      warnings.push(`采用成功，但**没有任何登录态进入账号池**：${zeroImportWhy(key, found)}`)
+    }
     // 与 quick-import 同样自动补全模型目录（两条路径行为必须一致，
     // 否则「采用」和「一键导入」出来的 Provider 可用性不同）。
     const modelWarn = await fillModelsIfEmpty(p)
     if (modelWarn) warnings.push(modelWarn)
     const res: Record<string, unknown> = { ...(providers.get(p.providerId) ?? p) }
+    // 还能导入哪些号（含服务端定好的 id 与凭据文件路径）：
+    // 前端「导入账号池」直接用这份，不再自己推算 id（两处各算必然漂移）。
+    res.suggestions = importSuggestions(key, found.suggestedAccounts)
     if (warnings.length > 0) res.warnings = warnings
     return ok(c, 201, res)
   })
@@ -339,7 +380,10 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     markImportSource(acct, key, sess)
     accounts.put(acct)
     changed()
-    return ok(c, 201, acct)
+    // 双写：顶层平铺 = 旧契约（前端读 acct.displayName / acct.id），新增字段供新前端
+    // 一次性拿到「还有哪些号可导」。过渡期两份共存；前端切完即可删掉平铺那层。
+    const after = importSuggestions(key, known)
+    return ok(c, 201, { ...acct, account: acct, suggestions: after, runtimeUnsupported: true } as unknown as Account)
   })
 
   // ---- POST /discover/quick-import ----
@@ -384,8 +428,13 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     //    tokenPath 来自本次扫描结果，不收前端路径）。
     const { warnings: importWarnings, imported, skipped } =
       await importSuggestedAccounts(key, found.suggestedAccounts, p)
-    if (imported > 0) changed()
     warnings.push(...importWarnings)
+    if (imported > 0) changed()
+    // 同 adopt：一个号都没进池时必须说清为什么（否则「一键导入」看起来成功了，
+    // 实际得到一条永远报「环境变量未设置」的空壳 Provider）。
+    if (imported === 0 && skipped === 0) {
+      warnings.push(`采用成功，但**没有任何登录态进入账号池**：${zeroImportWhy(key, found)}`)
+    }
 
     // ④ 自动补全模型目录（本次新增，修「导入后按真名调用 404」）：
     //    导入的 Provider 目录若是空的，用户拿上游真实模型名一调就 404，
@@ -397,6 +446,9 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     const latest = providers.get(p.providerId) ?? p
 
     const res: Record<string, unknown> = { provider: latest, created, imported, skipped }
+    // 还能导入哪些号（含服务端定好的 id 与凭据文件路径）。
+    // imported=0 时这份列表通常非空——它正是「采用成功了但池子还是空的」的出口。
+    res.suggestions = importSuggestions(key, found.suggestedAccounts)
     if (warnings.length > 0) res.warnings = warnings
     return ok(c, 200, res)
   })
@@ -674,6 +726,94 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     if (s.uid) acct.workbuddyUid = s.uid
     else delete acct.workbuddyUid
     acct.workbuddyTokenHash = workbuddyTokenHash(s.token)
+  }
+
+  // 还有哪些登录态**可以**导入，以及它们该用哪个 id / 凭据文件。
+  //
+  // 为什么要有这个函数（真实缺口）：「一键导入」跑完 imported=0 时，用户并不知道
+  // 下一步该干什么——发现页上的账号行还在，但那是**发现**的结果，不是「导入失败后
+  // 还能再试什么」。更糟的是前端的单账号导入按钮以前要自己推算 id（nextAccountId
+  // 遍历池子取第一个空闲编号），两处各算一次必然漂移：池里已有 workbuddy-1、
+  // workbuddy-3 时前端可能算出 workbuddy-2 而后端判定为已存在。
+  // 所以 id/凭据路径一律由服务端给（与 /discover/import-account 用同一套判据），
+  // 前端只负责展示与转交。
+  //
+  // 排除已入池的号：判据与 findSameIdentity 完全同源（按 key 分区的 uid / token 指纹 /
+  // 凭据文件原文），否则会把「已在账号池」的号又推一遍，用户点了得到一个 409。
+  // 只列活着的：过期登录态导入必 401，列出来等于骗人。
+  function importSuggestions(
+    key: string, suggested: DiscoveredAccount[] | undefined,
+  ): ImportSuggestion[] {
+    const out: ImportSuggestion[] = []
+    const prefix = shortAccountPrefix(key)
+    const taken = new Set(accounts.list().map((a) => a.id))
+    // 已入池身份：同一 key 分区下的 uid 集合与 token 指纹集合。
+    const ownUids = new Set<string>()
+    const ownHashes = new Set<string>()
+    for (const a of accounts.list()) {
+      if ((a.importSource ?? '') !== key) continue
+      if (a.workbuddyUid) ownUids.add(a.workbuddyUid)
+      if (a.workbuddyTokenHash) ownHashes.add(a.workbuddyTokenHash)
+    }
+    let n = 1
+    for (const acc of suggested ?? []) {
+      if (!acc.alive) continue
+      // 已在池里（uid 命中）——不重复推荐。uid 缺失的号拿不到这个判据，
+      // 退回下面按凭据文件原文比（与 findSameIdentity 的降级顺序一致）。
+      if (acc.uid && ownUids.has(acc.uid)) continue
+      let already = false
+      try {
+        const raw = readFileSync(acc.tokenPath, 'utf8')
+        const parsed = JSON.parse(raw) as { auth?: { accessToken?: unknown } }
+        const tok = typeof parsed.auth?.accessToken === 'string' ? parsed.auth.accessToken.trim() : ''
+        if (tok !== '' && ownHashes.has(workbuddyTokenHash(tok))) already = true
+        if (tok !== '') {
+          for (const a of accounts.list()) {
+            if ((a.importSource ?? '') !== key) continue
+            if (!a.credential.apiKeyFile) continue
+            try {
+              if (readFileSync(a.credential.apiKeyFile, 'utf8').trim() === tok) { already = true; break }
+            } catch { /* 读不了视为不匹配 */ }
+          }
+        }
+      } catch { /* 读不了：不因此排除（不猜） */ }
+      if (already) continue
+      while (taken.has(`${prefix}-${n}`)) n++
+      const id = `${prefix}-${n}`
+      taken.add(id)
+      n++
+      out.push({
+        tokenPath: acc.tokenPath, id,
+        credentialFile: posix.join('config', 'credentials', `${id}-jwt`),
+        nickname: acc.nickname,
+      })
+    }
+    return out
+  }
+
+  // 导入结果为 0 时的归因（人话，可直接展示）。
+  //
+  // 这是本次修复的核心：imported=0 以前只体现在「没报错、也没账号」这种沉默状态里，
+  // 用户要等到调用被拒才知道。这里把「为什么一个都没进」说清：没发现登录态 /
+  // 全过期 / 读写不出（信封）/
+  // 版本不符。四种原因用户能做的事完全不同，不能混成一句「导入失败」。
+  function zeroImportWhy(key: string, found: Finding): string {
+    const accts = found.suggestedAccounts ?? []
+    if (accts.length === 0) {
+      return `本机没有发现可导入的登录态（${
+        key.startsWith('workbuddy') ? '先在 WorkBuddy 桌面端登录一次再重扫' : '先在客户端完成登录后再重扫'}）`
+    }
+    const alive = accts.filter((a) => a.alive)
+    if (alive.length === 0) {
+      return `发现 ${accts.length} 个登录态但**全部已过期**——先在客户端重新登录（网关不能替你刷新过期的登录态）`
+    }
+    const envelope = alive.filter((a) => a.readHint === 'envelope')
+    if (envelope.length > 0) {
+      return `发现 ${accts.length} 个登录态，但可用的那个是**加密 token**（新版客户端格式，网关读不出明文，`
+        + `也没有可自动刷新的明文 refreshToken）——在客户端重新登录一次即可写出可读登录态，或自行取得 token 后`
+        + `填进 config/credentials/`
+    }
+    return `发现 ${alive.length} 个有效登录态，但都已在账号池（无需重复导入）`
   }
 }
 

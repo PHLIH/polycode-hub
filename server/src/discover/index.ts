@@ -326,6 +326,19 @@ export function wbHasPlaintextToken(f: WbAuthFile | null | undefined): boolean {
   return wbAccessToken(f) !== ''
 }
 
+// 登录态「能不能被读出明文」的三态事实（发现层产物的一部分，见 adminapi/types.readHint）。
+// 判据全部来自文件本身，不联网、不猜：
+//   plaintext  —— accessToken 是可直接使用的明文字符串
+//   envelope   —— accessToken 是加密信封（新版客户端），明文不可得
+//   unreadable —— 两者都不是（无 accessToken / 类型不认识 / 空值）
+// 注意 parseAuthFile 已经在解析阶段把「明显不是登录态」的文件挡掉了，所以这里
+// 落到 unreadable 的是「解析得出结构但取不到可用凭据」那一类。
+export function wbReadHint(f: WbAuthFile | null | undefined): 'plaintext' | 'envelope' | 'unreadable' {
+  if (wbAccessToken(f) !== '') return 'plaintext'
+  if (isEncryptedEnvelope(f?.auth?.accessToken)) return 'envelope'
+  return 'unreadable'
+}
+
 // 取登录态里的明文 access token；取不到（加密信封 / 非字符串 / 空白）返回 ''。
 //
 // 加密信封没有解密密钥，网关无从还原明文（也不该尝试——那意味着把用户的登录态
@@ -1360,6 +1373,7 @@ export function discoverWorkBuddyAccounts(dir: string): DiscoveredAccount[] {
     const exp = wbTokenExpiry(f)
     const alive = exp !== null && Date.now() < exp.getTime()
     const rank = snapshotRank(alive, wbHasPlaintextToken(f))
+    const readHint = wbReadHint(f)
     const key = `${realm ?? '?'}:${uid}`
     const prev = byKey.get(key)
     if (prev) {
@@ -1377,7 +1391,7 @@ export function discoverWorkBuddyAccounts(dir: string): DiscoveredAccount[] {
       }
     }
     byKey.set(key, {
-      nickname: nick, uid: shortID(uid), realm, type: f.account?.type, alive,
+      nickname: nick, uid: shortID(uid), realm, type: f.account?.type, alive, readHint,
       tokenPath: join(dir, name), modified: mod, exp, rank,
       expiresAt: exp ? fmtLocal(exp) : undefined,
     })

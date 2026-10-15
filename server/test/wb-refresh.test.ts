@@ -4,12 +4,17 @@
 
 import { describe, expect, test } from 'vitest'
 import { wbRefreshBaseOf, wbRefreshSession, type WbRefreshed } from '../src/discover/wb_refresh.ts'
+import { workBuddyRealmOfToken } from '../src/model/index.ts'
 
 // 组装 1300+ 字节的假 JWT（exp = 未来 30 天）。
-function craftJWT(expDays = 30): string {
+// iss 可选：真实 WorkBuddy token 一定带它（实测国内版 https://www.workbuddy.cn/auth/realms/copilot、
+// 海外版 https://www.workbuddy.ai/auth/realms/copilot），而版本守卫（账号-Provider 一致性）
+// 正是从 iss 反推版本的——所以测「刷新后的 token 能不能过守卫」必须带上它。
+function craftJWT(expDays = 30, iss?: string): string {
   const header = Buffer.from('{"alg":"RS256","typ":"JWT"}').toString('base64url')
   const claims = Buffer.from(JSON.stringify({
     exp: Math.floor((Date.now() + expDays * 86400_000) / 1000), sub: 'u1',
+    ...(iss !== undefined ? { iss } : {}),
   })).toString('base64url')
   return `${header}.${claims}.${'x'.repeat(600)}`
 }
@@ -24,7 +29,11 @@ describe('wbRefreshBaseOf', () => {
   test('域派生：国内版 / 海外版 / 认不出', () => {
     expect(wbRefreshBaseOf('copilot.tencent.com')).toBe('https://copilot.tencent.com')
     expect(wbRefreshBaseOf('www.workbuddy.cn')).toBe('https://copilot.tencent.com') // www 剥掉，cn → copilot
-    expect(wbRefreshBaseOf('www.workbuddy.ai')).toBe('https://workbuddy.ai')
+    // 海外版**保留 www**：2026-10-15 实测 workbuddy.ai 的 302 Location 指向
+    // https://www.workbuddy.ai:443/ **且不带路径**，跟随过去拿到的是 HTML 而非 JSON。
+    // 这条断言以前是 'https://workbuddy.ai'（剥 www），正是海外版自动刷新恒失败的原因。
+    expect(wbRefreshBaseOf('www.workbuddy.ai')).toBe('https://www.workbuddy.ai')
+    expect(wbRefreshBaseOf('workbuddy.ai')).toBe('https://www.workbuddy.ai')
     expect(wbRefreshBaseOf('example.com')).toBeUndefined()
     expect(wbRefreshBaseOf(undefined)).toBeUndefined()
   })
@@ -51,11 +60,17 @@ describe('wbRefreshSession', () => {
     expect(calledHeaders['X-Domain']).toBe('copilot.tencent.com')
   })
 
-  test('海外版 → 打 workbuddy.ai', async () => {
-    const refreshed = await wbRefreshSession(RT, 'ai', okFetch({
-      data: { data: { accessToken: craftJWT() } },
-    }))
+  test('海外版 → 打 www.workbuddy.ai（带 www，实测 302 的那个域是错的）', async () => {
+    let calledURL = ''
+    const refreshed = await wbRefreshSession(RT, 'ai', ((url: string | URL, init?: RequestInit) => {
+      calledURL = String(url)
+      return Promise.resolve(new Response(JSON.stringify({
+        data: { data: { accessToken: craftJWT(30, 'https://www.workbuddy.ai/auth/realms/copilot') } },
+      }), { status: 200 }))
+    }) as typeof fetch)
     expect(refreshed.realm).toBe('ai')
+    // 端点字面量锚点：改这里之前先读 wbRefreshBaseOf 的取证注释（302 丢路径）。
+    expect(calledURL).toBe('https://www.workbuddy.ai/v2/plugin/auth/token/refresh')
   })
 
   test('JWT 无 exp 时用 expiresIn 兜底', async () => {
@@ -199,5 +214,49 @@ describe('readSession 信封刷新（含跨快照）', async () => {
     const cur = write('workbuddy-desktop.info',
       authFile('uid-none', { $wbEncrypted: 1, envelope: 'Zm9v' }, { $wbEncrypted: 1, envelope: 'Zm9v' }))
     await expect(readSessionLike(cur, fetchOK)).rejects.toThrow(/无法自动刷新/)
+  })
+})
+
+// 海外版的端到端契约（一位真实用户的实际场景，2026-10-15）：
+// 他只装了海外版、token 是加密信封、refreshToken 是明文 → 走自动刷新。
+// 修复前 wbRefreshBaseOf('www.workbuddy.ai') 返回 https://workbuddy.ai（剥了 www），
+// 而该域实测 302 到 https://www.workbuddy.ai:443/（**Location 不带路径**），
+// 跟随过去拿到 HTML 首页 → 「刷新响应非 JSON」→ 账号导入被跳过 → Provider 只剩
+// 占位 apiKeyEnv=WB_TOKEN → 用户看到「环境变量 WB_TOKEN 未设置」。
+// 这条用例锁住「海外版信封 → 刷新 → 明文 token」整条链的域与包络。
+describe('海外版信封登录态 → 自动刷新（真实用户场景回归）', () => {
+  const AI_DOMAIN = 'www.workbuddy.ai'
+
+  test('域名派生：海外版保留 www（302 丢路径的那个域不能用）', () => {
+    expect(wbRefreshBaseOf(AI_DOMAIN)).toBe('https://www.workbuddy.ai')
+    expect(wbRefreshBaseOf('workbuddy.ai')).toBe('https://www.workbuddy.ai')
+  })
+
+  test('信封 + 明文 refreshToken → 刷出明文 token（打 www 域，X-Domain 同为海外域）', async () => {
+    const RT_AI = 'a'.repeat(700)
+    let url = ''
+    let hdrs: Record<string, string> = {}
+    const refreshed = await wbRefreshSession(RT_AI, 'ai', ((u: string | URL, init?: RequestInit) => {
+      url = String(u)
+      hdrs = (init?.headers ?? {}) as Record<string, string>
+      return Promise.resolve(new Response(JSON.stringify({
+        code: 0, msg: 'OK',
+        data: { accessToken: craftJWT(30, 'https://www.workbuddy.ai/auth/realms/copilot'), tokenType: 'Bearer', expiresIn: 2592000 },
+      }), { status: 200 }))
+    }) as typeof fetch)
+    expect(url).toBe('https://www.workbuddy.ai/v2/plugin/auth/token/refresh')
+    expect(hdrs['X-Domain']).toBe(AI_DOMAIN)
+    expect(hdrs['X-Refresh-Token']).toBe(RT_AI)
+    expect(refreshed.accessToken.split('.').length).toBe(3)
+    expect(refreshed.realm).toBe('ai')
+    // 换出的 token 必须能被反推回海外版（版本守卫靠它，推不出会被拒入池）
+    expect(workBuddyRealmOfToken(refreshed.accessToken)).toBe('ai')
+  })
+
+  test('302（跟随后拿到 HTML）→ 报「非 JSON」而不是把 HTML 当 token', async () => {
+    // 修复前的真实形态：workbuddy.ai 返回 302，fetch 跟随到 HTML 首页后状态 200。
+    await expect(wbRefreshSession('r'.repeat(700), 'ai', (async () =>
+      new Response('<!doctype html><html><head><title>WorkBuddy</title></head></html>', { status: 200 })
+    ) as unknown as typeof fetch)).rejects.toThrow(/非 JSON/)
   })
 })

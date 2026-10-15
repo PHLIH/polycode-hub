@@ -9,7 +9,7 @@ const props = defineProps({
   testing: { type: Boolean, default: false },
   testRes: { type: Object, default: null }
 })
-const emit = defineEmits(['test', 'reload', 'models', 'edit', 'remove'])
+const emit = defineEmits(['test', 'reload', 'models', 'edit', 'remove', 'discover'])
 
 const open = ref(false)
 
@@ -381,6 +381,14 @@ async function toggle() {
         <div class="ident">
           <div class="row1">
             <span class="name">{{ p.displayName || p.name }}</span>
+            <!-- 空壳提醒（credentialState=missing）：采用成功但一个号都没导进来、
+                 引用的环境变量/凭据文件也不存在。这种 Provider 长得与正常的完全一样，
+                 用户只能等调用时报「环境变量 XXX 未设置」才发现——而那句话说的是
+                 一个自己根本没有的变量名。这里直接把它标出来，并把入口指回发现页。 -->
+            <span v-if="p.credentialState === 'missing'" class="chip bad"
+              title="这个 Provider 此刻无法鉴权：引用的凭据读不到，名下也没有账号。若它是从发现页「采用」来的，说明桌面登录态没导入成功（常见原因：新版客户端的 token 是加密信封、网关读不出明文），去发现页看每行给出的原因。">
+              缺凭据
+            </span>
             <span v-if="p.streamOnly" class="chip"
               title="上游只支持流式，非流式请求会跳过此源">只流式</span>
             <span v-if="p.risk !== 'low'" class="chip" :class="riskClass"
@@ -419,6 +427,15 @@ async function toggle() {
           <span class="vr" aria-hidden="true" />
           <el-switch :model-value="p.state === 'active'" @change="toggle" @click.stop />
         </div>
+      </div>
+
+      <div v-if="p.credentialState === 'missing'" class="empty-shell">
+        <span>
+          这条 Provider <b>没有任何可用凭据</b>：引用的
+          <span class="mono">{{ p.credential.apiKeyFile || ('env ' + p.credential.apiKeyEnv) }}</span>
+          读不到，名下也没有账号——现在调用它一定会失败。
+        </span>
+        <button class="act tiny" @click="emit('discover')">去发现页重新导入</button>
       </div>
 
       <div class="underline" aria-hidden="true" />
@@ -760,6 +777,16 @@ async function toggle() {
   border-left: 2px solid var(--warn);
 }
 .takeover-note .mono { overflow-wrap: anywhere; }
+/* 空壳 Provider（采用成功但零账号、凭据也读不到）：这是「调用时报环境变量未设置」的
+   真实病灶，必须在卡片上就说清并给出入口，不能等用户去调用时才碰壁。 */
+.empty-shell {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-top: 10px; padding: 7px 10px; font-size: 11.5px; line-height: 1.6;
+  color: var(--warn); border-radius: var(--r-ctl);
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+  border-left: 2px solid var(--warn);
+}
+.empty-shell .mono { overflow-wrap: anywhere; }
 
 .probe-row { display: flex; align-items: center; gap: 10px; margin-top: 10px; font-size: 12px; }
 .probe-sel { width: 300px; }

@@ -5,7 +5,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, test, vi } from 'vite
 import { workbuddyTokenHash } from '../src/adminapi/discover_api.ts'
 import { mkdtempSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { expectMode } from './helpers/posix-mode.ts'
 import { Hono } from 'hono'
 import { createAdminApi } from '../src/adminapi/index.ts'
@@ -2481,5 +2481,252 @@ describe('DELETE /admin/api/providers/:pid/models/:model（删单个模型）', 
     expect(back.status).toBe(200)
     const list = await (await call('GET', '/admin/api/providers', { key: 'secret' })).json() as { providers: Provider[] }
     expect(list.providers[0]!.models.map((m) => m.id)).toEqual(['m1'])
+  })
+})
+
+// ---- 「采用成功但 0 个账号入池」的收口（真实故障链的起点）----
+//
+// 背景：WorkBuddy 采用草稿的 credential 是占位 apiKeyEnv='WB_TOKEN'，真正的凭据
+// 在账号池里。当登录态是新版客户端的加密信封（读不出明文）时，导入整批被跳过
+// （imported=0、skipped=0），而 Provider 照样落库——于是列表上出现一条**空壳**：
+// 它和正常 Provider 长得一模一样，直到用户调用时收到
+// 「环境变量 WB_TOKEN 未设置」，被引去配一个自己根本没有的变量。
+//
+// 这里把三件事钉死：
+//   ① imported=0 且 skipped=0 时必须有 warning 说清「为什么一个都没进」；
+//   ② 响应里给 suggestions（还能导入哪些号 + 服务端定好的 id/凭据路径）；
+//   ③ 列表端点的 credentialState 必须把空壳标成 missing（派生自真实凭据解析）。
+describe('0 个账号入池：必须说清原因，并给出可执行的下一步', () => {
+  // 信封登录态：accessToken 是 $wbEncrypted 对象（新版客户端格式）。
+  function makeEnvelopeAuthFile(nickname: string): string {
+    const tokenPath = join(workdir, `wb-env-${nickname}.info`)
+    writeFileSync(tokenPath, JSON.stringify({
+      auth: {
+        // 密文只用占位串：这不是真凭据，也不该被误认成泄漏
+        accessToken: { $wbEncrypted: 1, envelope: 'fake-ciphertext-not-a-credential' },
+        refreshToken: { $wbEncrypted: 1, envelope: 'fake-ciphertext-not-a-credential' },
+        tokenType: 'Bearer',
+        expiresAt: Date.now() + 30 * 86400_000,
+      },
+      account: { uid: `uid-env-${nickname}`, nickname, type: 'personal' },
+    }))
+    return tokenPath
+  }
+
+  test('信封登录态 → imported=0 且 warning 点名「加密 token」，suggestions 仍给出可导对象', async () => {
+    isolateCwd()
+    const tokenPath = makeEnvelopeAuthFile('加密号')
+    const findings: Finding[] = [{
+      key: 'workbuddy', harness: 'WB', status: 'ready', detail: '',
+      suggestedProvider: { ...readyProvider('wb-auto'), credential: { apiKeyEnv: 'WB_TOKEN' } },
+      // alive=true + readHint='envelope'：登录态活着，但网关读不出明文
+      suggestedAccounts: [{ nickname: '加密号', uid: 'u-env', alive: true, tokenPath, readHint: 'envelope' }],
+    }]
+    const call = caller(build({ discover: new StubDiscover(findings) }))
+    const res = await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy' } })
+    expect(res.status).toBe(201)
+    const out = await res.json() as {
+      warnings?: string[]; suggestions?: { id: string; credentialFile: string; tokenPath: string }[]
+    }
+    // 核心：不再沉默。必须说出「一个都没进」+ 真实病因（加密信封）。
+    const why = (out.warnings ?? []).join('\n')
+    expect(why).toContain('没有任何登录态进入账号池')
+    expect(why).toContain('加密 token')
+    // suggestions 由服务端给出（id 与凭据路径不归前端推算）
+    expect(out.suggestions).toHaveLength(1)
+    expect(out.suggestions![0]!.id).toBe('workbuddy-1')
+    expect(out.suggestions![0]!.credentialFile).toBe('config/credentials/workbuddy-1-jwt')
+  })
+
+  test('全部登录态已过期 → warning 说的是「重新登录」，不是「加密」', async () => {
+    isolateCwd()
+    const a = makeAuthFile('过期号A')
+    const b = makeAuthFile('过期号B')
+    const findings: Finding[] = [{
+      key: 'workbuddy', harness: 'WB', status: 'expired', detail: '',
+      suggestedProvider: { ...readyProvider('wb-auto'), credential: { apiKeyEnv: 'WB_TOKEN' } },
+      suggestedAccounts: [
+        { nickname: '过期号A', uid: 'u1', alive: false, tokenPath: a.tokenPath },
+        { nickname: '过期号B', uid: 'u2', alive: false, tokenPath: b.tokenPath },
+      ],
+    }]
+    const call = caller(build({ discover: new StubDiscover(findings) }))
+    const out = await (await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy' } }))
+      .json() as { warnings?: string[]; suggestions?: unknown[] }
+    const why = (out.warnings ?? []).join('\n')
+    expect(why).toContain('全部已过期')
+    expect(why).toContain('重新登录')
+    expect(why).not.toContain('加密') // 病因不同就不能串台（用户要做的事不一样）
+    expect(out.suggestions).toHaveLength(0) // 过期的号不该被推荐
+  })
+
+  test('正常导入成功 → 不加「一个都没进」的 warning（修复不能制造噪音）', async () => {
+    isolateCwd()
+    const alive = makeAuthFile('正常号')
+    const findings: Finding[] = [{
+      key: 'workbuddy', harness: 'WB', status: 'ready', detail: '',
+      suggestedProvider: { ...readyProvider('wb-auto'), credential: { apiKeyEnv: 'WB_TOKEN' } },
+      suggestedAccounts: [{ nickname: '正常号', uid: 'u-ok', alive: true, tokenPath: alive.tokenPath }],
+    }]
+    const call = caller(build({ discover: new StubDiscover(findings) }))
+    const out = await (await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy' } }))
+      .json() as { warnings?: string[]; suggestions?: unknown[] }
+    expect((out.warnings ?? []).join('\n')).not.toContain('没有任何登录态进入账号池')
+    // 已入池的号不再被推荐（否则用户点了得到 409）
+    expect(out.suggestions).toHaveLength(0)
+  })
+
+  test('import-account 响应同时带平铺字段与 suggestions（过渡双写契约）', async () => {
+    isolateCwd()
+    const a = makeAuthFile('号A')
+    const b = makeAuthFile('号B')
+    const wb = mkProviderFixed({ name: 'workbuddy' })
+    const findings: Finding[] = [{
+      key: 'workbuddy', harness: 'WB', status: 'ready', detail: '',
+      suggestedAccounts: [
+        { nickname: '号A', uid: 'uA', alive: true, tokenPath: a.tokenPath },
+        { nickname: '号B', uid: 'uB', alive: true, tokenPath: b.tokenPath },
+      ],
+    }]
+    const call = caller(build({ discover: new StubDiscover(findings), providers: [wb] }))
+    const res = await call('POST', '/admin/api/discover/import-account', {
+      key: 'secret',
+      body: { key: 'workbuddy', tokenPath: a.tokenPath, accountId: 'workbuddy-1', displayName: '号A', credentialFile: 'config/credentials/workbuddy-1-jwt' },
+    })
+    expect(res.status).toBe(201)
+    const out = await res.json() as unknown as Account & {
+      account: Account; suggestions: { id: string }[]
+    }
+    // 旧契约（前端当前读的平铺字段）必须还在
+    expect(out.id).toBe('workbuddy-1')
+    expect(out.displayName).toBe('号A')
+    // 新契约：账号本体 + 剩余可导列表（刚导入的那个不在里面）
+    expect(out.account.id).toBe('workbuddy-1')
+    expect(out.suggestions.map((s) => s.id)).toEqual(['workbuddy-2'])
+  })
+})
+
+// ---- credentialState：空壳 Provider 必须在列表上就被看出来 ----
+describe('Provider 列表的 credentialState（空壳不能被当成正常）', () => {
+  test('三种引用形态 + 有账号，各自派生正确', async () => {
+    const withAccounts = mkProviderFixed({ name: 'has-acct' })
+    const missingEnv = mkProviderFixed({ name: 'missing-env' })
+    missingEnv.credential = { apiKeyEnv: 'DEFINITELY_NOT_SET_ENV_XYZ' }
+    const missingFile = mkProviderFixed({ name: 'missing-file' })
+    missingFile.credential = { apiKeyFile: 'config/credentials/does-not-exist-xyz' }
+    const noCred = mkProviderFixed({ name: 'no-cred' })
+    noCred.credential = {}
+
+    const app = build({ providers: [withAccounts, missingEnv, missingFile, noCred], accounts: [
+      { id: 'a1', providerId: withAccounts.providerId, credential: {}, status: 'available', fails: 0 },
+    ] })
+    const list = await (await caller(app)('GET', '/admin/api/providers', { key: 'secret' }))
+      .json() as { providers: (Provider & { credentialState: string; accountCount: number })[] }
+    const by = new Map(list.providers.map((p) => [p.name, p]))
+    expect(by.get('has-acct')!.credentialState).toBe('account')
+    expect(by.get('has-acct')!.accountCount).toBe(1)
+    // 这就是「采用成功但零账号」的空壳：引用了不存在的变量
+    expect(by.get('missing-env')!.credentialState).toBe('missing')
+    expect(by.get('missing-file')!.credentialState).toBe('missing')
+    expect(by.get('no-cred')!.credentialState).toBe('none')
+  })
+
+  test('凭据文件稍后才写入 → 列表立刻反映（派生而非入库，不存在过期快照）', async () => {
+    isolateCwd()
+    const p = mkProviderFixed({ name: 'late-file' })
+    const rel = 'config/credentials/late-jwt'
+    p.credential = { apiKeyFile: rel }
+    const call = caller(build({ providers: [p] }))
+    const before = await (await call('GET', '/admin/api/providers', { key: 'secret' }))
+      .json() as { providers: (Provider & { credentialState: string })[] }
+    expect(before.providers[0]!.credentialState).toBe('missing')
+
+    const abs = join(process.cwd(), rel)
+    mkdirSync(dirname(abs), { recursive: true })
+    writeFileSync(abs, 'TOKEN')
+
+    const after = await (await call('GET', '/admin/api/providers', { key: 'secret' }))
+      .json() as { providers: (Provider & { credentialState: string })[] }
+    expect(after.providers[0]!.credentialState).toBe('file')
+  })
+})
+
+// 幂等采用不能变成死路（真实死锁回归）。
+//
+// 故障链：① 首次「采用」时登录态是加密信封 → 导入被跳过，Provider 落库但池子空着；
+//        ② 用户按提示去客户端重新登录（现在有明文了），回来再点「采用」；
+//        ③ 旧实现在「Provider 已存在」处直接 200 返回，**根本不跑导入** ——
+//           用户被永久卡死，重登多少次、点多少次都进不去账号，界面看起来还正常。
+// 修法：幂等只省「建行」，不省「导账号」（导入本身按身份判重，重复导只是刷新凭据）。
+describe('幂等采用（Provider 已存在）仍会重试导入账号', () => {
+  test('首次因信封跳过 → 换成明文后再次采用 → 账号成功入池', async () => {
+    isolateCwd()
+    // 同一路径先后写入两种登录态：先信封（导不进），再明文（能导进）。
+    const tokenPath = join(workdir, 'wb-flip.info')
+    const writeEnvelope = () => writeFileSync(tokenPath, JSON.stringify({
+      auth: {
+        accessToken: { $wbEncrypted: 1, envelope: 'X' },
+        refreshToken: { $wbEncrypted: 1, envelope: 'X' },
+        expiresAt: Date.now() + 30 * 86400_000,
+      },
+      account: { uid: 'u-flip', nickname: '翻转号', type: 'personal' },
+    }))
+    writeEnvelope()
+    const findings: Finding[] = [{
+      key: 'workbuddy', harness: 'WB', status: 'ready', detail: '',
+      suggestedProvider: { ...readyProvider('wb-auto'), credential: { apiKeyEnv: 'WB_TOKEN' } },
+      suggestedAccounts: [{ nickname: '翻转号', uid: 'u-flip', alive: true, tokenPath, readHint: 'envelope' }],
+    }]
+    const call = caller(build({ discover: new StubDiscover(findings) }))
+
+    // ① 第一次采用：Provider 建起来，但一个号都没进（信封读不出明文）
+    const first = await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy' } })
+    expect(first.status).toBe(201)
+    const firstOut = await first.json() as { warnings?: string[] }
+    expect((firstOut.warnings ?? []).join('\n')).toContain('没有任何登录态进入账号池')
+    const accts1 = await call('GET', '/admin/api/accounts', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ accounts: Account[] }>)
+    expect(accts1.accounts).toHaveLength(0)
+
+    // ② 用户在客户端重新登录：现在写得出明文 token（readHint 也要跟着变）
+    const plain = `hdr.${Buffer.from(JSON.stringify({ n: 'flip' })).toString('base64url')}.sig`
+    writeFileSync(tokenPath, JSON.stringify({
+      auth: { accessToken: plain, tokenType: 'Bearer' },
+      account: { uid: 'u-flip', nickname: '翻转号', type: 'personal' },
+    }))
+    findings[0]!.suggestedAccounts![0]!.readHint = 'plaintext'
+
+    // ③ 再点一次「采用」：这次必须真的导入（Provider 已存在，但导入不能被跳过）
+    const second = await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy' } })
+    expect(second.status).toBe(200) // 幂等：还是 200，不新建
+    const accts2 = await call('GET', '/admin/api/accounts', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ accounts: Account[] }>)
+    expect(accts2.accounts).toHaveLength(1) // 关键：账号这次真的进来了
+    expect(accts2.accounts[0]!.displayName).toBe('翻转号')
+    const credFile = accts2.accounts[0]!.credential.apiKeyFile!
+    expect(readFileSync(join(process.cwd(), credFile), 'utf8')).toBe(plain)
+  })
+
+  test('幂等采用也返回 suggestions/warnings（否则前端拿不到可执行信息）', async () => {
+    isolateCwd()
+    const a = makeAuthFile('第一次号')
+    const findings: Finding[] = [{
+      key: 'workbuddy', harness: 'WB', status: 'ready', detail: '',
+      suggestedProvider: { ...readyProvider('wb-auto'), credential: { apiKeyEnv: 'WB_TOKEN' } },
+      suggestedAccounts: [{ nickname: '第一次号', uid: 'u1', alive: true, tokenPath: a.tokenPath }],
+    }]
+    const call = caller(build({ discover: new StubDiscover(findings) }))
+    await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy' } })
+
+    // 再加一个还没导的号：第二次采用应当把它带进来，并回一份空 suggestions
+    const b = makeAuthFile('第二次号')
+    findings[0]!.suggestedAccounts!.push({ nickname: '第二次号', uid: 'u2', alive: true, tokenPath: b.tokenPath })
+    const res = await call('POST', '/admin/api/discover/adopt', { key: 'secret', body: { key: 'workbuddy' } })
+    expect(res.status).toBe(200)
+    const out = await res.json() as { suggestions?: unknown[] }
+    expect(Array.isArray(out.suggestions)).toBe(true) // 字段必须存在（不能是 undefined）
+    const accts = await call('GET', '/admin/api/accounts', { key: 'secret' })
+      .then((r) => r.json() as Promise<{ accounts: Account[] }>)
+    expect(accts.accounts.map((x) => x.displayName).sort()).toEqual(['第一次号', '第二次号'])
   })
 })

@@ -26,9 +26,19 @@ export type FetchLike = typeof fetch
 
 // 国内版 / 海外版的刷新 base（域从登录态文件的 auth.domain 派生，不写死单机事实）。
 export function wbRefreshBaseOf(domain: string | undefined): string | undefined {
-  const d = (domain ?? '').trim().toLowerCase().replace(/^www\./, '')
+  const raw = (domain ?? '').trim().toLowerCase()
+  const d = raw.replace(/^www\./, '')
   if (d === 'copilot.tencent.com' || d === 'workbuddy.cn') return 'https://copilot.tencent.com'
-  if (d === 'workbuddy.ai') return 'https://workbuddy.ai'
+  // 海外版**必须保留 www**：2026-10-15 实测（本机真实 refreshToken，同一天同一秒对照）——
+  //   POST https://www.workbuddy.ai/v2/plugin/auth/token/refresh → 200，换出有效 token；
+  //   POST https://workbuddy.ai/v2/plugin/auth/token/refresh     → 302 Location: https://www.workbuddy.ai:443/
+  //     （注意 Location 里**没有路径**）→ 跟随过去拿到的是 HTML 首页，不是 JSON。
+  // 这里此前写着 `return 'https://workbuddy.ai'`（把 www 剥掉），后果是海外版的
+  // **自动刷新整条链路恒失败**：信封登录态刷不出明文 → 账号导入被跳过（imported=0）
+  // → Provider 只剩草稿里的占位 apiKeyEnv=WB_TOKEN → 用户看到「环境变量 WB_TOKEN
+  // 未设置」，被告知去配环境变量或跑一次客户端重登。真实病因只是少了一个 www。
+  // 国内版无此问题（copilot.tencent.com 无 www 变体），所以这条只在 ai 分支生效。
+  if (d === 'workbuddy.ai') return 'https://www.workbuddy.ai'
   return undefined
 }
 

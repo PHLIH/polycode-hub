@@ -316,13 +316,33 @@ describe('探针：账号全不可用时绝不回落打占位凭据', () => {
 describe('凭据缺失文案：账号全不可用时补一句账号池真相', () => {
   const p = wbProvider('https://www.workbuddy.ai/v2')
 
-  test('不传账号（或全可用）→ 文案与历史逐字一致（issue #1 用例在守这条）', () => {
-    expect(missingCredentialMessage(p)).toBe(
-      '环境变量 WB_TOKEN 未设置 provider=workbuddy-ai'
-      + '（先 export WB_TOKEN=... 并重启网关，或到 Providers 点「一键导入」把桌面登录态导入账号池）')
-    expect(missingCredentialMessage(p, [])).toBe(missingCredentialMessage(p))
+  test('session-reuse 源零账号 → 先指向「一键导入」并说明占位变量的性质（不再把 export 排第一）', () => {
+    // 这条曾经锁的是旧文案「环境变量 WB_TOKEN 未设置（先 export …）」。
+    // 2026-10-15 改：真实用户（只装海外版、token 是加密信封）就是照着那句
+    // 「先 export WB_TOKEN=...」配了半天——他手上根本没有那个 token。该变量的
+    // 真实身份是「导入成功后会被凭据文件取代」的占位引用（见 wbSuggestedProvider），
+    // 所以对 session-reuse 源必须先说「去导入」，并说明导入结果为 0 时该看什么。
+    // 不变的部分（issue #1 守的）：仍点名 WB_TOKEN、仍给出可执行动作、不回传上游 HTML。
+    const msg = missingCredentialMessage(p)
+    expect(msg).toContain('WB_TOKEN') // 仍点名缺的是哪个引用
+    expect(msg).toContain('本机还没有该 Provider 的账号')
+    expect(msg).toContain('一键导入')
+    expect(msg).toContain('加密信封') // 导入结果为 0 的头号原因，必须说
+    expect(msg).not.toContain('<html') // issue #1：绝不把上游 HTML 当「鉴权失败」
+    // 账号全可用时不该说「还没有账号」
     expect(missingCredentialMessage(p, [wbAccount({ status: 'available' })]))
-      .toBe(missingCredentialMessage(p))
+      .toContain('环境变量 WB_TOKEN 未设置')
+  })
+
+  test('非 session-reuse 源零账号 → 文案与历史逐字一致（issue #1 用例在守这条）', () => {
+    // 官方 key 型 Provider 确实就是「去环境变量里配」，旧文案对它是准确的。
+    const official: Provider = {
+      ...p, accessKind: 'official', name: 'company-gw',
+    }
+    expect(missingCredentialMessage(official)).toBe(
+      '环境变量 WB_TOKEN 未设置 provider=company-gw'
+      + '（先 export WB_TOKEN=... 并重启网关，或到 Providers 点「一键导入」把桌面登录态导入账号池）')
+    expect(missingCredentialMessage(official, [])).toBe(missingCredentialMessage(official))
   })
 
   test('全部不可用 → 原动作保留 + 追加账号池真相（两种病因可能并存，不能丢一个）', () => {

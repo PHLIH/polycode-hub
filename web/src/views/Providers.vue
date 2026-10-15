@@ -5,6 +5,10 @@ import { api } from '../api.js'
 import { useSidecar } from '../sidecarJob'
 import ProviderCard from './ProviderCard.vue'
 
+// 卡片上的「去发现页重新导入」需要切页。本应用没有 vue-router，视图由 App.vue 的
+// view ref 控制，所以用与 Discover.vue 同一套自定义事件上抛（@navigate）。
+const emit = defineEmits(['navigate'])
+
 const list = ref([])
 const err = ref('')
 const dialog = ref(false)
@@ -738,7 +742,8 @@ async function adoptModels() {
 
   <ProviderCard v-for="p in visibleProviders" :key="p.providerId" :p="p" :egresses="egressOptions"
     :testing="testing === p.providerId" :test-res="testRes[p.providerId]"
-    @test="test" @reload="load" @models="openModels" @edit="openEdit" @remove="remove" />
+    @test="test" @reload="load" @models="openModels" @edit="openEdit" @remove="remove"
+    @discover="emit('navigate', 'discover')" />
 
   <!-- 已删除：软删的行不在主列表里，但会永久留在库中（历史用量靠 providerId 回溯）。
        给一个折叠区让用户看得到、也能真的清掉——否则它们只增不减且完全不可见。 -->

@@ -313,14 +313,21 @@ const scGuardTip = computed(() => {
 onMounted(() => rescan(false)) // 首次加载走缓存，秒出；点「重新扫描」才实时探测
 onMounted(loadSidecar)
 
+// 导入失败的原因要能**留在页面上**：ElMessage 几秒后就消失，用户回头看不到病因，
+// 只能再点一次、再失败一次。这里按 finding 记一条持久提示，导入成功才清掉。
+// （触发场景很具体：登录态是加密信封、网关读不出明文时，后端回的就是「加密信封」原话。）
+const importError = ref({})
+
 // 导入共存登录态进账号池：token 由服务端读取落盘（不经过前端）。
 const importing = ref('')
 async function importAccount(f, a) {
-  // id 取池子里下一个空闲编号，前缀与后端 shortAccountPrefix 对齐：
-  // workbuddy（国内版）/ workbuddy-ai（海外版）/ 其余按 key。此前前端恒用 `wb-N`，
-  // 与后端 `${key}-N` 口径不一致，两版账号混在同一个命名空间里也看不出归属。
-  const id = nextAccountId(f.key)
-  const credFile = `config/credentials/${id}-jwt`
+  // id 与凭据路径一律用**服务端给的那一份**（suggestions 里带上），不再由前端遍历
+  // 池子推算。历史上前端自己算（nextAccountId 取第一个空闲编号），与后端的判重
+  // 各算一次必然漂移：池里有 workbuddy-1、workbuddy-3 时前端算出 workbuddy-2，
+  // 而两个标签页同时点同一个号也会算出同一个 id。
+  const sug = suggestionsOf(f).find(s => s.tokenPath === a.tokenPath)
+  const id = sug ? sug.id : a.tokenPath
+  const credFile = sug ? sug.credentialFile : `config/credentials/${id}-jwt`
   importing.value = a.tokenPath
   try {
     const acct = await api.importDiscoveredAccount({
@@ -329,10 +336,40 @@ async function importAccount(f, a) {
       credentialFile: credFile
     })
     ElMessage.success(`已导入账号「${acct.displayName}」进账号池（${acct.id}）`)
-    await rescan()
+    // 导入响应带回新的 suggestions（刚导入那个已不在里面）。就地更新而不是整页重扫：
+    // rescan 会重新触发 zen 的联网探测（固有 2~8 秒），导入一个号不该等那个。
+    if (Array.isArray(acct.suggestions)) setSuggestions(f, acct.suggestions)
     await loadPool() // 刷新池子：按钮随即变「已在账号池」，重复点击不再 409
-  } catch (e) { ElMessage.error(e.message) }
+  } catch (e) {
+    ElMessage.error(e.message)
+    // 只在「读不出凭据」类失败下留持久提示：那是需要用户去重登客户端的动作，
+    // 而不是网络抖动那种重试一下就可能过的（后者靠 ElMessage 就够）。
+    const m = String(e && e.message || '')
+    if (m.includes('加密信封') || m.includes('读取登录态失败') || m.includes('不含有效 accessToken')) {
+      importError.value = {
+        ...importError.value,
+        [f.key]: `${m}——解决：在 WorkBuddy 桌面端重新登录一次（客户端会写出可读登录态），`
+          + `或自行取得 token 后填进 config/credentials/ 下的凭据文件`,
+      }
+    }
+  }
   finally { importing.value = '' }
+}
+
+// 服务端下发的导入建议（{tokenPath,id,credentialFile,nickname}）。
+// 按 finding key 存：adopt / import-account 的响应都会带一份，用响应里的更新本地缓存，
+// 使按钮显示的 id 始终与将真正写入的一致。
+const suggestions = ref({})
+function suggestionsOf(f) {
+  if (suggestions.value[f.key]) return suggestions.value[f.key]
+  return (f.suggestions || [])
+}
+// 这一行登录态对应的导入建议（没有 = 已在池里 / 已过期，不该再推荐）。
+function sugOf(f, a) {
+  return suggestionsOf(f).find(s => s.tokenPath === a.tokenPath)
+}
+function setSuggestions(f, list) {
+  suggestions.value = { ...suggestions.value, [f.key]: list }
 }
 
 // 已在账号池的账号（避免重复导入）
@@ -361,18 +398,10 @@ function imported(a) {
   return rows.some(x => x.displayName === a.nickname)
 }
 
-// 账号 id 前缀：与后端 shortAccountPrefix 同口径（workbuddy / workbuddy-ai / key）。
-// 两版分开编号，账号页一眼能看出这个号属于哪一版。
-function accountPrefix(key) {
-  return key || 'workbuddy'
-}
-
-function nextAccountId(key) {
-  const prefix = accountPrefix(key)
-  for (let n = 1; ; n++) {
-    if (!pool.value.some(x => x.id === `${prefix}-${n}`)) return `${prefix}-${n}`
-  }
-}
+// 账号 id 前缀与「下一个空闲编号」的推算已**移到服务端**（discover_api.importSuggestions）。
+// 前端自己算的问题：与后端的判重各算一次必然漂移（池里有 workbuddy-1、workbuddy-3 时
+// 前端算出 workbuddy-2；两个标签页同时点同一个号也会算出同一个 id 而撞 409）。
+// 现在前端只负责展示服务端给的那一份 suggestions。
 
 async function adopt(f) {
   adopting.value = f.key
@@ -382,13 +411,23 @@ async function adopt(f) {
     // 后端返回的是 Provider 本体（字段是 name / providerId，没有 id）：
     // 以前读 p.id 恒 undefined，采用成功也弹「已采用为 Provider「undefined」」。
     const label = `${p.name} (#${p.providerId})`
-    ElMessage.success(accts > 0
-      ? `已采用为 Provider「${label}」，${accts} 个登录态已入账号池，去 Provider 页确认模型`
-      : `已采用为 Provider「${label}」，去 Provider 页确认模型`)
+    // 提示必须区分「真的有号入池」与「采用成功但池子还是空的」：
+    // 后者是空壳 Provider（调用时报环境变量未设置的那个），把它说成「N 个登录态已入池」
+    // 会让用户以为配好了。以前只看「发现到几个活的」而不是「真的导进去几个」。
+    const still = Array.isArray(p.suggestions) ? p.suggestions.length : 0
+    if (still === 0) {
+      ElMessage.success(accts > 0
+        ? `已采用为 Provider「${label}」，${accts} 个登录态已入账号池，去 Provider 页确认模型`
+        : `已采用为 Provider「${label}」，去 Provider 页确认模型`)
+    } else {
+      ElMessage.warning({ message: `已采用为 Provider「${label}」，但还有 ${still} 个登录态未入账号池——点下方「导入账号池」完成`, duration: 8000 })
+    }
+    // 服务端给了还能导的号（含 id/凭据路径），供按钮直接使用。
+    if (Array.isArray(p.suggestions)) setSuggestions(f, p.suggestions)
     // 同 Providers.vue：ElMessage 第二个位置参数是 appContext 而非选项，
     // { duration } 必须包进第一个参数对象，否则抛
     // 「Object prototype may only be an Object or null: undefined」。
-    for (const w of p.warnings || []) ElMessage.warning({ message: w, duration: 6000 })
+    for (const w of p.warnings || []) ElMessage.warning({ message: w, duration: 8000 })
     await Promise.all([rescan(), loadPool()])
   } catch (e) { ElMessage.error(e.message) }
   finally { adopting.value = '' }
@@ -561,20 +600,43 @@ function gotoProviders() {
         <ul v-if="(f.actions || []).length" class="finding-actions">
           <li v-for="a in f.actions" :key="a">{{ a }}</li>
         </ul>
-        <div v-if="(f.suggestedAccounts || []).length > 1" class="co-accounts">
-          <p class="co-title">本机共存登录态（{{ f.suggestedAccounts.length }} 个，{{ f.suggestedAccounts.filter(a => a.alive).length }} 个有效）：</p>
+        <!-- 登录态区块的渲染条件：**只要有一个就渲染**。
+             曾经是 `length > 1`（只服务「多账号共存」），于是只装了一个版本的
+             用户——恰恰是最常见的形态——页面上根本没有「导入账号池」这个入口，
+             采用之后 Provider 空着、一个号都没进池，用户被卡死在那里。
+             多账号只是把这个区块变得更必要，不是它存在的前提。 -->
+        <div v-if="(f.suggestedAccounts || []).length > 0" class="co-accounts">
+          <p class="co-title">
+            {{ (f.suggestedAccounts || []).length === 1
+              ? `本机登录态（1 个${f.suggestedAccounts[0].alive ? '，有效' : '，已过期'}）：`
+              : `本机共存登录态（${f.suggestedAccounts.length} 个，${f.suggestedAccounts.filter(a => a.alive).length} 个有效）：` }}
+          </p>
           <div v-for="(a, i) in f.suggestedAccounts" :key="a.tokenPath" class="co-account">
             <span class="dot" :class="a.alive ? 'ok' : 'warn'"></span>
             <span class="co-name">{{ a.nickname }}</span>
             <!-- 版本徽标：国内版/海外版 token 互不通用，用户必须看得见自己在导哪一版 -->
             <span v-if="a.realm" class="realm-badge" :class="a.realm">{{ realmLabel(a.realm) }}</span>
             <span class="dim">{{ a.alive ? `有效期至 ${a.expiresAt}` : '已过期' }}</span>
-            <button class="linklike" :disabled="importing === a.tokenPath || !a.alive || imported(a)"
+            <!-- 加密 token 徽标：这是「导入为什么为 0」的头号原因，必须写在导入口旁边。
+                 没有它，用户点完导入看到失败也不知道该干什么（真实反馈：试了几次都不行）。 -->
+            <span v-if="a.readHint === 'envelope'" class="read-badge"
+              title="新版客户端把 token 存成加密信封，网关读不出明文；若没有可用的明文 refreshToken，导入会被跳过。在 WorkBuddy 桌面端重新登录一次即可写出可读登录态">
+              加密 token（需重登刷新）
+            </span>
+            <span v-else-if="a.readHint === 'unreadable'" class="read-badge warn"
+              title="登录态文件读不出可用凭据（文件不可读或格式不认识）。先确认文件权限，或重新登录客户端">
+              读取失败
+            </span>
+            <button class="linklike"
+              :disabled="importing === a.tokenPath || !a.alive || imported(a) || !sugOf(f, a)"
+              :title="!a.alive ? '登录态已过期：先在客户端重新登录' : (!sugOf(f, a) ? '该登录态已在账号池（无需重复导入）' : `将写入 ${sugOf(f, a).credentialFile}`)"
               @click="importAccount(f, a)">
-              {{ imported(a) ? '已在账号池' : importing === a.tokenPath ? '导入中…' : '导入账号池' }}
+              {{ imported(a) || !sugOf(f, a) ? '已在账号池' : importing === a.tokenPath ? '导入中…' : `导入账号池（${sugOf(f, a).id}）` }}
             </button>
           </div>
           <p class="field-hint">token 由服务端直接从登录态文件读取落盘（0600），不经过浏览器。</p>
+          <!-- 持久化的导入失败原因：ElMessage 消失后用户还能看到该怎么办 -->
+          <p v-if="importError[f.key]" class="import-error">{{ importError[f.key] }}</p>
         </div>
       </div>
       <!-- 采用按钮的显示条件：**只要本机发现了、且有可用草稿就给**。
@@ -690,6 +752,17 @@ function gotoProviders() {
   border: 1px solid var(--line); color: var(--dim);
 }
 .realm-badge.ai { color: var(--accent); border-color: var(--accent); }
+/* 加密 token / 读取失败徽标：与版本徽标同一视觉语言（细边框小胶囊），
+   但用警示色——它描述的是「这个号现在导不进来」这个需要动作的状态。 */
+.read-badge {
+  font-size: 11px; padding: 1px 6px; border-radius: 4px; flex: none;
+  border: 1px solid var(--warn, #b8860b); color: var(--warn, #b8860b);
+}
+.read-badge.warn { border-color: var(--bad, #c0392b); color: var(--bad, #c0392b); }
+.import-error {
+  margin: 6px 0 0; font-size: 12px; line-height: 1.5;
+  color: var(--bad, #c0392b); white-space: pre-wrap;
+}
 .co-account .linklike { font-size: 12px; }
 
 /* 自定义引擎接口规格：默认收起，点开是「方法 + 路径 + 用途」三列清单 + JSON 样例。

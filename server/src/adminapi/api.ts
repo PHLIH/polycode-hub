@@ -317,8 +317,52 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
   })
 
   app.get('/admin/api/providers', (c) => {
-    return ok(c, 200, { providers: providers.list() })
+    // 列表页除了 Provider 本体，额外下发两个**派生事实**（不入库、不参与写路径）：
+    //   accountCount  —— 名下账号数（含不可用的）。
+    //   credentialState —— 这个 Provider 此刻到底能不能鉴权。
+    //
+    // 为什么必须由服务端算：这是「采用成功后一个号都没导进来」的唯一可观测信号，
+    // 而它取决于三处本地状态（账号表、进程环境变量、凭据文件是否存在），前端
+    // 只能靠再发两个请求去拼，而且拼出来的口径随时会和真实转发不一致
+    // （真实判定在 gateway/proxy + router/upstream，两条路径各算一次必然漂移）。
+    // 派生而非入库：它是状态不是配置，落库就要处理「凭据文件后来才被写入」
+    // 这类过期快照（真实场景：先用「一键导入」写文件，Provider 行不变）。
+    // 注意：**不过滤 deleted**。软删的行必须继续出现在列表里——历史用量归因靠它
+    // 回溯 providerId，而前端自己按 state !== 'deleted' 分区展示（主列表 vs 折叠区），
+    // 过滤/展示是两件事，列表端点过滤过一次就再也拿不回来。
+    const rows = providers.list()
+    const all = accounts.list()
+    const providersView = rows.map((p) => {
+      const mine = all.filter((a) => a.providerId === p.providerId)
+      return {
+        ...p,
+        accountCount: mine.length,
+        credentialState: credentialStateOf(p, mine),
+      }
+    })
+    return ok(c, 200, { providers: providersView })
   })
+
+  // 一个 Provider 能否鉴权的派生状态（单一真相，供上面的列表端点与测试共用）。
+  //   account   —— 有账号（鉴权走账号池，转发时轮询取号凭据）
+  //   file      —— 凭据引用是文件且此刻真的读得到
+  //   env       —— 凭据引用是环境变量且此刻真的读到值
+  //   missing   —— **无法鉴权**：引用了不存在的变量/文件，且名下没有账号
+  //   none      —— 本就不需要鉴权（credential 为空）
+  //
+  // missing 是最要紧的一档：它对应「采用成功但一个号都没导进来」的空壳状态。
+  // 这种 Provider 在列表里长得和正常的一模一样，用户只能等调用时报错才发现，
+  // 而报错文案（missingCredentialMessage）说的是具体的变量名——用户看不出
+  // 「这个源本来就不该手工配变量」。标出来才能把入口指回发现页。
+  function credentialStateOf(p: Provider, mine: Account[]): 'account' | 'file' | 'env' | 'missing' | 'none' {
+    if (mine.length > 0) return 'account'
+    const cr = p.credential ?? {}
+    if (!cr.apiKeyFile && !cr.apiKeyEnv) return 'none'
+    const [value, resolved] = credentialResolve(cr, (name) =>
+      process.env[name] === undefined ? ['', false] : [process.env[name]!, true])
+    if (cr.apiKeyFile) return resolved && value !== '' ? 'file' : 'missing'
+    return resolved && value !== '' ? 'env' : 'missing'
+  }
 
   // 凭证明文按需查看：列表页永远只下发引用（防泄漏锚点见 adminapi.test.ts），
   // 明文只在这个显式端点返回，且调用方必须是已通过 withAuth 的管理面。

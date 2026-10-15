@@ -1010,9 +1010,24 @@ export function missingCredentialMessage(p: Provider, accts?: Account[]): string
       + `（先确认文件存在且可读；Discover「一键导入」会把桌面登录态写入该文件）`
   }
   const env = p.credential.apiKeyEnv ?? ''
+  const zeroAccounts = !accts || accts.length === 0
+  // 复用登录态的源（WorkBuddy 等）且**名下零账号**：这是「导入根本没成功」的形态，
+  // 必须先指向「去导入」，而不是让用户去 export 一个占位变量。
+  //
+  // 为什么顺序关键：这类源的 Provider 草稿由发现页生成，凭据引用（WB_TOKEN）只是
+  // 「导入成功后会被凭据文件取代」的占位（见 discover.wbSuggestedProvider），用户手上
+  // 根本没有那个变量。旧文案把「先 export」放在第一位，真实用户照着他配了半天也没用，
+  // 真正的动作（回发现页看导入为什么是 0 个）被排在后面。
+  // 不说死「千万不要 export」：手写配置的用户确可能真配了这个变量。
+  if (p.accessKind === 'session-reuse' && zeroAccounts && env !== '') {
+    return `本机还没有该 Provider 的账号 provider=${p.name}（凭据 ${env} 未设置；`
+      + `该源复用桌面登录态，凭据通常由「一键导入」写进 config/credentials/ 下的文件，一般不必手工 export 环境变量）`
+      + `。先到发现页点「一键导入」——若导入结果为 0：新版客户端把 token 存成加密信封（网关读不出明文），`
+      + `需先在 WorkBuddy 桌面端重新登录一次再导；发现页每行会给出该号被跳过的具体原因`
+  }
   const base = `环境变量 ${env} 未设置 provider=${p.name}`
     + `（先 export ${env}=... 并重启网关，或到 Providers 点「一键导入」把桌面登录态导入账号池）`
-  if (!accts || accts.length === 0) return base
+  if (zeroAccounts) return base
   const now = new Date()
   const summary = accountUnavailableSummary(accts, now)
   // 只要还有至少一个可用账号，凭据就不该走到这（"全不可用"才是要补充说明的情形）。

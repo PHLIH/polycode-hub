@@ -110,6 +110,14 @@ export interface DiscoveredAccount {
   // 账号必须按它归属到对应 Provider，混池会让一半请求注定 401。
   // 非 WorkBuddy 来源（zen 等）为 undefined。
   realm?: 'cn' | 'ai'
+  // 这份登录态「能不能被网关读出明文 token」——**事实**，不是猜测：
+  //   plaintext  = 明文 accessToken，可直接入池转发；
+  //   envelope   = 新版客户端的加密信封（{"$wbEncrypted":1,…}），网关没有解密
+  //                密钥，只能靠明文 refreshToken 走官方刷新链路换新 token；
+  //   unreadable = 读不出（文件不可读/格式不认识）。
+  // 为什么必须一路带到前端：导入结果为 0 时，「没装客户端」「装了但要重登」
+  // 「读得出只是过不了探测」对用户是完全不同的三件事，只报「导入 0 个」等于没说。
+  readHint?: 'plaintext' | 'envelope' | 'unreadable'
 }
 
 // 一条发现结果（JSON 可序列化，无密钥）。这是全仓唯一定义——发现层产出、
@@ -126,6 +134,20 @@ export interface Finding {
   suggestedAccounts?: DiscoveredAccount[]
   // 已接管该登录态的 Provider：内部数字 id（前端据此定位/删除那一行）。
   adoptedProviderId?: number
+  // 还能导入哪些登录态（服务端定好 id 与凭据文件路径）。
+  // 前端不再自己推算编号：两处各算一次必然漂移（池里已有 workbuddy-1、workbuddy-3
+  // 时前端可能算出 workbuddy-2；两个标签页同点一个号也会撞 409）。
+  // 已在账号池的号不出现在这里（否则用户点了得到 409），过期的也不列（导了必 401）。
+  suggestions?: ImportSuggestion[]
+}
+
+// 一条导入建议：token 路径 → 该用的账号 id 与凭据文件。
+// 三处（发现列表 / adopt / import-account 响应）共用这个形状，口径只有一份。
+export interface ImportSuggestion {
+  tokenPath: string
+  id: string
+  credentialFile: string
+  nickname: string
 }
 
 // DiscoverSource 提供本机 harness 发现。
