@@ -96,10 +96,21 @@ export function mapUpstreamError(ue: UpstreamError | undefined, sentEffort?: str
     case UPSTREAM.NETWORK: return irError(ERR.OVERLOADED, '上游不可达: ' + ue.message)
     // 指纹缺失不是「上游故障」而是「本地没配」：必须给可执行动作，
     // 否则用户只拿到一句英文 403，不知道该去 Provider 头里配什么。
-    case UPSTREAM.FINGERPRINT: return irError(ERR.AUTHENTICATION,
-      '上游只接受官方客户端指纹（免费档限制）: ' + ue.message
-      + '；先在本机跑一次 opencode（如 opencode run "hi"）产生新鲜会话，再调 POST /admin/api/providers/:pid/refresh-fingerprint 自动续上（或在 Provider 头里手填真实 x-opencode-session，会话过期后需重填；客户端自带的会话/UA 头网关一律忽略，只用网关静态配置）'
-      + '；另：zen 免费档要求流式 agent 体裁（含 read/bash 工具声明 + tool_choice），网关转发时已自动补工具声明，非流式调用则在内部改走流式上游并拼包返回，无需客户端配合')
+    case UPSTREAM.FINGERPRINT: {
+      // 上游把多种互不相干的拒绝压成同一句 403 FreeTierError，而旧文案笃定
+      // 「就是缺指纹」并只给「去跑一次 opencode」——对 baseURL 还在 /zen、
+      // UA/孪生头不匹配、体裁不对这三种病因，用户按指引做多少遍都不会变
+      // （他本来就是照着这句做的）。所以本地体检有具体结论时**先说具体项**，
+      // 没有才回落通用指引（见 upstream.zenPreflightReasons 的实测矩阵）。
+      const why = (ue.details ?? []).length > 0
+        ? `本地体检发现 ${ue.details!.length} 项不满足（这几项不需要跑客户端就能修）：`
+          + ue.details!.map((d, i) => `\n  ${i + 1}) ${d}`).join('')
+        : ''
+      return irError(ERR.AUTHENTICATION,
+        '上游只接受官方客户端指纹（免费档限制）: ' + ue.message
+        + (why !== '' ? why : '；先在本机跑一次 opencode（如 opencode run "hi"）产生新鲜会话，再调 POST /admin/api/providers/:pid/refresh-fingerprint 自动续上（或在 Provider 头里手填真实 x-opencode-session，会话过期后需重填；客户端自带的会话/UA 头网关一律忽略，只用网关静态配置）')
+        + '；另：zen 免费档要求流式 agent 体裁（含 read/bash 工具声明 + tool_choice），网关转发时已自动补工具声明，非流式调用则在内部改走流式上游并拼包返回，无需客户端配合')
+    }
     // 地区限制同理：不是「模型没了」也不是「Key 错了」，而是出口 IP 不在可用地区。
     // 不给这句指引，用户会以为模型下线了。
     case UPSTREAM.REGION: return irError(ERR.AUTHENTICATION,

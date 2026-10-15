@@ -7,7 +7,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { Provider } from '../model/index.ts'
-import { mintZenRequestId, reconcileCatalogModels, wbAuxEndpointIdentityHeaders, workBuddyRealmOfIssuer } from '../model/index.ts'
+import { mintZenRequestId, mintZenSessionPool, reconcileCatalogModels, wbAuxEndpointIdentityHeaders, workBuddyRealmOfIssuer, ZEN_POOL_MAX, ZEN_SESSION_POOL_HEADER, ZEN_UA_DEFAULT } from '../model/index.ts'
 import type { Finding } from '../adminapi/types.ts'
 import type { IrRequest, ToolDef } from '../ir/types.ts'
 
@@ -788,39 +788,46 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 // ---- OpenCode Zen（连通性探针，无需凭据） ----
 
 // fp：从本机 opencode 日志自动识别出的指纹（没有则 undefined）。
-// 有就把真实 UA + 会话直接写进草稿——新用户「一键导入」即可用，不需要手抄任何东西。
-// 没有也不伪造：留空头，由「opencode 做客户端时的透传 / ZEN_UA / 静态配置」兜底。
-// 头集合与真客户端对齐（2026-09-18 取证，2026-10-15 补录 session-id）：
+// 有就用真实 UA + 会话；没有则**现铸一池会话与 UA**——上游只校验形状与
+// 数值下界，不验真伪（见 model.mintZenSessionId），所以没装过 opencode 的
+// 用户也能直接可用，不再需要「先跑一次客户端」。
+// 头集合与真客户端对齐（2026-09-18 取证，2026-10-15 补录 session-id + 实测 UA 下限）：
 // x-opencode-* 头必带（上游要求 x-opencode-session；UA ≥ 1.19.0 时还要求
-// x-opencode-session-id 且两者同值，见 model.ZEN_SESSION_ID_HEADER）。
+// x-opencode-session-id 且两者同值，见 model.ZEN_SESSION_ID_HEADER）；
+// UA 另有**最低版本**要求（< 1.18.0 回 426 UpgradeRequired），故不能留空。
 function zenSuggestedProvider(baseURL: string, fp?: OpenCodeFingerprint | null): Provider {
+  // 现铸池：本机没指纹时用它顶上（限流按会话算，池有一定宽度才能均摊）。
+  // 有指纹时仍以真会话为主，但池也补足——真会话数量随用户使用变化，
+  // 只有一两个时照样会被单会话窗口卡住。
+  const minted = mintZenSessionPool(ZEN_POOL_MAX)
+  const sid = fp?.sessionID ?? minted[0]!
+  const pool = fp ? [fp.sessionID, ...minted].slice(0, ZEN_POOL_MAX) : minted
   return {
     providerId: 0, name: 'opencode', state: 'active' as const, displayName: 'Zen免费档（自动发现）',
     accessKind: 'reverse', risk: 'high',
-    riskNote: '逆向客户端指纹；免费档限流按会话（x-opencode-session）而非 IP，网关用会话池自动轮换；指纹优先用本机 opencode 客户端的真实运行记录自动识别，识别不到时才需要手动配置',
+    riskNote: '逆向客户端指纹；免费档限流按会话（x-opencode-session）而非 IP，网关用会话池自动轮换；指纹优先用本机 opencode 客户端的真实运行记录自动识别，识别不到时现铸（上游只校验形状，见 model.mintZenSessionId）',
     stability: 'beta', api: 'openai-completions',
     baseUrl: baseURL.replace(/\/+$/, '') + '/v1',
     credential: { apiKeyEnv: 'ZEN_KEY' },
     headers: {
       // 指纹优先级（见 upstream.applyZenFingerprint）：
-      //   会话：客户端透传 > 静态 x-opencode-session > 旧 x-session-id；
-      //   UA：静态头已配的不动（显式配置优先），缺时按 透传 > ZEN_UA 补。
-      // 自动识别到的就是「本机 opencode 真实发过的样子」，与手工抓包等价。
-      // 注意：只写 opencode/<版本> 这一段 UA——中间两段是 opencode 内部依赖版本，
-      // 日志里没有也无从可靠推断；实测这一段足够（测试有锚点）。不编造版本号。
-      ...(fp ? {
-        'User-Agent': fp.userAgent,
-        'x-opencode-client': 'cli',
-        'x-opencode-project': 'global',
-        'x-opencode-session': fp.sessionID,
-        // 孪生头：UA ≥ 1.19.0 时上游必查，且必须与 session 同值。
-        'x-opencode-session-id': fp.sessionID,
-        'x-opencode-request': mintZenRequestId(),
-        // x-session-id 附带（旧工具链可能读它；实测多带无害）。
-        // ⚠️ 不要加 x-session-affinity：2026-10-15 实测它是毒头，带则恒 403
-        // （官方客户端从不发它，上游拿它当「非官方客户端」判据）。见 applyZenFingerprint。
-        'x-session-id': fp.sessionID,
-      } : {}),
+      //   会话：静态 x-opencode-session > 旧 x-session-id（客户端透传一律忽略，网关权威）。
+      //   UA：静态头已配的不动（显式配置优先），缺时按 ZEN_UA > ZEN_UA_DEFAULT 补。
+      // 有本机指纹时写的就是「本机 opencode 真实发过的样子」，与手工抓包等价；
+      // 没有则是现铸值（与真值等效，见 model.mintZenSessionId 的取证）。
+      'User-Agent': fp?.userAgent ?? ZEN_UA_DEFAULT,
+      'x-opencode-client': 'cli',
+      'x-opencode-project': 'global',
+      'x-opencode-session': sid,
+      // 孪生头：UA ≥ 1.19.0 时上游必查，且必须与 session 同值。
+      'x-opencode-session-id': sid,
+      'x-opencode-request': mintZenRequestId(),
+      // x-session-id 附带（旧工具链可能读它；实测多带无害）。
+      // ⚠️ 不要加 x-session-affinity：2026-10-15 实测它是毒头，带则恒 403
+      // （官方客户端从不发它，上游拿它当「非官方客户端」判据）。见 applyZenFingerprint。
+      'x-session-id': sid,
+      // 会话池（网关内网头，出站前剥掉）：首打 sid，其余轮换用。
+      [ZEN_SESSION_POOL_HEADER]: pool.join(','),
     },
     priority: 1,
     // 模型目录**不预填任何模型名**（同 wbSuggestedProvider 的教训）。

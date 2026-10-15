@@ -168,7 +168,7 @@ describe('refreshZenProvider', () => {
     }
   })
 
-  test('已是最新则不写不断言；本地无会话则给重登指引', () => {
+  test('已是最新则不写不断言；本地无会话则现铸一池（不再要求先跑客户端）', () => {
     const dir = writeLogDir(mkdtempSync(join(tmpdir(), 'zenfp-')), FP_LOG)
     try {
       // 会话池头也要在才算“全齐”——池是新增维度（限流按会话算，多会话轮换），
@@ -190,11 +190,18 @@ describe('refreshZenProvider', () => {
       expect(rep.updated).toBe(false)
       expect(notified).toBe(0)
 
+      // 本机无日志（用户没装/没用过 opencode）：旧行为是“不写 + 给重登指引”，
+      // 现在直接现铸一池会话写回——上游只校验形状与低12位下界、不验真伪
+      // （见 model.mintZenSessionId），所以不再需要“先跑一次客户端”那一步。
       const empty = mkdtempSync(join(tmpdir(), 'zenfp-empty-'))
       try {
         const rep2 = refreshZenProvider(store, () => {}, id, [empty])
-        expect(rep2.updated).toBe(false)
-        expect(rep2.next).toBe(NO_LOCAL_FINGERPRINT_NEXT)
+        expect(rep2.updated).toBe(true)
+        expect(rep2.next).toBeUndefined() // 不再有“先去跑客户端”的指引
+        const after = store.get(id)!.headers!
+        expect(after['x-opencode-session']).toMatch(/^ses_[0-9a-f]{12}[A-Za-z0-9]{14}$/)
+        expect(after['x-opencode-session-id']).toBe(after['x-opencode-session'])
+        expect(parseZenSessionPool(after).length).toBeGreaterThan(1) // 现铸的是一池
       } finally {
         rmSync(empty, { recursive: true, force: true })
       }
@@ -421,8 +428,8 @@ describe('refreshZenProvider 同步 UA（网关权威后客户端 UA 不再补�
 // 不是按 IP——同一会话连打十轮 xhigh 必 429，而本机 opencode 多窗口没事。
 // 网关把本机全部真实会话收进池轮换，等效多窗口。
 describe('会话池：收集本机全部会话并轮换', () => {
-  const S1 = 'ses_aaaa1111bbbb2222cccc3333'
-  const S2 = 'ses_dddd4444eeee5555ffff6666'
+  const S1 = 'ses_aaaa1111bffeaaaaaaaaaaaaaa'
+  const S2 = 'ses_dddd4444effeaaaaaaaaaaaaaa'
   const POOL_LOG = [
     `timestamp=2026-09-18T00:00:01Z level=INFO message=created id=${S1} slug=x version=1.18.29 projectID=global directory=/private/tmp path=private/tmp`,
     `timestamp=2026-09-18T00:00:03Z level=INFO message=stream providerID=opencode modelID=mimo-v2.5-free session.id=${S1} small=false`,
@@ -614,8 +621,8 @@ describe('会话池：收集本机全部会话并轮换', () => {
 // （多半正是刚淘汰的坏会话）、补位曾只进内存不写库（下次 sync 即被剔除）。
 // 本组用既有 s1.opencode.ai + fetch 劫持套路钉死新语义。
 describe('会话池轮询与写库（A-P0-1/A-P0-2/A-P1-4/A-P1-6 回归）', () => {
-  const S1 = 'ses_aaaa1111bbbb2222cccc3333'
-  const S2 = 'ses_dddd4444eeee5555ffff6666'
+  const S1 = 'ses_aaaa1111bffeaaaaaaaaaaaaaa'
+  const S2 = 'ses_dddd4444effeaaaaaaaaaaaaaa'
   const POOL = [S1, S2]
   // 各用例独立 providerId：游标/失败/淘汰全按 providerId 隔离，互不串状态。
   const PID = { round: 911, quota: 912, empty: 913, refill: 914 }

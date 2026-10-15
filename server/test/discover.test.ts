@@ -1087,12 +1087,33 @@ describe('opencode 指纹自动识别', () => {
     expect(JSON.stringify(f.actions)).not.toContain('抓包')
   })
 
-  test('识别不到指纹时不伪造任何头', async () => {
+  test('识别不到指纹时现铸合规指纹（不再留空——留空已被实测证为必 403）', async () => {
+    // 本用例原先断言 `Object.keys(h)).toHaveLength(0)`，即「不伪造任何头」。
+    // 2026-10-15 实测推翻了那个取舍（逐变量单改，Bearer public）：
+    //   不发 User-Agent        → 403 FreeTierError
+    //   opencode/1.17.99 及以下 → 426 UpgradeRequired（要求 1.18.0+）
+    //   无 x-opencode-session   → 403
+    // 即「如实不发」在新版上游下等同于必失败。而上游只校验**形状**与一个数值
+    // 下界（实测：低 12 位 = 0xfbf → 403，= 0xfc0 → 200），不验真伪——
+    // 所以没装过 opencode 的用户也能直接可用，不必再被要求“先跑一次客户端”。
+    // 本用例锁的是新契约：吐出的每个值都必须是**形状合规**的，而不是随便编。
     const f = await checkZen('https://zen.example', (async () => new Response(
       JSON.stringify({ data: [{ id: 'm-free' }] }), { status: 200 })) as typeof fetch,
       8000, async () => ({ ok: true }), null)
     const h = (f.suggestedProvider as Provider).headers ?? {}
-    expect(Object.keys(h)).toHaveLength(0)
+    // UA 有硬性最低版本：不能缺，且必须是已知可用的版本
+    expect(h['User-Agent']).toMatch(/^opencode\/\d+\.\d+\.\d+/)
+    // 会话：形状（ses_ + 12 位小写 hex + 14 位 base62）与低 12 位下界
+    const sid = h['x-opencode-session']!
+    expect(sid).toMatch(/^ses_[0-9a-f]{12}[A-Za-z0-9]{14}$/)
+    expect(parseInt(sid.slice(4, 16), 16) & 0xfff).toBeGreaterThanOrEqual(0xfc0)
+    // 孪生头必须与会话同值（UA≥1.19.0 时上游必查，不一致即 403）
+    expect(h['x-opencode-session-id']).toBe(sid)
+    expect(h['x-session-id']).toBe(sid)
+    // request 头形状：msg_ + 12 位小写 hex + 14 位 base62
+    expect(h['x-opencode-request']).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    // 毒头绝不能出现（带则恒 403，实测 3/3）
+    for (const k of Object.keys(h)) expect(k.toLowerCase()).not.toContain('affinity')
   })
 
   test('opencode 数据目录按平台给候选（含 XDG 覆盖）', () => {

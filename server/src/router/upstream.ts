@@ -18,11 +18,13 @@ import type { AccountPool } from '../pool/account.ts'
 import { accountUnavailableSummary } from '../pool/account.ts'
 import { autoProtocol, forgetProtocol, rememberProtocol,
   capabilitiesFrom, credentialResolve, dynamicHeadersTimeout,
-  findHeaderKey, isWorkBuddyAiBaseUrl, isZenBaseUrl, mintZenRequestId, validZenRequestId,
+  findHeaderKey, isWorkBuddyAiBaseUrl, isZenBaseUrl, mintZenRequestId, mintZenSessionId,
+  validZenRequestId, validZenSessionId,
   validZenToken,
   zenHeadersWithFingerprint,
   parseZenSessionPool, writeZenSessionPool,
   ZEN_REQUEST_HEADER, ZEN_SESSION_HEADER, ZEN_SESSION_ID_HEADER, ZEN_SESSION_POOL_HEADER,
+  ZEN_UA_DEFAULT,
   type Account, type Capabilities, type DynamicHeadersSpec, type Provider } from '../model/index.ts'
 
 // egress 定义 → 代理 URI（EGRESS-SPIKE §4 方案 A）。
@@ -178,6 +180,98 @@ export function ensureZenAgentShape(req: IrRequest, baseUrl: string): IrRequest 
   }
 }
 
+// 从 UA 取 opencode 客户端版本（`opencode/<ver>` 首段）；取不到返回 ''。
+function openCodeUAVersion(ua: string): string {
+  const m = /^opencode\/([^\s]+)/.exec(ua.trim())
+  return m ? m[1]! : ''
+}
+
+// UA 是否声称新版 opencode（版本 ≥ 1.19.0）：上游只在这个区间才校验孪生头
+// （实测 B：1.19.0 + 缺孪生头 → 403；D：1.18.29 + 缺孪生头 → 200）。
+// 版本读不出时返回 false（不无据指控，也不拿畸形值当真）。
+export function zenNeedsTwinHeader(ua: string): boolean {
+  const v = openCodeUAVersion(ua)
+  if (v === '') return false
+  const [maj = '', min = ''] = v.split('.')
+  const M = Number(maj); const N = Number(min)
+  if (!Number.isFinite(M) || !Number.isFinite(N)) return false
+  return M > 1 || (M === 1 && N >= 19)
+}
+
+// zen 免费档的**出站指纹体检**（纯函数，导出供测试）：返回「本地就能判定、
+// 且必定导致 403 FreeTierError」的原因列表（空数组 = 体检通过）。
+//
+// 为什么需要它：上游把互不相干的多种拒绝压成**同一句话**
+// （"OpenCode's free tier can only be used from within OpenCode", HTTP 403）。
+// 2026-10-15 在线二分实测（`Bearer public`，逐变量单改）：
+//
+//   F 无 User-Agent + 有会话            → 403
+//   G 无 UA + 无会话                   → 403
+//   H UA=1.19.0 + 无会话                → 403
+//   I UA=1.18.29 + 无会话               → 403
+//   J session=A、twin=B（两值不一致）   → 403
+//   K UA=1.19.0 + 会话 + 孪生头同值      → 200
+//   B UA=1.19.0 + 会话、**缺**孪生头     → 403（b200c5d 之前的老 bug，已修）
+//   A 旧路径 /zen + 指纹齐全             → 403（路径已废弃，见 migrateZenBaseUrl）
+//   E 新路径 + 指纹齐全 + 裸 body        → 403（体裁闸门，见 ensureZenAgentShape）
+//
+// 前六项（F~J）全部是**出站头自己的状态**：网关在发请求之前就能知道，不必打上游、
+// 更不必去用户的机器上「跑一次 opencode 再刷新指纹」。而旧实现把这九种原因统一
+// 映射成一句「缺指纹 + 先在本机跑一次 opencode」——对 A/B/E 三种病因，用户按指引
+// 做多少遍都不会有任何变化（他本来就是照着这句做的，做到第二次仍然 403）。
+// 所以这里只做**能本地判定**的那部分体检，把话说准；判不了的（会话是否过期、
+// 体裁/路径）交给上游报错原文，绝不编揣测。
+//
+// 注意：缺 UA 与缺会话都必须报——上游不接受「只补一半」，而 applyZenFingerprint
+// 在无可用会话时会直接 return（不写 x-opencode-*），所以这两项要在落头后自查。
+export function zenPreflightReasons(h: Record<string, string>, baseUrl: string): string[] {
+  if (!isZenUpstream(baseUrl)) return []
+  const out: string[] = []
+  // ① 路径坐标：baseURL 还停在废弃的 /zen 上（b200c5d 之前导入的存量行）。
+  //    这条不修则后面全对也恒 403，且报错与「缺指纹」一模一样。
+  try {
+    const segs = new URL(baseUrl).pathname.split('/')
+    if (segs.includes('zen')) {
+      out.push(`Provider baseURL 还停在已废弃的 /zen 路径（${baseUrl}），上游 2026-10 起对该路径恒回 403 FreeTierError，与指纹无关；`
+        + `改成 https://opencode.ai/inference/v1（或重启网关让 migrateZenBaseUrl 自动迁移，也可在管理台「同步上游目录」触发）`)
+    }
+  } catch { /* baseURL 畸形交给别处报错 */ }
+  // ② UA：上游对免费档要求 opencode 官方 UA；缺了单靠会话救不回来（实测 F）。
+  const uaKey = findHeaderKey(h, 'user-agent')
+  const ua = ((uaKey !== undefined ? h[uaKey] : undefined) ?? '').trim()
+  if (ua === '') {
+    out.push('出站请求没有 User-Agent（上游免费档要求 opencode 官方 UA 形状；本地没识别到 opencode 日志时网关不会伪造版本号）')
+  }
+  // ③ 会话令牌：缺失/形状不合则 x-opencode-* 一个都不会写出去（applyZenFingerprint
+  //    在 sid 无效时提前 return），请求必然被当成非官方客户端。
+  const sidKey = findHeaderKey(h, ZEN_SESSION_HEADER)
+  const legacyKey = findHeaderKey(h, 'x-session-id')
+  const sid = ((sidKey !== undefined ? h[sidKey] : undefined) ?? '').trim()
+  const legacy = ((legacyKey !== undefined ? h[legacyKey] : undefined) ?? '').trim()
+  const usable = validZenToken(sid) ? sid : (validZenToken(legacy) ? legacy : '')
+  if (usable === '') {
+    out.push('出站请求没有可用的 x-opencode-session（真实会话来自本机 opencode 运行记录；本地日志里没有新鲜会话时无法凭空生成）')
+  } else {
+    // ④ 孪生头：两值必须同值；但「**缺失**」算不算不满足项取决于 UA 版本——
+    // 这是实测矩阵里的 B/D 分界：
+    //   B UA=1.19.0  + 缺孪生头 → 403（新版按新契约校验）
+    //   D UA=1.18.29 + 缺孪生头 → 200（旧版不查这个头）
+    // 所以缺失只在「UA 声称 ≥ 1.19.0」时报；不一致则任何版本都报（矩阵 J 实测 403）。
+    // 当前代码路径下 zenHeadersWithFingerprint 总是成对写出，缺失态到不了；
+    // 这里仍如实判定，是因为体检接受任意头表（手工配置、存量行、测试桩）。
+    const twinKey = findHeaderKey(h, ZEN_SESSION_ID_HEADER)
+    const twin = ((twinKey !== undefined ? h[twinKey] : undefined) ?? '').trim()
+    if (twin !== '' && twin !== usable) {
+      out.push(`x-opencode-session-id（孪生头）与 x-opencode-session 不一致（session=${usable.slice(0, 20)}…，`
+        + `twin=${twin.slice(0, 20)}…）：实测两值不一致即 403，必须同值`)
+    } else if (twin === '' && zenNeedsTwinHeader(ua)) {
+      out.push('出站请求缺 x-opencode-session-id（孪生头）：UA 声称 ≥ 1.19.0 时上游按新客户端校验，'
+        + '缺它一律 403 FreeTierError（与缺会话的报错完全一样）；点一次「刷新指纹」即可自动补上')
+    }
+  }
+  return out
+}
+
 // 发往上游前的**全部体裁保底**，一处收口。
 //
 // 为什么必须收口：上游对「请求体裁」有硬性要求，不满足就直接拒单，
@@ -254,7 +348,7 @@ const isZenUpstream = isZenBaseUrl
 // zen 指纹校准（导出供测试）：落实 x-opencode-* 四件套（静态 x-opencode-session
 // > 旧 x-session-id 晋升）与 x-session-id/affinity（恒跟 sid）；
 // UA 缺省时补位（静态头已配的不动——显式配置优先；缺时用 ZEN_UA，
-// 全无则不发），拒绝伪造版本。客户端透传一律忽略（网关权威）。
+// 都没有则用 ZEN_UA_DEFAULT——发版号是硬要求，见下），拒绝伪造版本。客户端透传一律忽略（网关权威）。
 // zen=true（即 opencode.ai 上游）才动——非 zen 上游原样不动。
 // 注意：x-opencode-* 一律保留（真客户端本来就发这些；删掉才会 403）。
 // envUA 是 ZEN_UA 的可注入替身（测试用，生产走 process.env.ZEN_UA）：
@@ -270,20 +364,30 @@ export function applyZenFingerprint(
 ): void {
   void session
   // UA 补位：Provider 静态头已配的不动（显式配置优先）；缺时用 ZEN_UA；
-  // 全都没有就不发（不编版本号）。客户端 UA 永不采用。
+  // 还没有就用 ZEN_UA_DEFAULT。
+  //
+  // 旧版这里是“全都没有就不发（不编版本号）”——2026-10-15 实测证明那等于必失败：
+  //   不发 UA                → 403 FreeTierError
+  //   opencode/1.17.99 及以下 → 426 UpgradeRequired（要求 1.18.0+）
+  //   opencode/1.18.0 及以上 → 200
+  // 所以“如实不发”已不是诚实而是故障：UA 有硬性最低版本，必须给一个已知可用的。
+  // 用户本机装了 opencode 时，指纹刷新会用真实 UA 覆盖这个默认值。
   if (zen && findHeaderKey(h, 'user-agent') === undefined) {
-    const ua = sanitizeUA(envUA ?? process.env.ZEN_UA)
-    if (ua !== undefined) h['User-Agent'] = ua
+    const ua = sanitizeUA(envUA ?? process.env.ZEN_UA) ?? ZEN_UA_DEFAULT
+    h['User-Agent'] = ua
   }
   if (!zen) return
   // 会话取值：静态 x-opencode-session > 旧 x-session-id（晋升沿用）。
   // 客户端透传一律忽略（见上）。
+  // 用 validZenSessionId（形状 + 低12位下界）而不是 validZenToken（宽松白名单）：
+  // 后者会放行 ses_x / ses_zzz / ses_real 这类形状根本不成立的值，
+  // 而实测那种值 0/3 全 403——当作可用会话发出去就是自伤。
   const staticZen = findHeaderKey(h, ZEN_SESSION_HEADER) !== undefined
     ? (h[findHeaderKey(h, ZEN_SESSION_HEADER)!] ?? '').trim() : ''
   const legacySid = findHeaderKey(h, 'x-session-id') !== undefined
     ? (h[findHeaderKey(h, 'x-session-id')!] ?? '').trim() : ''
-  const sid = validZenToken(staticZen) ? staticZen
-    : validZenToken(legacySid) ? legacySid : ''
+  const sid = validZenSessionId(staticZen) ? staticZen
+    : validZenSessionId(legacySid) ? legacySid : ''
   // request 取值：静态优先，形状不合就现铸（真机一次会话内稳定，网关侧持久化
   // 由刷新流程做，这里只保证每次发出的请求都带一个**形状合规**的值）。
   // 注意这里必须按 validZenRequestId（严格形状）而不是 validZenToken（宽松白名单）
@@ -291,12 +395,17 @@ export function applyZenFingerprint(
   let rid = findHeaderKey(h, ZEN_REQUEST_HEADER) !== undefined
     ? (h[findHeaderKey(h, ZEN_REQUEST_HEADER)!] ?? '').trim() : ''
   if (!validZenRequestId(rid)) rid = mintZenRequestId()
-  if (sid !== '') zenHeadersWithFingerprint(h, sid, rid)
-  if (!validZenToken(sid)) return // 无可用会话：不硬凑，失败信息更干净
+  // 无可用会话（用户没装过 opencode、也没配静态会话）→ 现铸一个。
+  //
+  // 旧版这里直接 return（“不硬凑，失败信息更干净”）——但在新版上游下那等于
+  // 把“没装过客户端的用户”全部挡在门外，而现铸实测与真值等效（上游只校验
+  // 形状与低12位下界，不验真伪；证据见 model.mintZenSessionId）。
+  const useSid = sid !== '' ? sid : mintZenSessionId()
+  zenHeadersWithFingerprint(h, useSid, rid)
   // 旧 x-session-id 行为保留（既有配置与未知工具链可能依赖；实测多带无害）。
   const sidKey = findHeaderKey(h, 'x-session-id')
-  if (sidKey !== undefined) h[sidKey] = sid
-  else h['x-session-id'] = sid
+  if (sidKey !== undefined) h[sidKey] = useSid
+  else h['x-session-id'] = useSid
   // x-session-affinity **必须删掉**（2026-10-15 在线二分实测，3/3 稳定复现）：
   //
   //   同会话、同请求体、同 UA、同路径，只加减这一个头——
@@ -657,7 +766,8 @@ export class Upstream {
       }
       const text = await resp.text() // text() 已消费 body，无需再 cancel
       console.warn(`[upstream] POST ${url} -> ${resp.status} (${ue2s(resp.status, text)})`)
-      const ue = new UpstreamError(resp.status, classifyUpstreamError(resp.status, text), summarizeUpstreamBody(text))
+      const ue = new UpstreamError(resp.status, classifyUpstreamError(resp.status, text), summarizeUpstreamBody(text),
+        undefined, zenPreflightReasons(this.buildHeaders(view, upReq.stream, dyn, proto, session), p.baseUrl))
       // truncation 兼容回退（B-P1-3）：老/兼容上游严格校验未知字段会 400，
       // 且 400 正触发换协议重试——烧三次也修不好。body 里直指 truncation
       // 时去该字段重发一次（同条件，不耗 attempts；仅一次，防循环）。
@@ -865,10 +975,17 @@ export class Upstream {
       throw new UpstreamError(0, UPSTREAM.BAD_REQUEST, `序列化上游请求失败: ${(err as Error).message}`)
     }
     let resp: Response
+    // 出站头体检（只对 zen 生效）：把「本地就能判定」的不满足项记下来，
+    // 上游回 403 时随错误一起带出去（见 zenPreflightReasons 的实测矩阵）。
+    // 必须在 fetch **之前**算：buildHeaders 会就地做指纹校准，落头后的状态
+    // 才是真正发出去的那一份（这也是「UA ≤ 1.18.29 自动补孪生头」的依据）。
+    let zenIssues: string[] = []
     try {
+      const probeHeaders = this.buildHeaders(p, upReq.stream, null, proto)
+      zenIssues = zenPreflightReasons(probeHeaders, p.baseUrl)
       resp = await this.fetch(buildRequestURL(p.baseUrl, path), {
         method: 'POST',
-        headers: this.buildHeaders(p, upReq.stream, null, proto),
+        headers: probeHeaders,
         body: body as never,
         signal,
         dispatcher: this.dispatcherFor(p) as never,
@@ -880,7 +997,8 @@ export class Upstream {
     if (resp.status >= 200 && resp.status <= 299) return resp.body!
     // resp.text() 已消费 body（此时 cancel() 会抛 ERR_INVALID_STATE 并崩掉进程——真实环境教训）
     const text = await resp.text()
-    throw new UpstreamError(resp.status, classifyUpstreamError(resp.status, text), summarizeUpstreamBody(text))
+    throw new UpstreamError(resp.status, classifyUpstreamError(resp.status, text), summarizeUpstreamBody(text),
+      undefined, zenIssues)
   }
 }
 

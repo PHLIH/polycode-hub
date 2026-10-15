@@ -21,6 +21,9 @@ export interface ProbeResult {
   text?: string
   latencyMs?: number
   error?: string
+  // 本地体检结论（zenPreflightReasons）：上游把多种拒绝压成同一句 403 时，
+  // 只有这里能说清到底缺哪一项。非 zen / 判不了时为空。
+  details?: string[]
 }
 
 export interface ModelProbe {
@@ -32,6 +35,8 @@ export interface ModelProbe {
   error?: string
   // 失败原因分类（ir.UpstreamError.kind），供账号测试按原因决定冷却时长。
   kind?: string
+  // 本地体检结论（同 ProbeResult.details），批量扫描时逐模型带出。
+  details?: string[]
 }
 
 export interface CapsDTO {
@@ -100,6 +105,9 @@ interface ProbeOutcome {
   error: string
   ul: UsageLog
   firstMs: number
+  // 本地体检结论（zenPreflightReasons）：上游把多种拒绝压成同一句 403 时，
+  // 只有这里能说清到底缺的是哪一项。非 zen / 判不了时为空。
+  details?: string[]
 }
 
 export class Probe {
@@ -127,7 +135,8 @@ export class Probe {
   // 对指定 Provider 打一次最小真实流式请求（首段文本 + 首字延迟回显）。
   // 锁定单个 Provider，不换源；任何失败都如实返回，不抛错。
   async probeProvider(providerId: number): Promise<ProbeResult> {
-    const fail = (error: string, latencyMs: number): ProbeResult => ({ ok: false, error, latencyMs })
+    const fail = (error: string, latencyMs: number, details?: string[]): ProbeResult =>
+      ({ ok: false, error, latencyMs, ...(details && details.length > 0 ? { details } : {}) })
     const bad = badProviderID(providerId)
     if (bad) return fail(bad, 0)
     const found = this.sched.providers().find((p) => p.providerId === providerId)
@@ -142,7 +151,7 @@ export class Probe {
     const cred = this.probeCredential(found)
     if (cred.err) return fail(cred.err, 0)
     const pr = await this.probeWithProtocols(cred.pv, bare)
-    if (!pr.ok) return fail('上游错误: ' + pr.error, pr.latencyMs ?? 0)
+    if (!pr.ok) return fail('上游错误: ' + pr.error, pr.latencyMs ?? 0, pr.details)
     return {
       ok: true, model: `${found.name}/${bare}`, protocol: pr.protocol,
       text: pr.text, latencyMs: pr.latencyMs,
@@ -218,7 +227,7 @@ export class Probe {
       const maybeStale = kind === UPSTREAM.BAD_REQUEST || kind === UPSTREAM.SERVER
       if (!maybeStale) {
         void this.usage?.insertLog({ ...r.ul, status: 'upstream_error', latencyMs: r.latencyMs })
-        return { model: modelID, ok: false, error: r.error, kind: kind || undefined }
+        return { model: modelID, ok: false, error: r.error, kind: kind || undefined, details: r.details }
       }
       // fallthrough：带着这次失败参与 best-rank，全量试错（下）。
       return this.probeAllProtocols(pv, modelID, { err: r.error, kind, ul: r.ul, latencyMs: r.latencyMs })
@@ -236,6 +245,9 @@ export class Probe {
     let lastUL: UsageLog | null = seed?.ul ?? null
     let lastLatency = seed?.latencyMs ?? 0
     let best: { err: string; kind: string; rank: number } | null = null
+    // 体检结论跟随“被选中上报的那一次”（与 err/kind 同源，不串到别的协议）：
+    // 否则会把协议 A 的缺头结论配协议 B 的报错，比不给结论更误导。
+    let bestDetails: string[] | undefined
     if (seed && seed.kind) {
       // recorded 那次失败同样参与 best-rank：它可能是真病因（凭据/限流），
       // 不能因为后面试错的 404 噪音把它盖掉。
@@ -260,7 +272,10 @@ export class Probe {
       // 记病因：rank 高的（真病因）不被后续协议的路径噪音盖掉。
       const kind = r.ul.errorKind ?? ''
       const rank = errorRank(kind, r.error)
-      if (!best || rank > best.rank) best = { err: r.error, kind, rank }
+      if (!best || rank > best.rank) {
+        best = { err: r.error, kind, rank }
+        bestDetails = r.details
+      }
       // 认证/请求侧硬错误：换协议也没用，早停省时间。
       if (probeFatalError(r.error, kind)) break
     }
@@ -269,7 +284,7 @@ export class Probe {
     }
     const errText = best?.err ?? lastErr
     const errKind = best?.kind || undefined
-    return { model: modelID, ok: false, error: errText, kind: errKind }
+    return { model: modelID, ok: false, error: errText, kind: errKind, details: bestDetails }
   }
 
   // 返回该 Provider 用于探测的副本：同源有可用账号则用**首个**可用账号的凭据。
@@ -346,7 +361,10 @@ export class Probe {
       // 失败原因分类随记账走（协议试错只记最终采用那次，这里只留最后一次的错误）
       const kind = (err as { kind?: string } | undefined)?.kind
       if (kind) ul.errorKind = kind
-      return { ok: false, text: '', latencyMs: ms(), error: (err as Error).message, ul, firstMs: 0 }
+      // 本地体检结论随错误一起带出（「测试」按钮也能看到具体缺哪一项，
+      // 而不是只得到一句与真因无关的「先跑一次 opencode」）。
+      const details = (err as { details?: string[] } | undefined)?.details
+      return { ok: false, text: '', latencyMs: ms(), error: (err as Error).message, ul, firstMs: 0, details }
     }
     const parser = getOutbound(proto).newStreamParser()
     let text = ''

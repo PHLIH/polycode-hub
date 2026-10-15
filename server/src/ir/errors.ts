@@ -82,12 +82,17 @@ export class UpstreamError extends Error {
   // 标识符且自称“upstream”的话，而这件事根本没到上游（NO_ACCOUNT 就是本地拦下的）。
   // 需要面向用户的文案时用 detail；message 维持原样（既有日志格式不变）。
   readonly detail: string
-  constructor(status: number, kind: string, message: string, acct?: UpstreamAcctInfo) {
+  // 可选第 5 参：本地体检（zenPreflightReasons）判出的**具体**不满足项。
+  // 与 acct 同思路——上游把多种拒绝压成同一句 403 时，只有这里能告诉用户
+  // 到底缺的是哪一项；没有体检结果（判不了的那部分）时为空，文案回落通用指引。
+  readonly details?: string[]
+  constructor(status: number, kind: string, message: string, acct?: UpstreamAcctInfo, details?: string[]) {
     super(status !== 0 ? `upstream ${kind} (http ${status}): ${message}` : `upstream ${kind}: ${message}`)
     this.status = status
     this.kind = kind
     this.acct = acct
     this.detail = message
+    if (details && details.length > 0) this.details = details
   }
 }
 

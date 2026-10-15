@@ -14,9 +14,9 @@ import {
   type OpenCodeFingerprint,
 } from './index.ts'
 import {
-  findHeaderKey, isZenBaseUrl, mintZenRequestId, parseZenSessionPool,
+  findHeaderKey, isZenBaseUrl, mintZenRequestId, mintZenSessionPool, parseZenSessionPool,
   validZenRequestId, writeZenSessionPool,
-  ZEN_REQUEST_HEADER, ZEN_SESSION_HEADER, ZEN_SESSION_ID_HEADER,
+  ZEN_POOL_MAX, ZEN_REQUEST_HEADER, ZEN_SESSION_HEADER, ZEN_SESSION_ID_HEADER, ZEN_UA_DEFAULT,
   type Provider,
 } from '../model/index.ts'
 import type { FingerprintRefreshReport } from '../adminapi/types.ts'
@@ -53,15 +53,14 @@ export function refreshZenProvider(
     return { ...base, detail: `非 Zen 上游（${p.baseUrl}），无需刷新指纹` }
   }
   // 会话池：本机近期真实用过的全部会话（旧→新），最新那个当主会话。
-  // 兼容旧行为：没有任何会话时按老路径返回指引。
+  // 本机一个都没有（用户没装过 opencode）时**不再报错让用户去跑客户端**：
+  // 现铸一池顶上。上游只校验形状与低12位下界、不验真伪（见
+  // model.mintZenSessionId 的实测），所以现铸与真值等效，这一步可以彻底免掉。
+  // 仍保留一条路径差异：本机有真会话时优先用真的（它带真实 modelID 归因，
+  // 且在用户真在用客户端时窗口最新鲜）。
   const pool = discoverAllOpenCodeFingerprints(openCodeDirs)
-  const fp: OpenCodeFingerprint | undefined = pool[pool.length - 1]
-  if (!fp) {
-    const none = discoverOpenCodeFingerprint(openCodeDirs)
-    return none
-      ? { ...base, detail: '本机没有可用的 opencode 会话' }
-      : { ...base, detail: '本机没有可用的 opencode 会话', next: NO_LOCAL_FINGERPRINT_NEXT }
-  }
+  if (pool.length === 0) return refreshZenWithMinted(store, notify, p, base)
+  const fp: OpenCodeFingerprint = pool[pool.length - 1]!
   const h: Record<string, string> = { ...(p.headers ?? {}) }
   const curKey = findHeaderKey(h, ZEN_SESSION_HEADER)
   const cur = (curKey !== undefined ? h[curKey] : undefined) ?? ''
@@ -127,6 +126,47 @@ export function refreshZenProvider(
     detail: `已更新为本机会话 ${primary}（来自 ${fp.logPath}` +
       `${fp.modelID ? `，该会话用过 ${fp.modelID}` : ''}）` +
       `${poolIDs.length > 1 ? `；会话池 ${poolIDs.length} 个可轮换` : ''}${uaNote}`,
+  }
+}
+
+// 本机一个 opencode 会话都采不到时的刷新路径：现铸一池会话 + 兜底 UA。
+//
+// 为什么可以把「先用一次客户端」这一步免掉：上游对 ses_ 只校验形状
+// （`ses_` + 12 位小写 hex + 14 位 base62）与一个数值下界（前 12 位 hex 的
+// 低 12 位 ≥ 0xfc0），**不验真伪、不验时效**——现铸值 × 3 个免费模型各打 5 次
+// 全 200，40 次「每次全新现铸」40/40，单会话连打 60 次未出窗口。
+// UA 同理有硬性最低版本（< 1.18.0 → 426），所以不能留空，用 ZEN_UA_DEFAULT。
+//
+// 取舍：现铸的会话**覆盖**库里的旧会话（若旧值形状不合）——旧值不合就是恒 403，
+// 不如换成已知可用的。库里有合规真会话时不会走到这里（调用方已提前分支）。
+function refreshZenWithMinted(
+  store: ZenProviderStore, notify: () => void, p: Provider, base: FingerprintRefreshReport,
+): FingerprintRefreshReport {
+  const h: Record<string, string> = { ...(p.headers ?? {}) }
+  const minted = mintZenSessionPool(ZEN_POOL_MAX)
+  const primary = minted[0]!
+  setHeader(h, ZEN_SESSION_HEADER, primary)
+  setHeader(h, ZEN_SESSION_ID_HEADER, primary)
+  setHeader(h, 'x-session-id', primary)
+  // request 头也一并现铸：库里存的旧 28 位残值不合形状，留着它比不带更糟（必 403）。
+  setHeader(h, ZEN_REQUEST_HEADER, mintZenRequestId())
+  writeZenSessionPool(h, minted)
+  // UA：静态已配且版本达标的不动（显式配置优先），否则写兜底值。
+  const uaKey = findHeaderKey(h, 'user-agent')
+  const curUA = ((uaKey !== undefined ? h[uaKey] : undefined) ?? '').trim()
+  let uaNote = ''
+  if (!/^opencode\/[^\s/]+\//.test(curUA) && !uaVersion(curUA)) {
+    setHeader(h, 'User-Agent', ZEN_UA_DEFAULT)
+    uaNote = `；UA 补为 ${ZEN_UA_DEFAULT}`
+  }
+  const affKey = findHeaderKey(h, 'x-session-affinity')
+  if (affKey !== undefined) delete h[affKey]
+  p.headers = h
+  store.put(p)
+  notify()
+  return {
+    ...base, updated: true, sessionChanged: true,
+    detail: `本机无 opencode 会话，已现铸 ${minted.length} 个会话（上游只校验形状与下界，不验真伪）${uaNote}`,
   }
 }
 

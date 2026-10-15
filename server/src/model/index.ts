@@ -437,6 +437,15 @@ export const ZEN_POOL_MAX = 16
 export const ZEN_DEFAULT_CLIENT = 'cli'
 export const ZEN_DEFAULT_PROJECT = 'global'
 
+// 缺 UA 时的兜底（用户没装过 opencode、也没给 ZEN_UA 时用）。
+//
+// 上游对 UA 有**最低版本**要求：< 1.18.0 直接被拒，实测 opencode/1.17.99 回
+// 426 UpgradeRequired（「OpenCode 1.18.0 or newer is required」），而完全不发
+// UA 也是 403。所以「全都没有就不发」（旧注释的取舍）在新版上游等于必失败——
+// 这里必须给一个已知可用的版本，否则没装客户端的用户永远用不了免费档。
+// 版本号是协议要求而非编造：本机装了 opencode 时，真实 UA 由指纹刷新覆盖它。
+export const ZEN_UA_DEFAULT = 'opencode/1.18.0'
+
 // 是否 Zen 上游（与 router/upstream 的判定同口径，此处独立定义以免 model 反向依赖 router）。
 export function isZenBaseUrl(baseUrl: string): boolean {
   try {
@@ -643,6 +652,9 @@ export function zenHeadersWithFingerprint(
 
 const ZEN_REQ_HEX = '0123456789abcdef'
 const ZEN_REQ_SUFFIX = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
+// ses_ 低 12 位的合法中位字符：首位恒 f、次位取 c..f → 数值落 [0xfc0, 0xfff]。
+// 下界 0xfc0 是实测出来的（0xfbf 全败、0xfc0 全过），不是猜的，见 mintZenSessionId。
+const ZEN_SESSION_LO_MID = 'cdef'
 
 // x-opencode-request 的**格式**（2026-10-15 在线二分实测，每格 3 次稳定）：
 //   msg_ + 12 位小写 hex + 14 位 base62，合计 30 个字符。
@@ -679,6 +691,63 @@ export function validZenRequestId(s: string): boolean {
 
 function defaultPick(chars: string): string {
   return chars[Math.floor(Math.random() * chars.length)]!
+}
+
+// x-opencode-session 的**形状与数值下界**（2026-10-15 在线二分实测，每格 3~4 次稳定）。
+//
+// 形状：ses_ + 12 位小写 hex + 14 位 base62，合计 30 字符。
+// 数值：那 12 位 hex 的**低 12 位必须 ≥ 0xfc0**——
+//   低 12 位 = 0xfbf → 0/4 全 403；= 0xfc0 → 4/4 全 200（边界恰好在这一格）；
+//   = 0xfc1 / 0xfd0 / 0xfe0 / 0xff0 / 0xffe / 0xfff → 均 4/4。
+//   高 36 位完全自由（000000000 / 7ffffffff / fffffffff 全部 4/4）。
+//
+// 关键结论：上游**不校验真伪**，只校验形状与这个下界。证据——
+//   · 现铸会话 × 3 个免费模型各打 5 次 → 全 200（唯一失败那个是上游自身
+//     抖动，同一时刻真实会话打同一模型也是 429 Endpoint is unavailable）；
+//   · 40 次「每次都用一个全新现铸会话」→ 40/40，未撞 IP/账号级限流；
+//   · 单个现铸会话连打 60 次仍在窗口内（限流是会话级，不是 IP 级）。
+// 旁证：本机真实会话池 48 个的 12 位前缀，低 12 位**全部等于 0xffe**，与下界一致。
+//
+// 因此可以不再依赖本机真实会话：真实会话只是「碰巧总满足下界」，而用户没装过
+// opencode 时本机一个会话都采不到——此前只能如实要求「先用一次客户端」，
+// 现在直接现铸即可，那一步没必要了。
+//
+// 注意别退回旧实现：旧结论曾把 ses_ 当成「(C − t_ms) 的补数编码、有效窗口 61 天」，
+// 那是拿高 36 位与时间的弱相关去拟合出来的——高 36 位实测完全自由，没有时效校验。
+export function mintZenSessionId(pick: (chars: string) => string = defaultPick): string {
+  let hi = ''
+  for (let i = 0; i < 9; i++) hi += pick(ZEN_REQ_HEX) // 高 36 位：任意
+  const lo = 'f' + pick(ZEN_SESSION_LO_MID) + pick(ZEN_REQ_HEX) // 低 12 位 ∈ [0xfc0,0xfff]
+  let suf = ''
+  for (let i = 0; i < 14; i++) suf += pick(ZEN_REQ_SUFFIX)
+  return `ses_${hi}${lo}${suf}`
+}
+
+// 会话 ID 自检：形状 + 低 12 位下界，即「上游到底认不认」。
+// 比 validZenToken（宽松白名单 `[A-Za-z0-9_-]{1,128}`）严得多——后者会放行
+// ses_x、ses_zzz、ses_real 这类形状根本不成立的值（实测 0/3 全 403），
+// 把它们当真会话发出去等于自伤。发往上游前一律按本函数把关。
+export function validZenSessionId(s: string): boolean {
+  const t = (s ?? '').trim()
+  if (!/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(t)) return false
+  return (parseInt(t.slice(4, 16), 16) & 0xfff) >= 0xfc0
+}
+
+// 现铸一池会话（去重），供「本机没有 opencode」时直接顶上会话池。
+// 免费档限流按会话算（不是 IP、不是账号），所以池要有一定宽度才能均摊；
+// 实测 40 次「每次全新现铸会话」40/40，未撞到任何全局限流。
+export function mintZenSessionPool(n: number, pick: (chars: string) => string = defaultPick): string[] {
+  const want = Math.max(0, Math.min(n, ZEN_POOL_MAX))
+  const out: string[] = []
+  const seen = new Set<string>()
+  // 去重靠重试：随机空间 ~2^42，实际几乎不会撞；这里加守卫防注入的 pick 恒定不走。
+  for (let i = 0; i < want; i++) {
+    let s = mintZenSessionId(pick)
+    for (let g = 0; seen.has(s) && g < 64; g++) s = mintZenSessionId(pick)
+    seen.add(s)
+    out.push(s)
+  }
+  return out
 }
 
 // ---- 模型目录与上游实时列表的对账 ----
