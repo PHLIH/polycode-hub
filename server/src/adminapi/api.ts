@@ -11,7 +11,7 @@ import { writeFile0600 } from './credential_file.ts'
 import { ERR, validProtocol, REASONING_LEVELS, validReasoningLevel } from '../ir/index.ts'
 import {
   providerValidate, accountHealth, validAccessKind, validRisk, sanitizeReasoningMaxTokens,
-  credentialResolve, forgetProtocol,
+  credentialResolve, forgetProtocol, newCatalogModel, reconcileCatalogModels,
   workBuddyRealmOfBaseUrl, workBuddyRealmOfToken, workBuddyRealmLabel,
   WB_CLIENT_VERSION,
   type Account, type CredentialRef, type Model, type Provider,
@@ -1318,6 +1318,71 @@ export function createAdminApi(deps: AdminApiDeps): Hono {
       return errRes(c, 502, ERR.API, (e as Error).message)
     }
     return ok(c, 200, list)
+  })
+
+  // 把库里的模型目录对账到上游实时列表（删已下线、补新发现）。
+  //
+  // 为什么必须有这个端点：目录的**唯一权威来源是上游**，而在此之前网关只会
+  // 「目录为空时补一次」（discover_api.fillModelsIfEmpty），已入库的项从不复核。
+  // 后果是目录单向积累：上游下线的 ID 永远留着，调用恒 404/410，用户分不清
+  // 是「模型没了」还是「自己配错了」；上游新上的又看不见。实测差得很多——
+  // #26 库里 5 个、上游 85 个；#4 库里 37 个、上游 33 个（其中 12 个已下线、8 个缺失）。
+  //
+  // 边界（与 model.reconcileCatalogModels 同源）：
+  //   · manual=true 是用户手工维护的，一律保留——网关不替用户清理他的东西；
+  //   · 上游列表为空则整体不动（上游抖动一次就清空目录是更严重的故障）；
+  //   · 新补的模型一律 enabled:false。列表里有 ≠ 你的凭据能调它——zen 免费档
+  //     最典型：列表 85 个，公共 key 只有 9 个能调，其余全 401。直接启用等于
+  //     把几十个必然失败的模型摆给用户。谁验过谁启用（前端「扫描可用性」）。
+  app.post('/admin/api/providers/:pid/models/sync', async (c) => {
+    const lister: ProviderModelLister | undefined = deps.lister
+    if (!lister) return errRes(c, 501, ERR.API, '模型发现未接线')
+    const raw = c.req.param('pid')
+    const p = findProvider(providers, raw)
+    if (!p) return errRes(c, 404, ERR.NOT_FOUND, `provider #${raw} 不存在`)
+    let list: ModelList
+    try {
+      list = await lister.listProviderModels(p.providerId)
+    } catch (e) {
+      // 与 GET 同口径：上游拉不到是 502（网关自己没问题，是上游/网络的问题）。
+      return errRes(c, 502, ERR.API, (e as Error).message)
+    }
+    const before = p.models.length
+    const r = reconcileCatalogModels(p.models, list.models)
+    p.models = r.kept
+    for (const id of r.added) {
+      const nm: Model = { ...newCatalogModel(id) }
+      const proto = list.protocols?.[id]
+      if (proto && validProtocol(proto)) nm.api = proto
+      const caps = list.caps?.[id]
+      if (caps) {
+        if (caps.input && caps.input.length > 0) nm.input = caps.input
+        if ((caps.contextWindow ?? 0) > 0) nm.contextWindow = caps.contextWindow
+        if ((caps.maxOutputTokens ?? 0) > 0) nm.maxOutputTokens = caps.maxOutputTokens
+      }
+      p.models.push(nm)
+    }
+    const changedFlag = r.added.length > 0 || r.removed.length > 0
+    if (changedFlag) {
+      providers.put(p)
+      changed()
+      // 删掉的模型要清协议探测缓存：进程内 autoProtocol 还记着旧值的话，
+      // 同名模型被上游重新上线时会直接沿用过期协议，不再试错（同 DELETE 端点）。
+      for (const id of r.removed) forgetProtocol(p.name, id)
+    }
+    return ok(c, 200, {
+      providerId: p.providerId,
+      providerName: p.name,
+      source: list.source,
+      added: r.added,
+      removed: r.removed,
+      kept: r.kept.length,
+      enabled: p.models.filter((m) => m.enabled).length,
+      // 本次是否真写了库（added/removed 皆空 = 目录已与上游一致）。
+      updated: changedFlag,
+      // 对账前的条数：前端据此显示「37 → 33」这类对比，比单看结果直观。
+      had: before,
+    })
   })
 
   // ---- sidecar / projects ----

@@ -7,7 +7,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { Provider } from '../model/index.ts'
-import { mintZenRequestId, wbAuxEndpointIdentityHeaders, workBuddyRealmOfIssuer } from '../model/index.ts'
+import { mintZenRequestId, reconcileCatalogModels, wbAuxEndpointIdentityHeaders, workBuddyRealmOfIssuer } from '../model/index.ts'
 import type { Finding } from '../adminapi/types.ts'
 import type { IrRequest, ToolDef } from '../ir/types.ts'
 
@@ -823,15 +823,18 @@ function zenSuggestedProvider(baseURL: string, fp?: OpenCodeFingerprint | null):
       } : {}),
     },
     priority: 1,
-    models: [
-      // 协议不是「一个 Provider 一刀切」：zen 的 muse-spark 系只认 /responses，
-      // 走 /chat/completions 上游直接 500（实测）。草稿里就把它标成 openai-responses，
-      // 免得全部继承 Provider 级 openai-completions 后逐个踩坑。
-      { id: 'mimo-v2.5-free', manual: false, enabled: true },
-      { id: 'nemotron-3-ultra-free', manual: false, enabled: true },
-      { id: 'muse-spark-1.3-contributor-free', api: 'openai-responses', manual: false, enabled: true },
-      { id: 'union-alpha', manual: false, enabled: true },
-    ],
+    // 模型目录**不预填任何模型名**（同 wbSuggestedProvider 的教训）。
+    //
+    // 这里曾经写着 5 个硬编码的免费档 ID（mimo-v2.6-flash-free 等）。写死的
+    // 代价是双重的：上游一下线，那个名字就变成永远 404/410 的假值；而它又只在
+    // “拿不到上游列表”时生效，于是断网/被墙的用户恰好被导入一批必死的模型，
+    // 却看不出是「模型没了」还是「自己配错了」。
+    //
+    // 权威来源是上游 GET /inference/v1/models（免费档也免指纹就能拉，85 个模型
+    // 一次到手）。由发现流程剪枝、由管理面的目录同步端点写回，网关不猜。
+    // 协议同理：由探针逐模型探到后落库（autoProtocol / probeWithProtocols），
+    // 不再靠草稿里手标 openai-responses 这种写死声明。
+    models: [],
   }
 }
 
@@ -860,6 +863,30 @@ function spreadByFamily(ids: string[]): string[] {
     if (seen.has(fam)) continue
     seen.add(fam)
     out.push(id)
+  }
+  return out
+}
+
+// 从已跨族去重的列表里**均匀取样** n 个（含首尾）。
+//
+// 为什么不能直接 slice(0, n)：上游列表的顺序对“能不能用”毫无意义，而开头
+// 一段恰好扎堆不可用的概率不低（实测撞过：jev 500 / deepseek-v4-flash 已下线 /
+// muse-spark 地区受限 连续排在前面，只取前 3 个就齐了）。那样会把「列表前段
+// 不可用」误报成「整个源不可用」，用户连导入按钮都点不到——而可用的模型就在
+// 列表后面。均匀取样保证探测名额覆盖整张列表，而不是被开头一段拿去。
+// 顺序仍按原列表：取样结果只是子集，不打乱优先级。
+export function evenlySample<T>(items: T[], n: number): T[] {
+  if (n <= 0 || items.length === 0) return []
+  if (items.length <= n) return [...items]
+  if (n === 1) return [items[0]!]
+  const out: T[] = []
+  const seen = new Set<number>()
+  for (let i = 0; i < n; i++) {
+    // 把 [0, len-1] 等分取端点：i=0 取首个，i=n-1 取末个。
+    const at = Math.round((i * (items.length - 1)) / (n - 1))
+    if (seen.has(at)) continue
+    seen.add(at)
+    out.push(items[at]!)
   }
   return out
 }
@@ -938,26 +965,26 @@ export async function checkZen(
   // 任一候选调通即 ready；全失败才报不可用，且报**最有信息量**的那次病因。
   // 本地判免费（不引 gateway/probe：发现层不该依赖网关层，避免反向依赖环）。
   const freeIds = ids.filter((id) => looksFreeName(id))
-  // 候选优先级（2026-09-20 修）：**先探草稿里的模型**，再拿免费档补位。
+  // 候选优先级（2026-10-15 重定）：**先探草稿里的模型**（有则优先——它才是
+  // 「采用后会暴露给用户的那几个」），否则从上游列表里跨族均匀取样。
   //
-  // 为什么必须草稿优先：草稿 models 就是「采用后会暴露给用户的那几个」。按上游
-  // 列表顺序取前 3 个会拿到当时排前面的模型（jev-1.13-free 500 / deepseek-v4-flash
-  // 已下线 / muse-spark 地区受限），于是 3 个名额全被无关模型占掉，明明草稿里的
-  // mimo-v2.5-free 当时可调用，却被判 unreachable —— 用户被告知「这个源不能用」，
-  // 而他真正要用的模型是好的。探针要回答的是「采用后我能不能用」，不是「列表里
-  // 任意三个模型行不行」。
+  // 为什么必须跨族 + 均匀：草稿不再预填模型后，候选只能来自上游列表，而列表的
+  // 顺序与可用性无关。沿列表取前几个曾造成真实误判（jev 500 / deepseek-v4-flash
+  // 已下线 / muse-spark 地区受限 连续排在前，只取前 3 个就齐了）——整个源被判
+  // unreachable，而可用的模型就在列表后面。探针要回答的是「采用后我能不能用」。
   const draftIds = (f.suggestedProvider?.models ?? []).map((m) => m.id)
   const draftLive = draftIds.filter((id) => ids.includes(id))
-  // 按「族」分散取样：同一族（id 去掉免费后缀后的主体）只取第一个。
-  // 否则列表里同族模型扎堆时（如 muse-spark 有 1.2/1.3 两代），几个名额全被它占掉，
-  // 一族不可用就误判整个 Provider 不可用——而其他族可能完全正常。
+  // 按「族」分散：同一族（id 去掉版本号与免费后缀）的模型经常一起下线、一起
+  // 地区受限，几个名额全被一族占掉等于把探测结果押在一个篮子里。
   const primary = spreadByFamily(draftLive)
-  // 补位：优先免费档；**一个免费档都没有时回落全部模型**——有些源（含测试里的
-  // 构造列表）模型名里没有 free 字样，若在这里就返回空，会把「列表可达」直接
-  // 判成「无法验证可调用性」，探测等于没做。
+  // 补位：优先免费档（免费档才有意义，付费档用 public key 必 401）；
+  // **一个免费档都没有时回落全部模型**——有些源（含测试里的构造列表）模型名里
+  // 没有 free 字样，若在这里就返回空，会把「列表可达」直接判成「无法验证可调用性」。
   const fillPool = freeIds.length > 0 ? freeIds : ids
   const fill = spreadByFamily(fillPool).filter((id) => !primary.includes(id))
-  const cands = [...primary, ...fill].slice(0, ZEN_PROBE_MODELS)
+  const cands = primary.length > 0
+    ? [...primary, ...fill].slice(0, ZEN_PROBE_MODELS)
+    : evenlySample(fill, ZEN_PROBE_MODELS)
   if (cands.length === 0) {
     f.status = 'unreachable'
     f.detail = `连通，但模型列表为空（${ids.length} 个），无法验证可调用性`
@@ -1030,22 +1057,14 @@ export async function checkZen(
 // 它们仍留在草稿里，采用后就是一个永远 404 的目录项——用户拿它一调就报错，
 // 却看不出是「模型没了」还是「自己配错了」。
 //
-// 两条边界（宁可不剪，也不误删）：
-//   · manual=true 是用户手工维护的，一律保留——发现层不替用户清理他的东西；
-//   · live 为空（列表拉空/解析异常）时整体不剪——此时沉默比误删安全。
-// 返回保留项与剔除项（剔除项用于在 detail 里如实告知，不静默改动用户看到的目录）。
+// 实现委托给 model.reconcileCatalogModels：发现层剪草稿、管理面同步目录是同
+// 一件事（“把目录对齐到上游”），口径必须只有一份，否则两处漂移。
+// 两条边界（宁可不剪，也不误删）见那个函数的注释。
 export function pruneStaleDraftModels<T extends { id: string; manual?: boolean }>(
   models: T[], live: string[],
 ): { kept: T[]; stale: string[] } {
-  if (live.length === 0) return { kept: models, stale: [] }
-  const up = new Set(live)
-  const kept: T[] = []
-  const stale: string[] = []
-  for (const m of models) {
-    if (m.manual || up.has(m.id)) kept.push(m)
-    else stale.push(m.id)
-  }
-  return { kept, stale }
+  const r = reconcileCatalogModels(models, live)
+  return { kept: r.kept, stale: r.removed }
 }
 
 // 单次探针失败的粗分类（只用于给用户看的简报；判定仍以 kind/错误原文为准）。

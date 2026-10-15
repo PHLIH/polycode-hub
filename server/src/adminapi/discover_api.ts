@@ -10,7 +10,7 @@ import { writeFile0600 } from './credential_file.ts'
 import { wbRefreshSession } from '../discover/wb_refresh.ts'
 import { detectRealmFromAuth } from '../discover/index.ts'
 import { ERR } from '../ir/index.ts'
-import { providerValidate, workBuddyRealmOfBaseUrl, type Account, type Provider } from '../model/index.ts'
+import { looksFree, newCatalogModel, providerValidate, workBuddyRealmOfBaseUrl, type Account, type Provider } from '../model/index.ts'
 import type { Context, Hono } from 'hono'
 import type { DiscoveredAccount, Finding } from './types.ts'
 import type { AdminCtx } from './api.ts'
@@ -448,10 +448,30 @@ export function registerDiscoverRoutes(app: Hono, ctx: AdminCtx): void {
     }
     const target = providers.get(p.providerId)
     if (!target || target.models.length > 0) return ''
-    target.models = ids.map((id) => ({ id, manual: false, enabled: true }))
+    // 新入库的模型**不无条件启用**。
+    //
+    // 「上游列表里有」≠「你的凭据能调它」——zen 免费档最典型：列表 85 个，公共
+    // key 只有 9 个能调，其余全 401 AuthError。无条件 enabled:true 会把几十个必然
+    // 失败的 ID 摆进 /v1/models，用户一调就报错，而界面完全不提示哪些能用。
+    //
+    // 启用规则（只能靠命名启发式，上游不提供价格字段）：
+    //   · 有命名带 free/contributor/trial 的 → 只启用那些（免费档就是这些）；
+    //   · 一个都没有（付费源的常态，如 senseaudio）→ 全部启用，因为该源没有
+    //     「部分模型不可用」的概念，卡在这里反而会让采用出来的目录空白；
+    //     none 与 all 之间没有第三种可推断的选择。
+    // 剩下的交给「扫描可用性」逐个验证，那是唯一能给出事实的路径。
+    const freeIds = ids.filter((id) => looksFree(id))
+    const enableAll = freeIds.length === 0
+    const freeSet = new Set(freeIds)
+    target.models = ids.map((id) => ({
+      ...newCatalogModel(id),
+      enabled: enableAll || freeSet.has(id),
+    }))
     providers.put(target)
     changed()
-    return `已自动发现 ${ids.length} 个模型（${ids.slice(0, 5).join('、')}${ids.length > 5 ? '…' : ''}）；如与实际可用不符，请到 Providers 页核对`
+    const enabledN = target.models.filter((m) => m.enabled).length
+    return `已自动发现 ${ids.length} 个模型（已启用 ${enabledN} 个：${ids.slice(0, 5).join('、')}`
+      + `${ids.length > 5 ? '…' : ''}）；其余未启用的请到 Providers 页扫描后自行勾选`
   }
 
   // 凭据默认值（adopt 与 quick-import 共用）：ZEN_KEY 未配置时把免费档公共 key

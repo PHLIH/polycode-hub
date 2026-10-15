@@ -480,6 +480,62 @@ async function openModels(p) {
 
 const handModels = ref('')
 const handOpen = ref(false)
+const syncing = ref(false)
+
+// 同步上游目录：把库里那份对账到上游实时列表（删已下线、补新发现）。
+//
+// 与「获取模型」的区别：「获取模型」只是问上游要一份列表给你勾（不动库），
+// 这个是把库改掉——所以它必须把改动如实念出来（哪些删了、哪些补了），
+// 不能默默改用户的目录。新补的模型后端置 enabled:false，页面要告诉用户
+// 「列表里有」不等于「你能调它」（zen 免费档列表 85 个、公共 key 只 9 个能调）。
+async function syncCatalog() {
+  const target = modelsTarget.value
+  if (!target || syncing.value) return
+  syncing.value = true
+  try {
+    const r = await api.syncProviderModels(target.providerId)
+    const parts = [`保留 ${r.kept} 个`]
+    if (r.added && r.added.length) parts.push(`新增 ${r.added.length} 个（已入库但未启用）`)
+    if (r.removed && r.removed.length) parts.push(`删除 ${r.removed.length} 个（上游已下线）`)
+    const head = r.updated
+      ? `目录已与上游对齐（${r.had} → ${r.kept + (r.added || []).length}）：${parts.join('，')}`
+      : `目录已是最新（${r.kept} 个），无需改动`
+    // 明细单独列出来：改动绝不能只给个数字，否则用户不知道动了什么、无法核对。
+    const lines = [head]
+    if (r.added && r.added.length) {
+      lines.push('', '新增（未启用，验过后再开）：', ...r.added.map(x => '  + ' + x))
+    }
+    if (r.removed && r.removed.length) {
+      lines.push('', '删除（上游列表里已没有）：', ...r.removed.map(x => '  − ' + x))
+    }
+    if (r.added && r.added.length) {
+      lines.push('', '新模型默认不对外暴露。在下方列表勾选后点「保存」才会启用。')
+    }
+    await ElMessageBox.alert(lines.join('\n'), '同步上游目录', {
+      confirmButtonText: '好',
+      customClass: 'sync-catalog-msg',
+    })
+  } catch (e) {
+    if (e !== 'cancel' && e !== 'close') ElMessage.error(e.message || String(e))
+  } finally {
+    syncing.value = false
+  }
+  // 无论成败都重拉一次：失败也可能已经拉到了上游列表，能把页面上的
+  // 陈旧目录刷新掉（用户至少能看到现状），代价只是一次只读请求。
+  try {
+    await load()
+    await refreshTarget(target.providerId)
+    const res = await api.fetchProviderModels(target.providerId)
+    fetched.value = res.models || []
+    fetchedSource.value = res.source || ''
+    declaredProtocols.value = res.protocols || {}
+    declaredCaps.value = res.caps || {}
+    freeModels.value = new Set(res.free || [])
+    // 同 appendHandModels 收尾：只勾「已暴露的」，不预勾新入库的未启用模型。
+    const fresh = (list.value || []).find(x => x.providerId === target.providerId)
+    picked.value = exposedModels(fresh || target).map(m => m.id)
+  } catch { /* 重拉失败不报错：上面已经给过结果了 */ }
+}
 
 // freeHint：解释「免费」标记的来源与局限：
 // 上游不在列表里标价格，只能按命名约定（-free / contributor / trial）启发式判断；
@@ -853,6 +909,17 @@ async function adoptModels() {
     <template v-else>
       <p class="md-source">{{ sourceHint }}　<span class="free-dot" />免费 <span class="mono">{{ freeModels.size }}</span></p>
 
+      <!-- 同步上游目录：直接改库（删已下线/补新发现），而不是只影响本次勾选。
+           放在「获取模型」旁边因为两者都回答「上游到底有什么」，但只有它会写库。 -->
+      <div class="md-sync">
+        <button class="btn ghost" :disabled="syncing" @click="syncCatalog">
+          {{ syncing ? '同步中…' : '同步上游目录' }}
+        </button>
+        <span class="dim md-sync-note">
+          按上游实时列表理顺本地目录：上游已下线的删掉、新出现的补进来（新补的默认不启用）。
+        </span>
+      </div>
+
       <div class="md-toolbar">
         <input v-model="modelQ" class="md-search mono" placeholder="过滤模型 ID…">
         <button class="md-tool" @click="picked = [...visibleModels]">全选{{ onlyFree ? '免费' : '' }}</button>
@@ -1000,6 +1067,10 @@ async function adoptModels() {
 .eg-chip .dot { margin-right: 0; }
 
 /* ---- 获取模型弹窗 ---- */
+.md-sync { display: flex; align-items: center; gap: 10px; margin: 8px 0 12px; flex-wrap: wrap; }
+.md-sync-note { font-size: 12px; flex: 1 1 240px; }
+/* 同步结果明细是多行的（新增/删除逐条列出），默认 alert 会把换行压掉。 */
+:global(.sync-catalog-msg .el-message-box__message) { white-space: pre-wrap; font-family: var(--mono, monospace); font-size: 12px; }
 .md-head { display: flex; align-items: baseline; gap: 10px; }
 .md-title { font-size: 15px; font-weight: 600; }
 .md-target { font-size: 12px; color: var(--accent); }

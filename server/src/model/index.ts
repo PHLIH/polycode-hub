@@ -680,3 +680,47 @@ export function validZenRequestId(s: string): boolean {
 function defaultPick(chars: string): string {
   return chars[Math.floor(Math.random() * chars.length)]!
 }
+
+// ---- 模型目录与上游实时列表的对账 ----
+//
+// 目录的唯一权威来源是上游：这里只回答「怎么把库里那份对齐到上游那份」。
+// 网关不做“预填猜的模型名”——写死的名字上游一下线就变成永远 404 的假值，
+// 而用户以为是自己配错了（发现层曾经踩过两次：hy3-preview、mimo-v2.5-free）。
+//
+// 调用方（发现层剪草稿、管理面同步目录）共用这一个函数，避免两处口径漂移。
+//
+// 边界（宁可不改，也不误删）：
+//   · manual=true 是用户手工维护的，一律保留——网关不替用户清理他的东西；
+//   · live 为空（列表拉空/上游无此接口/解析异常）时整体不动——
+//     此时沉默比误删安全（上游抖动一次就清空目录是更严重的故障）。
+export interface CatalogReconcile<T> {
+  kept: T[] // 保留项（含全部 manual）
+  added: string[] // 上游有、目录没有（待补）
+  removed: string[] // 目录有、上游没有且非 manual（已下线）
+}
+
+export function reconcileCatalogModels<T extends { id: string; manual?: boolean }>(
+  catalog: T[], live: string[],
+): CatalogReconcile<T> {
+  if (live.length === 0) return { kept: catalog, added: [], removed: [] }
+  const up = new Set(live)
+  const have = new Set(catalog.map((m) => m.id))
+  const kept: T[] = []
+  const removed: string[] = []
+  for (const m of catalog) {
+    if (m.manual || up.has(m.id)) kept.push(m)
+    else removed.push(m.id)
+  }
+  const added = live.filter((id) => !have.has(id))
+  return { kept, added, removed }
+}
+
+// 新增模型的落库形态：**默认不启用**。
+//
+// 为什么不直接 enabled:true：上游“在列表里”不等于“这个 key 能调它”。
+// zen 免费档最典型——列表 85 个模型，用公共 key 只有 9 个能调，其余全 401；
+// 直接启用会把 76 个必然失败的模型暴露给用户（/v1/models 里全列着，一调就报错）。
+// 谁验过谁启用：调用方探针通过后再置 true（见管理面 sync 端点）。
+export function newCatalogModel(id: string): { id: string; manual: false; enabled: false } {
+  return { id, manual: false, enabled: false }
+}

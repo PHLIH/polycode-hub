@@ -10,7 +10,7 @@ import {
   discoverWorkBuddyModels, workBuddyAuthDirs, workBuddySearchPaths, searchWorkBuddyAuthFiles,
   detectRealmFromAuth,
   parseFingerprintFromLog, openCodeDataDirs,
-  Scanner, defaultConfig, type ScanConfig, zenProbeRequest, pruneStaleDraftModels,
+  Scanner, defaultConfig, type ScanConfig, zenProbeRequest, pruneStaleDraftModels, evenlySample,
 } from '../src/discover/index.ts'
 import { providerValidate, type Provider } from '../src/model/index.ts'
 
@@ -799,63 +799,96 @@ describe('checkZen', () => {
     expect(req.messages.length).toBeGreaterThan(0)
   })
 
-  // 上游已下线的模型留在草稿里，采用后就是永远 404 的目录项（用户看不出是模型没了
-  // 还是自己配错）。草稿必须跟随上游列表剪掉这些，且**如实告知**（不静默改动目录）。
-  test('草稿模型跟随上游刷新：剔除已下线项并如实告知', async () => {
+  // 草稿**不能写死模型名**。写死的名字上游一下线就是永远 404 的假值，而它又只在
+  // “拿不到上游列表”时生效——断网/被墙的用户恰好被导入一批必死的模型，却看不出
+  // 是「模型没了」还是「自己配错了」。权威来源只能是上游实时列表。
+  test('草稿不预填任何模型：目录一律交给上游实时列表', async () => {
     const fetchList = (async () => new Response(
-      JSON.stringify({ data: [{ id: 'mimo-v2.5-free' }, { id: 'nemotron-3-ultra-free' }] }),
+      // 故意返回两个“看似应该预填”的 ID：它们不应因为出现在上游列表里就被写进草稿。
+      // 草稿是“采用时会落库的目录”，预填等于替用户做了一个未经验证的决定。
+      JSON.stringify({ data: [{ id: 'mimo-v2.6-flash-free' }, { id: 'space-bunny-free' }] }),
       { status: 200 },
     )) as typeof fetch
-    const f = await checkZen('https://zen.example', fetchList) // 不测调用：只看草稿
-    const names = (f.suggestedProvider?.models ?? []).map((m) => m.id)
-    expect(names).toContain('mimo-v2.5-free')
-    expect(names).toContain('nemotron-3-ultra-free')
-    expect(names).not.toContain('union-alpha') // 上游已下线
-    expect(f.detail).toContain('union-alpha') // 剔除要如实告知
+    const f = await checkZen('https://zen.example', fetchList)
+    expect(f.suggestedProvider?.models).toEqual([])
+    // 上游列表本身仍要拿到（探测靠它），只是不写进草稿。
+    expect(f.detail).toContain('2 个模型')
   })
 
-  // 剪枝的两条边界（宁可不剪也不误删）——直接锁纯函数，不绕道网络。
-  test('剪枝保留 manual 手工项；列表拉空时整体不剪', () => {
+  // 剪枝行为改为直接锁纯函数：草稿不再预填后，这段逻辑的唯一入口就是
+  // reconcileCatalogModels（发现层剪草稿、管理面同步目录共用同一份）。
+  // 上游已下线的模型留在目录里就是永远 404 的目录项，必须剪掉且如实告知；
+  // 但不能误伤——两条边界见下。
+  test('已下线项被剔除并如实告知；manual 与空列表两条边界不误删', () => {
     const models = [
-      { id: 'gone-auto' },                    // 上游没了 + 自动 → 剪
-      { id: 'gone-manual', manual: true },    // 上游没了 + 手工 → 留（用户自己维护的）
-      { id: 'live', manual: false },          // 上游还在 → 留
+      { id: 'longcat-2.5-preview-free' },  // 上游已下线 + 自动 → 剪
+      { id: 'mimo-v2.6-flash-free' },      // 上游还在 → 留
+      { id: 'my-hand-model', manual: true }, // 上游没有 + 手工 → 留（用户自己维护的）
+      { id: 'space-bunny-free' },          // 上游还在 → 留
     ]
-    const r = pruneStaleDraftModels(models, ['live'])
-    expect(r.kept.map((m) => m.id)).toEqual(['gone-manual', 'live'])
-    expect(r.stale).toEqual(['gone-auto'])
+    const r = pruneStaleDraftModels(models, ['mimo-v2.6-flash-free', 'space-bunny-free'])
+    expect(r.kept.map((m) => m.id)).toEqual(['mimo-v2.6-flash-free', 'my-hand-model', 'space-bunny-free'])
+    expect(r.stale).toEqual(['longcat-2.5-preview-free'])
     // live 为空（列表拉空/解析异常）：沉默比误删安全，一个都不剪
     const empty = pruneStaleDraftModels(models, [])
-    expect(empty.kept).toHaveLength(3)
+    expect(empty.kept).toHaveLength(4)
     expect(empty.stale).toEqual([])
   })
 
-  // 真实误判（2026-09-20 用户实测报回）：按上游列表顺序取前 3 个免费模型做探针，
-  // 恰好那 3 个都不可用（jev 500 / deepseek-v4-flash 已下线 / muse-spark 地区受限），
-  // 于是整个源被判 unreachable，用户连导入按钮都点不到——而草稿里的 mimo-v2.5-free
-  // 当时是可调用的。探针要回答的是「采用后我能不能用」，所以候选必须先取草稿模型。
-  test('探针候选优先取草稿模型（不被列表顺序挤掉）', async () => {
+  // 剪枝要如实告知（不静默改动用户看到的目录）：detail 里要点名被剔除的 ID。
+  test('剪掉的模型在 detail 里点名', async () => {
+    const fetchList = (async () => new Response(
+      JSON.stringify({ data: [{ id: 'mimo-v2.6-flash-free' }, { id: 'space-bunny-free' }] }),
+      { status: 200 },
+    )) as typeof fetch
+    const f = await checkZen('https://zen.example', fetchList)
+    // 草稿已空 → 没有可剪的，detail 不应出现“剔除”字样（没改动就不该声称改了）
+    expect(f.detail).not.toContain('剔除')
+  })
+
+  // 探针只能抽样（预算 3 个），所以采样方式直接决定「整源不可用」这个结论对不对。
+  // 真实误判（2026-09-20 用户报回）：沿列表取前 3 个，恰好三个都不可用
+  // （jev 500 / deepseek-v4-flash 已下线 / muse-spark 地区受限 连续排在前），
+  // 于是整个源被判 unreachable，而可用的模型就在列表后面。
+  //
+  // 草稿不再预填模型后，候选只能来自上游列表，这条防线变成关键：采样必须
+  // **跨族 + 覆盖整张列表（含末尾）**，而不是沿开头截一段。
+  test('探针候选覆盖列表末尾：可用模型在后段也能判 ready', async () => {
     const fetchList = (async () => new Response(
       JSON.stringify({ data: [
         { id: 'jev-1.13-free' },
         { id: 'deepseek-v4-flash-free' },
         { id: 'muse-spark-1.3-contributor-free' },
-        { id: 'mimo-v2.5-free' },
-        { id: 'nemotron-3-ultra-free' },
+        { id: 'nemotron-3.5-lightning-free' },
+        { id: 'mimo-v2.6-flash-free' }, // ← 唯一的可用项，排在末尾
       ] }), { status: 200 },
     )) as typeof fetch
     const tried: string[] = []
     const f = await checkZen('https://zen.example', fetchList, 8000, async (m) => {
       tried.push(m)
-      // 只有草稿里的模型可用；列表前三个都不可用（含地区限制）
-      return m === 'mimo-v2.5-free'
+      return m === 'mimo-v2.6-flash-free'
         ? { ok: true }
         : { ok: false, kind: 'region', error: 'not available in your country' }
     })
-    // 草稿里的 mimo-v2.5-free 必须被探到，且整体判 ready
-    expect(tried).toContain('mimo-v2.5-free')
+    // 末尾的可用模型必须被抽到（前 3 个全灭不能定案）
+    expect(tried).toContain('mimo-v2.6-flash-free')
     expect(f.status).toBe('ready')
-    expect(f.detail).toContain('mimo-v2.5-free')
+    expect(f.detail).toContain('mimo-v2.6-flash-free')
+  })
+
+  // 均匀取样的纯函数契约：首尾必含、个数准确、不重复、不打乱原有优先级。
+  // 首尾必含是上一条能成立的前提（列表末尾不能因为「名额不够」而永远探不到）。
+  test('evenlySample：首尾必含且在区间内均匀分布', () => {
+    const xs = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h']
+    expect(evenlySample(xs, 3)).toEqual(['a', 'e', 'h'])
+    expect(evenlySample(xs, 1)).toEqual(['a'])
+    expect(evenlySample(xs, 8)).toEqual(xs)
+    expect(evenlySample(xs, 99)).toEqual(xs) // 名额多于样本：全试，不重复
+    expect(evenlySample([], 3)).toEqual([])
+    expect(evenlySample(xs, 0)).toEqual([])
+    // 顺序保持原列表顺序（取样只是子集，不重排优先级）
+    const s = evenlySample(xs, 4)
+    expect(s).toEqual([...s].sort((a, b) => xs.indexOf(a) - xs.indexOf(b)))
   })
 
   // 全失败时，detail 必须列出**每个候选各自**的失败类型，而不是只报一个最优病因。

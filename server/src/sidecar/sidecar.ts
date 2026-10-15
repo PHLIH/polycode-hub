@@ -987,6 +987,10 @@ auth:
 provider: zai
 plan: start-plan
 
+# 这是**第三方 sidecar 自己的配置**（TriDefender/zcode-api），不是网关的模型目录。
+# sidecar 要求一个必填的默认模型，我们按上游 api.z.ai 当前在线的列表取一个
+# （2026-10-15 实测列表：glm-4.5/4.5-air/4.6/4.7/5/5-turbo/5.1/5.2/5.3/5.3-flash/5.3-flashx）。
+# 网关侧的模型目录不依赖这行：那个由「同步上游目录」从上游实时列表拉。
 defaultModel: glm-5.3-flash
 `
     mkdirSync(sidecarDir, { recursive: true, mode: 0o755 })

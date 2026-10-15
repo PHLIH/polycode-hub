@@ -152,6 +152,11 @@ export const api = {
     const data = await req('GET', '/admin/api/egresses')
     return (data && data.egresses) || []
   },
+  // 把库里目录对账到上游实时列表：删上游已下线的，补上游新上的。
+  // 新补的一律 enabled:false（列表里有 ≠ 你的凭据能调它，见后端端点注释），
+  // 所以返回的 added 需要用户验证后再启用。拉上游可能慢，超时给足。
+  syncProviderModels: (pid) =>
+    req('POST', `/admin/api/providers/${encodeURIComponent(pid)}/models/sync`, undefined, { timeoutMs: 60000 }),
   scanProviderModels: async (pid, models, opts = {}) => {
     // 识别/扫描会真的打上游，慢是正常的——给足超时，但要能取消（opts.signal）。
     const data = await req('POST', `/admin/api/providers/${encodeURIComponent(pid)}/scan`,

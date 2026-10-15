@@ -44,7 +44,9 @@ providers:
       api_key_env: "COMPANY_GW_KEY"      # 密钥放环境变量，配置不落明文
     priority: 1
     # 同源多账号按 weight 加权轮询（账号页可调，默认 1）；关/失效的账号权重自动失效。
-    models:                       # 模型目录：可探测补全，也可手动添加（manual: true）
+    models:                       # 模型目录：留空并点「同步上游目录」从上游实时列表拉取（推荐，
+                                  # 上游会下线模型，写死的 ID 会变成永远 404 的假值）；
+                                  # 手工维护的条目一定要标 manual: true，同步时才不会被删。
       - id: "claude-sonnet-4-6"
         display_name: "Claude Sonnet 4.6"
         context_window: 200000    # 未知则不填 → 放行 + warn（默认不做预检）
@@ -157,7 +159,9 @@ accounts: []
 #   - opencode 做客户端时：它的真 UA + 会话头自动透传，零配置；
 #   - 其他客户端经网关调用时：按下配静态 UA（自己抓包取 opencode 真串）+ 静态 ses_，
 #     或设 ZEN_UA 环境变量做项目级默认 UA（静态头优先于 ZEN_UA）。
-# 旧 x-opencode-* 四件套是毒头（必 403），不要加。
+# 2026-10 上游把接口路径由 /zen 改为 /inference；旧路径仍通但恒 403 FreeTierError。
+# x-opencode-* 不是毒头（2026-09-18 起上游就要求它们）；UA ≥ 1.19.0 时还要求
+# x-opencode-session-id 且与 x-opencode-session 同值。
 # providers:
 #   - name: "zen-free"
 #     display_name: "Zen免费档"
@@ -167,29 +171,29 @@ accounts: []
 #     stability: "beta"
 #     state: "paused"                # active | paused（旧 enabled: false 等价于 paused）
 #     api: "openai-completions"      # 仅作默认；协议是模型级的，见下方 models[].api
-#     base_url: "https://opencode.ai/zen/v1"
+#     base_url: "https://opencode.ai/inference/v1"
 #     credential:
 #       api_key_env: "ZEN_KEY"       # 值固定为 public
-#     headers:                       # 指纹是能否调用的关键：只有 UA + 真实 ses_ 才不被拒
+#     headers:                       # 指纹是能否调用的关键：UA + 真实 ses_ + 孪生头同值
 #       User-Agent: "opencode/换成抓包取到的真串 ai-sdk/provider-utils/换真串 runtime/bun/换真串"
+#       x-opencode-client: "cli"
+#       x-opencode-project: "global"
+#       x-opencode-session: "ses_换成你自己的真实会话"
+#       x-opencode-session-id: "ses_换成你自己的真实会话（与上一行同值）"
 #       x-session-id: "ses_换成你自己的真实会话"
-#       x-session-affinity: "ses_换成你自己的真实会话"
+#       # 不要加 x-session-affinity：毒头，带上游恒 403
 #     priority: 1
-#     models:
-#       - id: "mimo-v2.5-free"
-#         input: [text]
-#         enabled: true
-#       - id: "nemotron-3-ultra-free"
-#         input: [text]
-#         enabled: true
-#       # 协议必须落到模型级：muse-spark 系只认 /responses，走 /chat/completions 上游直接 500。
-#       # 全继承 Provider 级 openai-completions 就是本次真实缺陷。
-#       - id: "muse-spark-1.3-contributor-free"
-#         api: "openai-responses"
-#         input: [text, image]
-#         enabled: true
-#       # 注意：muse-spark 系在部分地区回 403 RegionError（模型不在本地区可用），
-#       # 需要经出口代理访问（见上方 egresses 段）。这与指纹/协议是两回事。
+#     # 模型目录**不要写死 ID**。上游会下线模型，写死的名字会变成永远 404 的假值，
+#     # 而用户无法分辨“模型没了”还是“自己配错了”。两种正确做法：
+#     #   ① 留空 models: []，导入后到管理台点「同步上游目录」（推荐，上游有 /models 接口时）；
+#     #   ② 确实要手填就显式标 manual: true，网关不会在同步时删掉你的手工项。
+#     models: []
+#     # 需要指定探测/测试用哪个模型时才填 probe_model；留空则自动从已启用模型里选。
+#     # probe_model: "mimo-v2.6-flash-free"
+#     #
+#     # 历史写法（已废弃，仅作说明）：以前这里逐条写模型 ID，还要手标协议，
+#     # 因为 muse-spark 系只认 /responses、走 /chat/completions 上游直接 500。
+#     # 现在协议由探针逐模型探到后落库（autoProtocol），不再手标。
 
 # ZCode 免费 plan 经本地 sidecar 示例（2026-09-12 已实测打通 GLM-5.3-Flash）：
 # plan 通道要逐请求验证，本网关不内置求解——另起专用反代（如 TriDefender/zcode-api，
@@ -208,7 +212,5 @@ accounts: []
 #     credential: {}
 #     enabled: false
 #     priority: 1
-#     models:
-#       - id: "GLM-5.3-Flash"
-#         input: [text]
-#         enabled: true
+#     # 留空：由 sidecar 的 GET /v1/models 实时拉取（导入后点「同步上游目录」）。
+#     models: []
