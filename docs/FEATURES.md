@@ -68,7 +68,9 @@
 
 - 同源加权轮询（`pick`）：按 `Account.weight`（缺省/非法按 1）分配流量；无可用抛 `ErrNoAccount`，调度据此换源/报错，不静默等待。
 - `markResult`（`pool/account.ts:93-128`）：成功且有惩罚时清零落盘；失败 `fails++`，kind=quota → `exhausted`（**不设到期时间，只认人工“重置”或一次成功的测试**，`pool/account.ts:119-123`），其余 → `cooldown` + 到期时间。
-- `hasFor:30-32` 区分“该源无账号 → 走 Provider 级凭据”与“有账号但全冷却 → 跳过该源”。
+- `hasFor:30-32` 区分“该源无账号 → 走 Provider 级凭据”与“有账号但全冷却 → 跳过该源”；**它只回答“配没配账号”，不能拿来判断“能不能发”**。
+- 可用性判据是 `eligibleAccountCount:36-40`（与 `pick` 同语义，会触发冷却到期复位）：转发与探针都据此决定是否回落 Provider 级凭据（`proxy.ts:557-576`、`probe.ts:285-299`）。
+- **账号全不可用是独立错误类 `no_account`**（`ir/errors.ts`，请求根本没发出去）：转发报 `账号池无可用账号 provider=…（名下 N 个账号全部不可用：冷却中 x、额度用尽 y、已停用 z）` 并换源，探针直接本地拦截。文案与状态标签的单一真相源在 `pool/account.ts`（`accountStatusLabel / accountUnavailableSummary / noAvailableAccountMessage`）——绝不再回落到 Provider 级占位凭据报「环境变量 WB_TOKEN 未设置」（会把用户引去重配凭据，而真实动作是账号页重置/换号）。
 - 冷却到期自动复位（`eligible:pool/account.ts:167-178`）；`exhausted` 永不自动恢复（`model/index.ts:301-303`）。
 - 惩罚落盘：`fails / cooldownUntil` 写回 `admin.db`，重启不失忆；`exhausted` 必须把 status 一起写进去，恢复时再抹回 available（`cli.ts:189-211` 回写规则注释）。
 - 健康度（纯派生，不落盘，`model/index.ts:319-331`）：绿=健康、琥珀=冷却中或连败 ≥ 3 次（`FAILS_WARN_AT=3`）、红=disabled / exhausted。

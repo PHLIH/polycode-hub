@@ -14,13 +14,15 @@ import {
   flushZenPoolToLib, recordZenFailure, recordZenSuccess, refillZenPool, takeNextZenSession,
   zenPoolActiveLen, ZEN_FAIL_THRESHOLD, ZEN_FAIL_WINDOW_MS,
 } from './zen_pool.ts'
+import type { AccountPool } from '../pool/account.ts'
+import { accountUnavailableSummary } from '../pool/account.ts'
 import { autoProtocol, forgetProtocol, rememberProtocol,
   capabilitiesFrom, credentialResolve, dynamicHeadersTimeout,
   findHeaderKey, isWorkBuddyAiBaseUrl, isZenBaseUrl, mintZenRequestId, validZenToken,
   zenHeadersWithFingerprint,
   parseZenSessionPool, writeZenSessionPool,
   ZEN_REQUEST_HEADER, ZEN_SESSION_HEADER, ZEN_SESSION_POOL_HEADER,
-  type Capabilities, type DynamicHeadersSpec, type Provider } from '../model/index.ts'
+  type Account, type Capabilities, type DynamicHeadersSpec, type Provider } from '../model/index.ts'
 
 // egress 定义 → 代理 URI（EGRESS-SPIKE §4 方案 A）。
 // v1 支持 http/https 代理（undici ProxyAgent 语义；socks5 不支持，Clash 等混合端口直接用 http://）。
@@ -51,6 +53,10 @@ export interface UpstreamOpts {
   // 协议落盘钩子（cli 注入）：转发时自动探测成功的，把协议写回模型目录（DB）。
   // 参数：provider 内部 id、模型 id、探到的协议。抛错会被吞掉打日志（不影响转发）。
   onProtocolLearned?: (providerId: number, modelId: string, protocol: Protocol) => void
+  // 账号池（cli 注入）：**只**用于让「凭据缺失」的报错能带上账号池真相——
+  // 账号全不可用时，真正该修的是账号（重置/换号）而不是凭据（见 missingCredentialMessage）。
+  // 不参与选号：轮询一直在 proxy 层做，Upstream 只做「拿到什么凭据就发什么」。
+  accountPool?: AccountPool
 }
 
 type Lookup = (name: string) => [string, boolean]
@@ -343,6 +349,7 @@ export class Upstream {
   private refillCandidatesFn: () => string[]
   private onZenPoolFlushedFn: ((providerId: number, sessions: string[]) => void) | undefined
   private onProtocolLearnedFn: ((providerId: number, modelId: string, protocol: Protocol) => void) | undefined
+  private accountPoolRef: AccountPool | undefined
   private protoBackfillInFlight = new Set<string>() // 协议回填单 flight：同模型并发只落一次
   private dispatchers = new Map<string, unknown>()
 
@@ -353,6 +360,21 @@ export class Upstream {
     this.refillCandidatesFn = opts.refillCandidates ?? (() => [])
     this.onZenPoolFlushedFn = opts.onZenPoolFlushed
     this.onProtocolLearnedFn = opts.onProtocolLearned
+    this.accountPoolRef = opts.accountPool
+  }
+
+  // 运行时挂账号池（cli 里池子与 Upstream 的构造有先后依赖，用 setter 解耦，
+  // 与 Proxy.setAccountPool 同一风格）。
+  setAccountPool(ap: AccountPool): void {
+    this.accountPoolRef = ap
+  }
+
+  // 该 Provider 名下的账号快照（没接池子 / 没账号时返回 undefined）：
+  // 交给 missingCredentialMessage 决定是否要额外说明「账号全不可用」。
+  private accountsFor(providerId: number): Account[] | undefined {
+    if (!this.accountPoolRef) return undefined
+    const mine = this.accountPoolRef.accountsFor(providerId)
+    return mine.length > 0 ? mine : undefined
   }
 
   // 会话补位候选（淘汰后补新用）。cli 注入的是「本机 opencode 日志里的全部候选」。
@@ -398,6 +420,7 @@ export class Upstream {
       refillCandidates: over.refillCandidates ?? this.refillCandidatesFn,
       onZenPoolFlushed: over.onZenPoolFlushed ?? this.onZenPoolFlushedFn,
       onProtocolLearned: over.onProtocolLearned ?? this.onProtocolLearnedFn,
+      accountPool: over.accountPool ?? this.accountPoolRef,
     })
     return derived
   }
@@ -706,7 +729,7 @@ export class Upstream {
     let key = ''
     if (p.credential.apiKeyEnv || p.credential.apiKeyFile) {
       const [v, ok] = credentialResolve(p.credential, this.credLookup)
-      if (!ok) throw new UpstreamError(0, UPSTREAM.AUTH, missingCredentialMessage(p))
+      if (!ok) throw new UpstreamError(0, UPSTREAM.AUTH, missingCredentialMessage(p, this.accountsFor(p.providerId)))
       key = v
     }
     if (proto === 'anthropic-messages') {
@@ -817,14 +840,23 @@ export class Upstream {
 
 // 凭据解析失败的对外文案：必须点名缺的是哪个变量/文件，并给可执行的下一步。
 // 只说「凭据无效」用户仍不知道去哪配；照抄上游 HTML 401 更是误导（issue #1）。
-export function missingCredentialMessage(p: Provider): string {
+export function missingCredentialMessage(p: Provider, accts?: Account[]): string {
   if (p.credential.apiKeyFile) {
     return `凭据文件读不到 provider=${p.name} file=${p.credential.apiKeyFile}`
       + `（先确认文件存在且可读；Discover「一键导入」会把桌面登录态写入该文件）`
   }
   const env = p.credential.apiKeyEnv ?? ''
-  return `环境变量 ${env} 未设置 provider=${p.name}`
+  const base = `环境变量 ${env} 未设置 provider=${p.name}`
     + `（先 export ${env}=... 并重启网关，或到 Providers 点「一键导入」把桌面登录态导入账号池）`
+  if (!accts || accts.length === 0) return base
+  const now = new Date()
+  const summary = accountUnavailableSummary(accts, now)
+  // 只要还有至少一个可用账号，凭据就不该走到这（"全不可用"才是要补充说明的情形）。
+  if (summary === '') return base
+  // 只补一句账号池真相，不换掉原来的可执行动作：两种病因（真没设环境变量 /
+  // 账号全不可用）可能同时存在，不能报一个就丢掉另一个。
+  return base + `。另行：该 Provider 名下还有 ${accts.length} 个账号，全部不可用`
+    + `（${summary}）；到账号页「重置」或换号后重试`
 }
 
 // 403 语义细分：上游对「模型不在本端点/本出口」也回 403（实测 zen muse 系 RegionError）。

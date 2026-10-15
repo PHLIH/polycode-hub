@@ -7,7 +7,7 @@ import {
   type Provider, type UsageLog,
 } from '../model/index.ts'
 import { validProtocol } from '../ir/index.ts'
-import type { AccountPool } from '../pool/account.ts'
+import { noAvailableAccountMessage, type AccountPool } from '../pool/account.ts'
 import type { Scheduler } from '../router/scheduler.ts'
 import type { Upstream } from '../router/upstream.ts'
 import { requestID, mergeStreamUsage, cooldownFor } from './proxy.ts'
@@ -139,8 +139,9 @@ export class Probe {
       }
     }
     if (!bare) return fail('该 Provider 在「模型」里一个都没勾选，先勾选模型再测', 0)
-    const pv = this.probeCredential(found)
-    const pr = await this.probeWithProtocols(pv, bare)
+    const cred = this.probeCredential(found)
+    if (cred.err) return fail(cred.err, 0)
+    const pr = await this.probeWithProtocols(cred.pv, bare)
     if (!pr.ok) return fail('上游错误: ' + pr.error, pr.latencyMs ?? 0)
     return {
       ok: true, model: `${found.name}/${bare}`, protocol: pr.protocol,
@@ -178,14 +179,17 @@ export class Probe {
       models = found.models.filter((m) => m.enabled).map((m) => m.id)
     }
     if (models.length === 0) return [{ model: '', ok: false, error: '没有可测模型：先获取模型列表或手填' }]
-    const pv = this.probeCredential(found)
+    const cred = this.probeCredential(found)
+    // 账号全不可用：一个模型都别发。批量扫描会并发扇出，回落打占位凭据只会
+    // 产出 N 条一模一样的假错误（看起来像「模型全挂了」，实际是账号池空了）。
+    if (cred.err) return models.map((m) => ({ model: m, ok: false, error: cred.err! }))
     const out: ModelProbe[] = new Array(models.length)
     let next = 0
     await Promise.all(Array.from({ length: Math.min(PROBE_CONCURRENCY, models.length) }, async () => {
       for (;;) {
         const i = next++
         if (i >= models.length) return
-        out[i] = await this.probeWithProtocols(pv, models[i]!)
+        out[i] = await this.probeWithProtocols(cred.pv, models[i]!)
       }
     }))
     return out
@@ -268,19 +272,31 @@ export class Probe {
     return { model: modelID, ok: false, error: errText, kind: errKind }
   }
 
-  // 返回该 Provider 用于探测的副本：同源有可用账号则用**首个**可用账号的凭据，
-  // 否则用 Provider 级凭据。不写 MarkResult，不污染冷却；也不推进 pick 的轮询
-  // 游标（探针是只读观察，不能偷走转发的轮询位置）。
+  // 返回该 Provider 用于探测的副本：同源有可用账号则用**首个**可用账号的凭据。
+  // 不写 MarkResult，不污染冷却；也不推进 pick 的轮询游标（探针是只读观察，
+  // 不能偷走转发的轮询位置）。
   //
   // 注意：这里**不等价**于真实转发——转发走 pick() 加权轮询，可能轮到第 2/3 个
   // 账号。「测试通过」只证明"首个可用账号能用"，不证明轮询到的账号能用。
   // 排障时若测试通过但请求失败，先看失败日志里实际用的 accountId 再下结论。
-  private probeCredential(p: Provider): Provider {
-    if (!this.accounts) return p
+  //
+  // 账号存在但全部不可用时**绝不回落**到 Provider 级凭据（err 分支）：那会把
+  // 「账号池里的号都被打了」误报成「你没配凭据」，用户遂去重装/重配一遍，而
+  // 账号依旧是不可用的（真实用户反馈：WorkBuddy 故报「环境变量 WB_TOKEN 未设置」）。
+  // 池里根本没有该 Provider 的账号时才回落——那是真的只能靠 Provider 级凭据。
+  private probeCredential(p: Provider): { pv: Provider; err?: string } {
+    if (!this.accounts) return { pv: p }
     const now = new Date()
     const acct = this.accounts.snapshot().find(
       (a) => a.providerId === p.providerId && accountEffectiveStatus(a, now) === 'available')
-    return acct ? { ...p, credential: acct.credential } : p
+    if (acct) return { pv: { ...p, credential: acct.credential } }
+    const mine = this.accounts.accountsFor(p.providerId)
+    if (mine.length === 0) return { pv: p } // 没配账号：沿用 Provider 级凭据（行为不变）
+    return {
+      pv: p,
+      err: noAvailableAccountMessage(p.name, mine, now)
+        + '：到账号页「重置」手动放行，或对该号点「测试」直接验证，或换号后重测',
+    }
   }
 
   // 对指定模型打一次最小真实流式请求。不抛错，失败如实返回。

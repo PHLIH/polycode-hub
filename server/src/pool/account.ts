@@ -48,8 +48,26 @@ export class AccountPool {
 
   // 报告该 Provider 是否配置了账号（哪怕全部冷却）：
   // 供调度区分「无账号 → 走 Provider 凭据」与「有账号但全冷却 → 跳过该 Provider」。
+  //
+  // ⚠️ 转发层不得再拿它当「能不能发请求」的判据：配了账号 ≠ 能用。
+  // 真实故障（用户反馈）：hasFor 为 true 而账号全不可用时，转发既不换源也不报原因，
+  // 客户端只拿到一句 500，账号池里到底怎么了在外面完全看不出来。
+  // 「能不能发」请看 eligibleAccountCount（它才与 pick 同语义）。
   hasFor(providerId: number): boolean {
     return this.accounts.some((a) => a.providerId === providerId)
+  }
+
+  // 当前**真正可用**的账号数（冷却到期会自动复位并落盘，与 pick 同语义——
+  // 两处判据必须同源，否则会出现「探针说没有、pick 却挑得出号」这种自相矛盾的状态）。
+  eligibleAccountCount(providerId: number, now: Date): number {
+    return this.eligible(this.accounts.filter((a) => a.providerId === providerId), now).length
+  }
+
+  // 该 Provider 名下全部账号的**副本**（含不可用的）：调用方要拿它去生成
+  // 「名下 3 个账号全部不可用：冷却中 2、已停用 1」这类人话。
+  // 返回副本（.map 浅拷贝）与 snapshot 同口径：读账号状态不应污染池内对象。
+  accountsFor(providerId: number): Account[] {
+    return this.accounts.filter((a) => a.providerId === providerId).map((a) => ({ ...a }))
   }
 
   // 该 Provider 名下的账号数：转发层用它定"换号重试"的上界——绝不能用候选
@@ -216,4 +234,54 @@ function weightOf(a: Account): number {
   const w = a.weight
   if (typeof w !== 'number' || !Number.isFinite(w)) return 1
   return Math.max(1, Math.floor(w))
+}
+
+// ---- 账号状态的人话（单一真相源）----
+//
+// 为什么放在池里而不是各调用点自己拼：probe / proxy / adminapi 三处都要说明
+// 「这个号现在为什么不能用」，三份文案迟早漂移；更要紧的是措辞本身就是诊断信息
+// ——「冷却中」（会自己好）与「额度用尽」（等下去也不会好）对用户的下一步完全不同。
+export function accountStatusLabel(s: AccountStatus): string {
+  if (s === 'available') return '可用'
+  if (s === 'cooldown') return '冷却中'
+  if (s === 'exhausted') return '额度用尽'
+  if (s === 'disabled') return '已停用'
+  return s
+}
+
+// 「为什么没有可用账号」的摘要，如「冷却中 1、额度用尽 1、已停用 1」。
+//
+// 顺序固定（冷却中→额度用尽→已停用），与传入顺序无关：同一池子必须永远产出同一句话，
+// 否则日志与 UI 文案随机变动，对比两次排障记录就成了刻舟求剑。
+// 全可用时返回空串（调用方据此知道「不该出现这段补充」）。
+export function accountUnavailableSummary(accounts: Account[], now: Date): string {
+  const order: AccountStatus[] = ['cooldown', 'exhausted', 'disabled']
+  const count = new Map<string, number>()
+  for (const a of accounts) {
+    const st = accountEffectiveStatus(a, now) // 冷却到期的按可用算，别把它算进不可用
+    if (st === 'available') continue
+    count.set(st, (count.get(st) ?? 0) + 1)
+  }
+  const parts: string[] = []
+  for (const st of order) {
+    const n = count.get(st)
+    if (n) parts.push(`${accountStatusLabel(st)} ${n}`)
+  }
+  // 未知状态（将来新增枚举）排在固定顺序之后，按字典序——总比静默吞掉强。
+  const rest = [...count.keys()].filter((k) => !order.includes(k as AccountStatus)).sort()
+  for (const st of rest) parts.push(`${accountStatusLabel(st as AccountStatus)} ${count.get(st)}`)
+  return parts.join('、')
+}
+
+// 「账号池无可用账号」的完整一句话（probe 与 proxy 共用，避免两处各拼一份文案漂移）。
+//
+// 必须点名 provider 与「名下 N 个账号全部不可用：<摘要>」：只说「无可用账号」等于没说——
+// 用户看不出到底是没导入过账号（该去导入），还是导进来了但都被上游打了（该去重置/换号）。
+// 这两种情况在 Provider 列表页长得一模一样（apiKeyEnv 都是 WB_TOKEN）。
+export function noAvailableAccountMessage(
+  providerName: string, accounts: Account[], now: Date,
+): string {
+  const summary = accountUnavailableSummary(accounts, now)
+  return `账号池无可用账号 provider=${providerName}`
+    + `（名下 ${accounts.length} 个账号全部不可用${summary ? `：${summary}` : ''}）`
 }

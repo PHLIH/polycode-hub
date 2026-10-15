@@ -210,6 +210,10 @@ export async function runServe(args: string[]): Promise<void> {
   }
   const acctPool = new AccountPool(cfg.accounts, writePenalty, writeReset)
   px.setAccountPool(acctPool)
+  // Upstream 也要能看到账号池：仅用于让「凭据缺失」的报错说出账号池真相
+  // （账号全不可用时该去重置/换号，而不是去重配凭据）。池子与 up 的构造
+  // 有先后依赖（up 在前），所以用 setter 补接。
+  up.setAccountPool(acctPool)
 
   seedProvidersIfEmpty(providers, cfg.providers)
   // WorkBuddy 使用端归因头迁移（存量修复）：模板只影响新建，已入库的行要在这里补，

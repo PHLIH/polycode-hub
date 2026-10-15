@@ -12,6 +12,7 @@ import {
 } from '../ir/index.ts'
 import { resolveProtocol, estimateRequestTokens, type Scheduler, type Upstream, type SessionHint } from '../router/index.ts'
 import type { AccountPool } from '../pool/account.ts'
+import { noAvailableAccountMessage, accountUnavailableSummary } from '../pool/account.ts'
 import { accountEffectiveStatus, applyReasoningCap, applyReasoningPreset, type Account, type Provider, type UsageLog, type UsageStatus } from '../model/index.ts'
 import {
   DEFAULT_FIRST_BYTE_TIMEOUT_MS, DEFAULT_STREAM_IDLE_TIMEOUT_MS, type Config,
@@ -84,6 +85,13 @@ export function mapUpstreamError(ue: UpstreamError | undefined, sentEffort?: str
     case UPSTREAM.RATE_LIMIT: return irError(ERR.RATE_LIMIT, '所有上游限流: ' + ue.message)
     case UPSTREAM.AUTH: return irError(ERR.AUTHENTICATION, '上游鉴权失败: ' + ue.message)
     case UPSTREAM.QUOTA: return irError(ERR.RATE_LIMIT, '上游额度耗尽: ' + ue.message)
+    // 账号池无可用账号：这条**不是上游错误**（请求根本没发出去），所以不套「上游错误:」
+    // 前缀——那是给「上游回了话但结果不好」用的。归 500 而不是 401：401 会把客户端
+    // 引向「我的 key 配错了」（去翻凭据），而真实动作在本地（账号页重置/换号）。
+    // 用 detail 而不是 message：后者带着 `upstream no_account: ` 这段**给日志用的**
+    // 机器可读前缀。端给用户会变成「upstream no_account: 账号池无可用账号…」——
+    // 一句夹着英文标识符、还自称 upstream 的话，而这件事根本没到上游。
+    case UPSTREAM.NO_ACCOUNT: return irError(ERR.API, ue.detail)
     case UPSTREAM.NETWORK: return irError(ERR.OVERLOADED, '上游不可达: ' + ue.message)
     // 指纹缺失不是「上游故障」而是「本地没配」：必须给可执行动作，
     // 否则用户只拿到一句英文 403，不知道该去 Provider 头里配什么。
@@ -547,7 +555,24 @@ export class Proxy {
     }
 
     for (const pv of cands) {
-      if (!this.accounts || !this.accounts.hasFor(pv.providerId)) {
+      // 判据必须是「有没有**可用**账号」，不是「有没有账号」：
+      // 真实故障（用户反馈）——名下账号全不可用时，hasFor 仍为 true，于是既不换源
+      // 也不报原因，客户端只拿到一句无信息的 500；而账号池里到底是「没导入」还是
+      // 「都冷却/耗尽/停用」在外面完全看不出来（这正是用户来问的那个）。
+      if (!this.accounts || this.accounts.eligibleAccountCount(pv.providerId, new Date()) === 0) {
+        const mine = this.accounts ? this.accounts.accountsFor(pv.providerId) : []
+        if (mine.length > 0) {
+          // 有账号但全部不可用：**不回落**到 Provider 级占位凭据（那会报「环境变量
+          // WB_TOKEN 未设置」，把人引去重配凭据），也不打上游（注定失败），换下一个源。
+          const err = new UpstreamError(0, UPSTREAM.NO_ACCOUNT,
+            noAvailableAccountMessage(pv.name, mine, new Date()),
+            { total: mine.length, byStatus: accountUnavailableSummary(mine, new Date()) })
+          lastErr = err
+          lastAcctId = '' // 没指定到任何账号：失败账归 Provider 不归号（不应把号染红）
+          console.warn(`账号池无可用账号，跳过该源 provider=${pv.name}（${err.acct!.byStatus}）`)
+          continue
+        }
+        // 压根没配账号：沿用 Provider 级凭据（行为与今天完全一致）。
         if (await attempt(pv, null)) break
         continue
       }

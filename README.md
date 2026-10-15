@@ -25,7 +25,7 @@
 - **凭据不限**：官方 API Key 是最常规的接法——填 `api_key_env`（走环境变量）或 `api_key_file`（走 `config/credentials/` 下的文件）即可，`access_kind` 默认就是 `official`；登录态复用、本地 sidecar 只是另外两种可选路径。密钥全程不落明文，只存引用
 - **三种协议均支持**：`POST /v1/messages`（Anthropic）、`POST /v1/chat/completions`（OpenAI Chat）、`POST /v1/responses`（OpenAI Responses），流式与非流式均可，经 IR 中间表示中转
 - **协议自动识别**：`api` 留空即自动探测，首次成功后记住；管理台「扫描可用性」可批量实测并写回
-- **账号池**：同源轮询，按失败原因冷却（限流 60s / 额度用尽 600s / 鉴权 1800s）；额度用尽只认人工重置或一次成功的测试
+- **账号池**：同源轮询，按失败原因冷却（限流 60s / 额度用尽 600s / 鉴权 1800s）；额度用尽只认人工重置或一次成功的测试；账号全不可用时如实报「账号池无可用账号（冷却/额度用尽/停用各几个）」，不回落到 Provider 级占位凭据
 - **管理台**：`http://127.0.0.1:3000/admin/` —— 配 Provider、导账号、看用量、管项目
 - **账号健康度**：绿 / 琥珀 / 红一眼看清连败与额度见底，不用翻日志
 - **本机发现**：自动扫描 WorkBuddy 登录态、ZCode 安装、OpenCode Zen 连通，点一下完成「采用 Provider + 账号入池」

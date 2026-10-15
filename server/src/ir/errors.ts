@@ -50,16 +50,44 @@ export const UPSTREAM = {
   // country"）。与指纹同属「被拒但不是凭据问题」，但病灶不同——换出口代理可解，
   // 所以必须分开：归 auth 会让人去翻 API Key，归 bad_request 会被当协议噪音压下去。
   REGION: 'region',
+  // 本地账号池无可用账号：该源配了账号，但全部冷却/额度用尽/被停用。
+  //
+  // 必须独立于 AUTH：这条错误**根本没打到上游**（status 恒 0，请求在本地就被拦下），
+  // 却顶着「鉴权」二字，会把用户推去反复翻凭据——而凭据很可能是好的。
+  // 真实故障（用户反馈）：WorkBuddy 的 Provider 凭据是草稿占位 apiKeyEnv=WB_TOKEN，
+  // 账号池里的号一旦全部不可用，回落打 Provider 级凭据就报「环境变量 WB_TOKEN 未设置」，
+  // 用户照着重装/重配一遍，问题依旧（账号还是不可用）。
+  // 归 RATE_LIMIT 也不对：账号是被本地判定不可用的，恢复方式是「重置/换号」而不是等。
+  NO_ACCOUNT: 'no_account',
   UNKNOWN: 'unknown',
 } as const
+
+// 账号池侧的失败上下文（NO_ACCOUNT 专用）：让上层（管理面/用量页）不必重新查池
+// 就能如实说明「名下几个号、都卡在哪」，而不是只给一句「无可用账号」。
+type UpstreamAcctInfo = {
+  total: number
+  byStatus: string // 已格式化的人话摘要，如「冷却中 1、额度用尽 1」
+  last?: { kind: string; message: string; at: Date }
+}
 
 export class UpstreamError extends Error {
   readonly status: number // 0 = 未拿到响应（网络/DNS/超时）
   readonly kind: string
-  constructor(status: number, kind: string, message: string) {
+  // 可选第 4 参：只在失败原因与账号池状态有关时携带。既有 26 处调用点全部不用改。
+  readonly acct?: UpstreamAcctInfo
+  // 不带 `upstream <kind>:` 前缀的原文（就是构造时第 3 参）。
+  //
+  // 需要它是因为那个前缀是**给日志/排障用的机器可读标签**，不是给人看的：
+  // 直接端给用户就变成「upstream no_account: 账号池无可用账号…」——一句夹着英文
+  // 标识符且自称“upstream”的话，而这件事根本没到上游（NO_ACCOUNT 就是本地拦下的）。
+  // 需要面向用户的文案时用 detail；message 维持原样（既有日志格式不变）。
+  readonly detail: string
+  constructor(status: number, kind: string, message: string, acct?: UpstreamAcctInfo) {
     super(status !== 0 ? `upstream ${kind} (http ${status}): ${message}` : `upstream ${kind}: ${message}`)
     this.status = status
     this.kind = kind
+    this.acct = acct
+    this.detail = message
   }
 }
 
